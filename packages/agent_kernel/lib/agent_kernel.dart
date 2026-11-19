@@ -1,5 +1,19 @@
-/// Ring 0 TCB kernel library for FM Agent OS.
+/// Ring 0 TCB kernel library for FM Agent OS ([D-001]..[D-008], [D-010], [D-011], [D-017], [D-020]).
 library;
 
-/// Placeholder version marker for WP-1 workspace skeleton verification.
+export 'src/approval_gate.dart';
+export 'src/audit_logger.dart';
+export 'src/cancellation.dart';
+export 'src/capability.dart';
+export 'src/context_memory.dart';
+export 'src/io_payload_capper.dart';
+export 'src/llm_driver.dart';
+export 'src/pcb.dart';
+export 'src/quota.dart';
+export 'src/syscall_error.dart';
+export 'src/syscall_gate.dart';
+export 'src/syscall_hook.dart';
+export 'src/vfs_namespace.dart';
+
+/// Package version marker.
 const String agentKernelPackageVersion = '0.1.0';
