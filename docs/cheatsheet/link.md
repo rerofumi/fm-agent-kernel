@@ -45,3 +45,23 @@
 | https://agentclientprotocol.com/protocol/v1/tool-calls | 公式プロトコル仕様 | `2026-11-19` | [acp_protocol.md](./acp_protocol.md) | `tool_call` / `tool_call_update`、`diff` コンテンツ、`session/request_permission` の入出力スキーマ確認 |
 | https://agentclientprotocol.com/protocol/v1/session-config-options | 公式プロトコル仕様 | `2026-11-19` | [acp_protocol.md](./acp_protocol.md) | `session/set_config_option`（予約カテゴリ `model`, `mode` 等）による標準モデル切替方式の確認 |
 | https://agentclientprotocol.com/protocol/v1/extensibility | 公式プロトコル仕様 | `2026-11-19` | [acp_protocol.md](./acp_protocol.md) | `_meta` 拡張オブジェクトと `_` プレフィックス独自メソッドの厳格な互換性規則の確認 |
+
+## 5. Stage 2：Dart `Isolate`・コンテキスト窓メタデータ・Web Search / SSRF・`SKILL.md`
+
+| 出典 URL | 出典種別 | 確認日 | 関連ローカル資料 | 参照理由 |
+| --- | --- | :---: | --- | --- |
+| https://api.dart.dev/dart-isolate/Isolate/spawn.html | 公式 API リファレンス | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | AOT (`dart compile exe`) で利用可能な `Isolate.spawn`、`onError` / `onExit`、`errorsAreFatal` 仕様の確認 |
+| https://api.dart.dev/dart-isolate/TransferableTypedData-class.html | 公式 API リファレンス | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | Isolate 間での大容量バイト列の O(1) 所有権移転仕様の確認 |
+| https://api.dart.dev/dart-async/ZoneSpecification-class.html | 公式 API リファレンス | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | `print` 捕捉用 `ZoneSpecification` と、新規生成 `Isolate` が独立 Root Zone を持つ仕様の確認 |
+| https://docs.ollama.com/context-length | 公式ドキュメント | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | Ollama の VRAM 容量別既定コンテキスト長（4k / 32k / 256k）、`OLLAMA_CONTEXT_LENGTH`、実効窓確認方法の確認 |
+| https://github.com/ollama/ollama/blob/main/docs/api.md | 公式 API 仕様 | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | Ollama `POST /api/show`（`model_info`, `parameters`）および `GET /api/ps`（`context_length`）のフィールド仕様確認 |
+| https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties | 公式 API 仕様 | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | OpenRouter `GET /api/v1/models` の `context_length` および `top_provider.max_completion_tokens` スキーマ確認 |
+| https://openrouter.ai/docs/guides/overview/models | 公式ドキュメント | `2026-11-19` | [dart_isolate_and_context_paging.md](./dart_isolate_and_context_paging.md) | OpenRouter モデルカタログおよびコンテキスト上限の扱い確認 |
+| https://docs.ollama.com/capabilities/web-search | 公式ドキュメント | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | Ollama 公式 `POST https://ollama.com/api/web_search` / `POST https://ollama.com/api/web_fetch` と `OLLAMA_API_KEY` Bearer 認証仕様の確認 |
+| https://api-dashboard.search.brave.com/app/documentation/web-search/get-started | 公式ドキュメント | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | 代替候補 Brave Search API のエンドポイントと `X-Subscription-Token` 認証要件の確認 |
+| https://docs.tavily.com/documentation/api-reference/endpoint/search | 公式 API 仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | 代替候補 Tavily Search API のエンドポイントと Bearer 認証要件の確認 |
+| https://api.dart.dev/dart-io/HttpClient/connectionFactory.html | 公式 API リファレンス | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | `HttpClient.connectionFactory` による検証済み公開 IP ピン留め（DNS Rebinding 防止）仕様の確認 |
+| https://api.dart.dev/dart-io/SecureSocket/secure.html | 公式 API リファレンス | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | 検証済み IP への生 TCP ソケット上で元ホスト名の TLS SNI・X.509 証明書検証を維持する `SecureSocket.secure` 仕様の確認 |
+| https://pub.dev/packages/yaml | 公式パッケージ仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | `SKILL.md` フロントマター解析用 pure-Dart `package:yaml` の仕様確認 |
+| https://pub.dev/packages/html | 公式パッケージ仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | HTML5 DOM 解析・ノイズ要素除去用 pure-Dart `package:html` の仕様確認 |
+| https://pub.dev/packages/html2md | パッケージ仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | pure-Dart HTML→Markdown 変換ライブラリの仕様・オプション確認 |
