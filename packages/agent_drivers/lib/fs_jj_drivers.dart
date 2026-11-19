@@ -1,4 +1,4 @@
-/// Read-Only HostFS and serialized Jujutsu (`jj`) drivers for FM Agent OS ([D-011], [D-012], [D-014]).
+/// HostFS (Read-Only + CAS Write) and serialized Jujutsu (`jj`) CoW transaction drivers ([D-011]..[D-015]).
 library;
 
 export 'src/fs/host_fs_driver.dart';

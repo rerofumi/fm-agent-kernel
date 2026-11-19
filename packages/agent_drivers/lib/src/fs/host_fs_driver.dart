@@ -7,23 +7,47 @@ import 'package:crypto/crypto.dart';
 import 'package:glob/glob.dart';
 import 'package:path/path.dart' as p;
 
-/// Host filesystem Read-Only driver scoped to a [VfsNamespace] ([D-011], [D-012]).
+/// Callback invoked prior to workspace file mutation to isolate a CoW change ([D-015]).
+typedef EnsureActiveTransactionCallback =
+    Future<SyscallResult<Object?>> Function();
+
+/// Callback invoked after workspace file mutation to synchronize `jj` snapshots ([D-014]).
+typedef SyncWorkingCopySnapshotCallback =
+    Future<SyscallResult<Object?>> Function();
+
+/// Host filesystem Read-Only & CAS Write driver scoped to a [VfsNamespace] ([D-011], [D-012], [D-013]).
 ///
 /// Enforces real-path symlink/junction boundary checks, bidirectional protection
 /// of `.jj`, `.git`, `.agent_os`, and `.env*`, automatic skipping during parent
-/// scans, binary rejection/skipping, and whole-file SHA-256 computation.
+/// scans, binary rejection/skipping, whole-file SHA-256 computation, and CAS
+/// atomic writes integrated with Jujutsu CoW transactions.
 class HostFsDriver {
-  HostFsDriver({required this.namespace});
+  HostFsDriver({
+    required this.namespace,
+    EnsureActiveTransactionCallback? ensureActiveTransaction,
+    SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
+  })  : _ensureActiveTransaction = ensureActiveTransaction,
+        _syncWorkingCopySnapshot = syncWorkingCopySnapshot;
 
-  factory HostFsDriver.forWorkspace(String workspaceHostRoot) {
+  factory HostFsDriver.forWorkspace(
+    String workspaceHostRoot, {
+    EnsureActiveTransactionCallback? ensureActiveTransaction,
+    SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
+  }) {
     return HostFsDriver(
       namespace: VfsNamespace(workspaceHostRoot: workspaceHostRoot),
+      ensureActiveTransaction: ensureActiveTransaction,
+      syncWorkingCopySnapshot: syncWorkingCopySnapshot,
     );
   }
 
   final VfsNamespace namespace;
+  final EnsureActiveTransactionCallback? _ensureActiveTransaction;
+  final SyncWorkingCopySnapshotCallback? _syncWorkingCopySnapshot;
 
   static final RegExp _drivePrefixPattern = RegExp(r'^[a-zA-Z]:');
+  static final RegExp _sha256Pattern = RegExp(r'^[0-9a-fA-F]{64}$');
+  static int _tempFileCounter = 0;
 
   /// Reads a 1-based closed line range from a UTF-8 text file in `/workspace` ([D-012]).
   Future<SyscallResult<Map<String, dynamic>>> readLines({
@@ -456,11 +480,564 @@ class HostFsDriver {
     });
   }
 
+  /// Atomically replaces a unique [oldBlock] in an existing file after CAS SHA-256 verification ([D-013]).
+  ///
+  /// Guarantees zero byte modification to the target file on any validation,
+  /// boundary, CAS mismatch, or block-matching failure.
+  Future<SyscallResult<Map<String, dynamic>>> editBlock({
+    required String path,
+    required String expectedSha256,
+    required String oldBlock,
+    required String newBlock,
+  }) async {
+    if (path.trim().isEmpty) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_ARGS',
+          message: 'Argument "path" must be a non-empty string.',
+          recoverable: true,
+        ),
+      );
+    }
+    final normalizedExpected = expectedSha256.trim().toLowerCase();
+    if (!_sha256Pattern.hasMatch(normalizedExpected)) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_SHA256',
+          message: 'Argument "expectedSha256" must be a 64-character hex SHA-256 digest.',
+          recoverable: true,
+        ),
+      );
+    }
+    if (oldBlock.isEmpty) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'EMPTY_OLD_BLOCK',
+          message: 'Argument "oldBlock" must not be empty.',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final resolvedResult = namespace.resolveVirtualPath(
+      path,
+      allowRoot: false,
+      checkProtected: true,
+      checkSymlinks: true,
+    );
+    if (!resolvedResult.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(resolvedResult.error!);
+    }
+    final resolved = resolvedResult.value!;
+
+    final entityType = FileSystemEntity.typeSync(
+      resolved.hostPath,
+      followLinks: true,
+    );
+    if (entityType == FileSystemEntityType.notFound) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.enoent,
+          reason: 'FILE_NOT_FOUND',
+          message: 'File "${resolved.virtualPath}" does not exist.',
+          recoverable: true,
+        ),
+      );
+    }
+    if (entityType == FileSystemEntityType.directory) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'IS_DIRECTORY',
+          message: 'Path "${resolved.virtualPath}" is a directory and cannot be edited.',
+          recoverable: true,
+        ),
+      );
+    }
+    if (entityType != FileSystemEntityType.file) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'NOT_A_REGULAR_FILE',
+          message: 'Path "${resolved.virtualPath}" is not a regular file.',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final List<int> bytes;
+    try {
+      bytes = await File(resolved.hostPath).readAsBytes();
+    } on FileSystemException catch (e) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.eio,
+          reason: 'FILE_READ_FAILED',
+          message: 'Failed to read "${resolved.virtualPath}": ${e.message}',
+          recoverable: false,
+        ),
+      );
+    }
+
+    final actualSha256 = sha256.convert(bytes).toString();
+    if (actualSha256 != normalizedExpected) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.econflict,
+          reason: 'CAS_HASH_MISMATCH',
+          message:
+              'CAS SHA-256 mismatch for "${resolved.virtualPath}": expected $normalizedExpected, actual $actualSha256.',
+          recoverable: true,
+          hint:
+              'Re-read "${resolved.virtualPath}" with sys_read_lines to obtain the latest sha256 and content.',
+          details: <String, dynamic>{
+            'path': resolved.virtualPath,
+            'expectedSha256': normalizedExpected,
+            'actualSha256': actualSha256,
+          },
+        ),
+      );
+    }
+
+    if (_containsNulByte(bytes)) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'BINARY_FILE',
+          message: 'File "${resolved.virtualPath}" is binary and cannot be block-edited.',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final String decoded;
+    try {
+      decoded = utf8.decode(bytes, allowMalformed: false);
+    } on FormatException {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'BINARY_FILE',
+          message: 'File "${resolved.virtualPath}" is not valid UTF-8 text.',
+          recoverable: true,
+        ),
+      );
+    }
+
+    var effectiveNewBlock = newBlock;
+    var matchOffsets = _findAllMatchOffsets(decoded, oldBlock);
+    var matchedNeedleLength = oldBlock.length;
+
+    if (matchOffsets.isEmpty) {
+      final dominantEol = _detectDominantEol(decoded);
+      final normalizedOld = _normalizeEol(oldBlock, dominantEol);
+      if (normalizedOld != oldBlock) {
+        final normalizedMatches = _findAllMatchOffsets(decoded, normalizedOld);
+        if (normalizedMatches.isNotEmpty) {
+          matchOffsets = normalizedMatches;
+          matchedNeedleLength = normalizedOld.length;
+          effectiveNewBlock = _normalizeEol(newBlock, dominantEol);
+        }
+      }
+    }
+
+    if (matchOffsets.isEmpty) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.econflict,
+          reason: 'TARGET_BLOCK_NOT_FOUND',
+          message:
+              'Target oldBlock was not found in "${resolved.virtualPath}".',
+          recoverable: true,
+          hint:
+              'Inspect the file via sys_read_lines and supply an exact matching block.',
+        ),
+      );
+    }
+
+    if (matchOffsets.length > 1) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.econflict,
+          reason: 'AMBIGUOUS_BLOCK_MATCH',
+          message:
+              'Target oldBlock matched ${matchOffsets.length} locations in "${resolved.virtualPath}"; block must match uniquely.',
+          recoverable: true,
+          hint:
+              'Include additional surrounding context lines in oldBlock so it matches exactly once.',
+          details: <String, dynamic>{
+            'path': resolved.virtualPath,
+            'matchCount': matchOffsets.length,
+          },
+        ),
+      );
+    }
+
+    // All preconditions passed: ensure CoW transaction isolation before touching disk.
+    if (_ensureActiveTransaction != null) {
+      final txRes = await _ensureActiveTransaction();
+      if (!txRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
+      }
+    }
+
+    final matchStart = matchOffsets.first;
+    final updatedText = decoded.replaceRange(
+      matchStart,
+      matchStart + matchedNeedleLength,
+      effectiveNewBlock,
+    );
+    final newBytes = utf8.encode(updatedText);
+
+    final writeErr = await _atomicWriteBytes(resolved.hostPath, newBytes);
+    if (writeErr != null) {
+      return SyscallResult<Map<String, dynamic>>.failure(writeErr);
+    }
+
+    final newSha256 = sha256.convert(newBytes).toString();
+
+    if (_syncWorkingCopySnapshot != null) {
+      final syncRes = await _syncWorkingCopySnapshot();
+      if (!syncRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(syncRes.error!);
+      }
+    }
+
+    return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+      'path': resolved.virtualPath,
+      'previousSha256': actualSha256,
+      'newSha256': newSha256,
+      'bytesWritten': newBytes.length,
+    });
+  }
+
+  /// Creates a new file or performs a CAS-verified whole-file overwrite ([D-013], OM-03).
+  ///
+  /// - Create mode (`createOnly == true` or `expectedSha256 == null`): returns `EEXIST`
+  ///   (`FILE_ALREADY_EXISTS_READ_FIRST`) if the target already exists.
+  /// - Update mode (`expectedSha256 != null && !createOnly`): returns `ENOENT` if missing
+  ///   or `ECONFLICT` (`CAS_HASH_MISMATCH`) if the file's SHA-256 changed.
+  Future<SyscallResult<Map<String, dynamic>>> writeFile({
+    required String path,
+    required String content,
+    String? expectedSha256,
+    bool createOnly = false,
+  }) async {
+    if (path.trim().isEmpty) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_ARGS',
+          message: 'Argument "path" must be a non-empty string.',
+          recoverable: true,
+        ),
+      );
+    }
+    String? normalizedExpected;
+    if (expectedSha256 != null) {
+      normalizedExpected = expectedSha256.trim().toLowerCase();
+      if (!_sha256Pattern.hasMatch(normalizedExpected)) {
+        return const SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.einval,
+            reason: 'INVALID_SHA256',
+            message:
+                'Argument "expectedSha256" must be a 64-character hex SHA-256 digest when provided.',
+            recoverable: true,
+          ),
+        );
+      }
+    }
+
+    final resolvedResult = namespace.resolveVirtualPath(
+      path,
+      allowRoot: false,
+      checkProtected: true,
+      checkSymlinks: true,
+    );
+    if (!resolvedResult.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(resolvedResult.error!);
+    }
+    final resolved = resolvedResult.value!;
+
+    final entityType = FileSystemEntity.typeSync(
+      resolved.hostPath,
+      followLinks: true,
+    );
+    if (entityType == FileSystemEntityType.directory) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'IS_DIRECTORY',
+          message: 'Path "${resolved.virtualPath}" is a directory and cannot be overwritten.',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final bool isCreateMode = createOnly || normalizedExpected == null;
+    String? previousSha256;
+
+    if (isCreateMode) {
+      if (entityType != FileSystemEntityType.notFound) {
+        return SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eexist,
+            reason: 'FILE_ALREADY_EXISTS_READ_FIRST',
+            message:
+                'File "${resolved.virtualPath}" already exists. Read it with sys_read_lines and provide expectedSha256 to update.',
+            recoverable: true,
+            hint:
+                'Call sys_read_lines("${resolved.virtualPath}") first to obtain sha256, then pass expectedSha256 (with createOnly: false) or use sys_edit_block.',
+          ),
+        );
+      }
+    } else {
+      if (entityType == FileSystemEntityType.notFound) {
+        return SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.enoent,
+            reason: 'FILE_NOT_FOUND',
+            message:
+                'File "${resolved.virtualPath}" does not exist for CAS update.',
+            recoverable: true,
+            hint: 'Omit expectedSha256 to create a new file.',
+          ),
+        );
+      }
+      if (entityType != FileSystemEntityType.file) {
+        return SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.einval,
+            reason: 'NOT_A_REGULAR_FILE',
+            message: 'Path "${resolved.virtualPath}" is not a regular file.',
+            recoverable: true,
+          ),
+        );
+      }
+
+      final List<int> existingBytes;
+      try {
+        existingBytes = await File(resolved.hostPath).readAsBytes();
+      } on FileSystemException catch (e) {
+        return SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eio,
+            reason: 'FILE_READ_FAILED',
+            message: 'Failed to read "${resolved.virtualPath}": ${e.message}',
+            recoverable: false,
+          ),
+        );
+      }
+      final actualSha256 = sha256.convert(existingBytes).toString();
+      if (actualSha256 != normalizedExpected) {
+        return SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.econflict,
+            reason: 'CAS_HASH_MISMATCH',
+            message:
+                'CAS SHA-256 mismatch for "${resolved.virtualPath}": expected $normalizedExpected, actual $actualSha256.',
+            recoverable: true,
+            hint:
+                'Re-read "${resolved.virtualPath}" with sys_read_lines to obtain the latest sha256.',
+            details: <String, dynamic>{
+              'path': resolved.virtualPath,
+              'expectedSha256': normalizedExpected,
+              'actualSha256': actualSha256,
+            },
+          ),
+        );
+      }
+      previousSha256 = actualSha256;
+    }
+
+    // All preconditions passed: ensure CoW transaction isolation before touching disk.
+    if (_ensureActiveTransaction != null) {
+      final txRes = await _ensureActiveTransaction();
+      if (!txRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
+      }
+    }
+
+    try {
+      final parentDir = Directory(p.dirname(resolved.hostPath));
+      if (!parentDir.existsSync()) {
+        await parentDir.create(recursive: true);
+      }
+    } on FileSystemException catch (e) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.eio,
+          reason: 'DIRECTORY_CREATE_FAILED',
+          message:
+              'Failed to create parent directory for "${resolved.virtualPath}": ${e.message}',
+          recoverable: false,
+        ),
+      );
+    }
+
+    final newBytes = utf8.encode(content);
+    final writeErr = await _atomicWriteBytes(resolved.hostPath, newBytes);
+    if (writeErr != null) {
+      return SyscallResult<Map<String, dynamic>>.failure(writeErr);
+    }
+
+    final newSha256 = sha256.convert(newBytes).toString();
+
+    if (_syncWorkingCopySnapshot != null) {
+      final syncRes = await _syncWorkingCopySnapshot();
+      if (!syncRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(syncRes.error!);
+      }
+    }
+
+    return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+      'path': resolved.virtualPath,
+      'created': isCreateMode,
+      'previousSha256': previousSha256,
+      'newSha256': newSha256,
+      'bytesWritten': newBytes.length,
+    });
+  }
+
   /// Registers `sys_read_lines`, `sys_glob`, and `sys_grep` on [gate].
   void registerReadSyscalls(SyscallGate gate) {
     for (final def in buildReadSyscallDefinitions()) {
       gate.registerSyscall(def);
     }
+  }
+
+  /// Registers `sys_edit_block` and `sys_write_file` on [gate].
+  void registerWriteSyscalls(SyscallGate gate) {
+    for (final def in buildWriteSyscallDefinitions()) {
+      gate.registerSyscall(def);
+    }
+  }
+
+  /// Registers both Read-Only and CAS Write VFS syscalls on [gate].
+  void registerAllSyscalls(SyscallGate gate) {
+    registerReadSyscalls(gate);
+    registerWriteSyscalls(gate);
+  }
+
+  /// Builds all Read-Only and CAS Write VFS [SyscallDefinition] entries ([D-012], [D-013]).
+  List<SyscallDefinition> buildAllSyscallDefinitions() {
+    return <SyscallDefinition>[
+      ...buildReadSyscallDefinitions(),
+      ...buildWriteSyscallDefinitions(),
+    ];
+  }
+
+  /// Builds [SyscallDefinition] entries for CAS Write VFS syscalls ([D-002], [D-003], [D-013]).
+  List<SyscallDefinition> buildWriteSyscallDefinitions() {
+    return <SyscallDefinition>[
+      SyscallDefinition(
+        name: 'sys_edit_block',
+        requiredRight: CapRight.writeCow,
+        kind: 'edit',
+        applyIoCap: false,
+        validateArgs: _validateEditBlockArgs,
+        checkPreconditions: (_, args) async =>
+            _checkWritePathPrecondition(args['path'] as String),
+        evaluatePolicy: (_, _) async => RingDecision.allow,
+        handler: (exec) => editBlock(
+          path: exec.args['path'] as String,
+          expectedSha256: exec.args['expectedSha256'] as String,
+          oldBlock: exec.args['oldBlock'] as String,
+          newBlock: exec.args['newBlock'] as String,
+        ),
+      ),
+      SyscallDefinition(
+        name: 'sys_write_file',
+        requiredRight: CapRight.writeCow,
+        kind: 'edit',
+        applyIoCap: false,
+        validateArgs: _validateWriteFileArgs,
+        checkPreconditions: (_, args) async =>
+            _checkWritePathPrecondition(args['path'] as String),
+        evaluatePolicy: (_, _) async => RingDecision.allow,
+        handler: (exec) => writeFile(
+          path: exec.args['path'] as String,
+          content: exec.args['content'] as String,
+          expectedSha256: exec.args['expectedSha256'] as String?,
+          createOnly: exec.args['createOnly'] as bool? ?? false,
+        ),
+      ),
+    ];
+  }
+
+  /// Returns canonical tool schemas for all Read-Only and CAS Write VFS syscalls ([D-012], [D-013]).
+  static List<SyscallToolSchema> allToolSchemas() {
+    return <SyscallToolSchema>[
+      ...readToolSchemas(),
+      ...writeToolSchemas(),
+    ];
+  }
+
+  /// Returns canonical tool schemas for `sys_edit_block` and `sys_write_file` ([D-007], [D-013]).
+  static List<SyscallToolSchema> writeToolSchemas() {
+    return <SyscallToolSchema>[
+      SyscallToolSchema(
+        name: 'sys_edit_block',
+        description:
+            'Replace a unique block of text in an existing file inside /workspace after verifying whole-file SHA-256 (CAS).',
+        parametersJsonSchema: const <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'path': <String, dynamic>{
+              'type': 'string',
+              'description': 'Virtual path under /workspace.',
+            },
+            'expectedSha256': <String, dynamic>{
+              'type': 'string',
+              'description':
+                  '64-character lowercase/uppercase hex SHA-256 digest from sys_read_lines or previous edit.',
+            },
+            'oldBlock': <String, dynamic>{
+              'type': 'string',
+              'description': 'Exact non-empty text block to replace (must match uniquely).',
+            },
+            'newBlock': <String, dynamic>{
+              'type': 'string',
+              'description': 'Replacement text block (may be empty to delete oldBlock).',
+            },
+          },
+          'required': <String>['path', 'expectedSha256', 'oldBlock', 'newBlock'],
+        },
+      ),
+      SyscallToolSchema(
+        name: 'sys_write_file',
+        description:
+            'Create a new file or overwrite an existing file in /workspace with mandatory CAS SHA-256 verification for existing files.',
+        parametersJsonSchema: const <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'path': <String, dynamic>{
+              'type': 'string',
+              'description': 'Virtual path under /workspace.',
+            },
+            'content': <String, dynamic>{
+              'type': 'string',
+              'description': 'Complete UTF-8 text content to write.',
+            },
+            'expectedSha256': <String, dynamic>{
+              'type': 'string',
+              'description':
+                  'Required 64-character hex SHA-256 when overwriting an existing file; omit when creating a new file.',
+            },
+            'createOnly': <String, dynamic>{
+              'type': 'boolean',
+              'description':
+                  'When true, strictly requires the target file not to exist (default false).',
+            },
+          },
+          'required': <String>['path', 'content'],
+        },
+      ),
+    ];
   }
 
   /// Builds [SyscallDefinition] entries for Read-Only VFS syscalls ([D-002], [D-006], [D-012]).
@@ -904,6 +1481,176 @@ class HostFsDriver {
       spans.add((start: lineStart, end: text.length));
     }
     return spans;
+  }
+
+  SyscallError? _checkWritePathPrecondition(String rawPath) {
+    final resolved = namespace.resolveVirtualPath(
+      rawPath,
+      allowRoot: false,
+      checkProtected: true,
+      checkSymlinks: true,
+    );
+    return resolved.ok ? null : resolved.error;
+  }
+
+  static SyscallError? _validateEditBlockArgs(Map<String, dynamic> args) {
+    final path = args['path'];
+    if (path is! String || path.trim().isEmpty) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_ARGS',
+        message: 'Argument "path" must be a non-empty string.',
+        recoverable: true,
+      );
+    }
+    final expectedSha256 = args['expectedSha256'];
+    if (expectedSha256 is! String ||
+        !_sha256Pattern.hasMatch(expectedSha256.trim())) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_SHA256',
+        message:
+            'Argument "expectedSha256" must be a 64-character hex SHA-256 digest.',
+        recoverable: true,
+      );
+    }
+    final oldBlock = args['oldBlock'];
+    if (oldBlock is! String || oldBlock.isEmpty) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'EMPTY_OLD_BLOCK',
+        message: 'Argument "oldBlock" must be a non-empty string.',
+        recoverable: true,
+      );
+    }
+    final newBlock = args['newBlock'];
+    if (newBlock is! String) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_ARGS',
+        message: 'Argument "newBlock" must be a string.',
+        recoverable: true,
+      );
+    }
+    return null;
+  }
+
+  static SyscallError? _validateWriteFileArgs(Map<String, dynamic> args) {
+    final path = args['path'];
+    if (path is! String || path.trim().isEmpty) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_ARGS',
+        message: 'Argument "path" must be a non-empty string.',
+        recoverable: true,
+      );
+    }
+    final content = args['content'];
+    if (content is! String) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_ARGS',
+        message: 'Argument "content" must be a string.',
+        recoverable: true,
+      );
+    }
+    final expectedSha256 = args['expectedSha256'];
+    if (expectedSha256 != null &&
+        (expectedSha256 is! String ||
+            !_sha256Pattern.hasMatch(expectedSha256.trim()))) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_SHA256',
+        message:
+            'Argument "expectedSha256" must be a 64-character hex SHA-256 digest when provided.',
+        recoverable: true,
+      );
+    }
+    final createOnly = args['createOnly'];
+    if (createOnly != null && createOnly is! bool) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_ARGS',
+        message: 'Argument "createOnly" must be a boolean.',
+        recoverable: true,
+      );
+    }
+    return null;
+  }
+
+  static List<int> _findAllMatchOffsets(String haystack, String needle) {
+    if (needle.isEmpty) {
+      return const <int>[];
+    }
+    final offsets = <int>[];
+    var start = 0;
+    while (start <= haystack.length - needle.length) {
+      final idx = haystack.indexOf(needle, start);
+      if (idx < 0) {
+        break;
+      }
+      offsets.add(idx);
+      start = idx + 1;
+    }
+    return offsets;
+  }
+
+  static String _detectDominantEol(String text) {
+    var crlfCount = 0;
+    var lfOnlyCount = 0;
+    for (var i = 0; i < text.length; i++) {
+      final unit = text.codeUnitAt(i);
+      if (unit == 0x0D /* \r */) {
+        if (i + 1 < text.length && text.codeUnitAt(i + 1) == 0x0A /* \n */) {
+          crlfCount++;
+          i++;
+        }
+      } else if (unit == 0x0A /* \n */) {
+        lfOnlyCount++;
+      }
+    }
+    if (crlfCount > 0 && crlfCount >= lfOnlyCount) {
+      return '\r\n';
+    }
+    return '\n';
+  }
+
+  static String _normalizeEol(String input, String targetEol) {
+    final unified = input.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    if (targetEol == '\r\n') {
+      return unified.replaceAll('\n', '\r\n');
+    }
+    return unified;
+  }
+
+  Future<SyscallError?> _atomicWriteBytes(String hostPath, List<int> bytes) async {
+    final parentDir = p.dirname(hostPath);
+    final baseName = p.basename(hostPath);
+    final seq = _tempFileCounter++;
+    final tempPath = p.join(
+      parentDir,
+      '.agent_os_tmp_${pid}_${DateTime.now().microsecondsSinceEpoch}_${seq}_$baseName',
+    );
+    final tempFile = File(tempPath);
+    try {
+      await tempFile.writeAsBytes(bytes, flush: true);
+      await tempFile.rename(hostPath);
+      return null;
+    } on FileSystemException catch (e) {
+      try {
+        if (tempFile.existsSync()) {
+          tempFile.deleteSync();
+        }
+      } catch (_) {
+        // Best-effort cleanup of temp file.
+      }
+      return SyscallError(
+        code: SyscallErrorCode.eio,
+        reason: 'FILE_WRITE_FAILED',
+        message: 'Failed to atomically write "$hostPath": ${e.message}',
+        recoverable: false,
+      );
+    }
   }
 }
 
