@@ -1,10 +1,10 @@
 # 3 LLM プロバイダ仕様・KV キャッシュ監視・モデル切替互換性
 
-- **確認日**: `2026-11-19`
+- **確認日**: `2026-11-19`（Stage 1 `WP-4` / `WP-9` / `AT-01` 実機検証結果を追記反映）
 - **対象プロバイダ**:
-  1. **Local Ollama**: `ollama 0.40.16`（`http://localhost:11434` — **本機で実測確認済み**）
-  2. **Ollama Cloud**: `https://ollama.com`（公式一次資料で確認。`OLLAMA_API_KEY` 未設定のため実機通信は未実施）
-  3. **OpenRouter**: `https://openrouter.ai/api/v1`（公式一次資料で確認。`OPENROUTER_API_KEY` 未設定のため実機通信は未実施）
+  1. **Local Ollama**: `ollama 0.40.16`（`http://localhost:11434` および `http://192.168.0.5:11434/v1` → `/api/chat` 正規化 — **実機 API・Tool Call・KV キャッシュ上昇確認済み**）
+  2. **Ollama Cloud**: `https://ollama.com`（`OLLAMA_API_KEY` 設定環境にて `gpt-oss:120b` で **実機 API・Tool Call・連続ターン `prompt_eval_cached_count` 上昇確認済み**）
+  3. **OpenRouter**: `https://openrouter.ai/api/v1`（`OPENROUTER_API_KEY` 設定環境にて `openai/gpt-4o-mini`・`anthropic/claude-haiku-4.5` で **実機 API・Tool Call・連続ターン `cachedTokens` 上昇確認済み**）
 
 ---
 
@@ -21,7 +21,9 @@
 | `gpt-oss:20b` | 13.79 GB | 20.9B / `MXFP4` | `completion`, **`tools`**, **`thinking`** | 大型ローカルモデルの検証に利用可 |
 | `nomic-embed-text:latest` | 0.27 GB | 137M / `F16` | 埋め込み専用 | チャット不可（除外すること） |
 
-> **環境変数の注意**: 本機には `OLLAMA_HOST=0.0.0.0`（サーバー待受バインド指定）が設定されている。クライアント実装が `OLLAMA_HOST` をそのまま接続先 URL に使う場合は、`0.0.0.0` を `127.0.0.1` / `localhost` へ正規化するか、明示的な設定値 `http://localhost:11434` を優先すること。
+> **環境変数の注意と `/v1` サフィックス正規化（Stage 1 実装・実測確定）**:
+> - 本機には `OLLAMA_HOST=0.0.0.0`（サーバー待受バインド指定）や、OpenAI 互換ツール向けの `OLLAMA_HOST=http://192.168.0.5:11434/v1` が設定されるケースがある。
+> - `OllamaDriver.normalizeChatEndpoint`（`packages/agent_drivers/lib/src/llm/ollama_driver.dart`）では、`0.0.0.0` / `::` / `[::]` を `127.0.0.1` へ正規化するのに加え、**末尾の `/` および `/v1` サフィックスを除去してネイティブ `/api/chat` エンドポイント（例: `http://192.168.0.5:11434/api/chat`）へ接続する**。これにより、`OLLAMA_HOST` に `/v1` が含まれていても §1.2 のストリーム時キャッシュ統計欠落を回避し、`prompt_eval_cached_count` を正確に取得できることを実機確認済み。
 
 ### 1.2 【重要実測】OpenAI 互換 `/v1/chat/completions` vs ネイティブ `/api/chat` 比較
 
@@ -55,7 +57,7 @@
 | OpenAI 互換エンドポイント | **`https://ollama.com/v1/chat/completions`**（ベース URL `https://ollama.com/v1`） |
 | 認証方式 | HTTP ヘッダ **`Authorization: Bearer <OLLAMA_API_KEY>`**（環境変数 `OLLAMA_API_KEY`） |
 | リクエスト・レスポンス構造 | Local Ollama と同一のプロトコル仕様（`messages`, `tools`, `stream`）。したがって Local Ollama 用ドライバに対して **ベース URL（`http://localhost:11434` vs `https://ollama.com`）と `Authorization` ヘッダ有無** を切り替えるだけで共通実装にできる。 |
-| 注意・未確認点 | クラウド側インフラでの `keep_alive` 無視有無や、クラウド実行時の `prompt_eval_cached_count` 返却有無は、`OLLAMA_API_KEY` 設定後の実機疎通で確認が必要（フィールド自体は Optional / nullable として欠損時も `0` または `null` で安全にフォールバックさせること）。 |
+| 運用確認済み事項（`WP-9` / `AT-01` 実測） | `https://ollama.com/api/chat`（`gpt-oss:120b`）に対し `Authorization: Bearer` 認証で実機リクエスト・Tool Call 往復・NDJSON ストリームの `prompt_eval_cached_count` 返却および連続ターンでの上昇（`64` → `3,008` [`0.9801`]、`1,776` → `13,344` [`0.9752`]、`64` → `6,080` [`0.9872`]）を確認済み。 |
 
 ---
 
@@ -107,9 +109,17 @@
 
 ---
 
-## 5. 未確認事項と依存作業の開始条件
+## 5. Stage 1 実機 API 検証結果（`WP-4` / `WP-9` / `AT-01` 確定知見）
 
-- **未確認**: `OPENROUTER_API_KEY` および `OLLAMA_API_KEY` が現在未設定のため、OpenRouter および Ollama Cloud に対する実機 HTTP リクエストとレスポンス観測（E2）は未実施。
-- **影響範囲と開始条件**:
-  - アーキテクチャ設計・インターフェース設計・Local Ollama を用いた単体/結合開発は**直ちに開始可能**。
-  - Stage 1 受け入れ条件である「3 プロバイダすべてでの実機 API 動作確認（E2）」を実施する前までに、利用者が `OPENROUTER_API_KEY` と `OLLAMA_API_KEY` を実行環境へ設定すること。
+`OPENROUTER_API_KEY` および `OLLAMA_API_KEY` を設定した実機環境（`.agent_os/.env` またはプロセス環境変数経由で注入、`SecretRedactor` によりログ上は `<REDACTED>` 保護）にて、3 プロバイダすべての実機 HTTP 通信・Tool Call 往復・連続ターンキャッシュ上昇・毎ターン切替を確認済みである。
+
+| プロバイダ | 実機確認モデル | 実測結果（Tool Call・キャッシュ統計・コスト） |
+| :--- | :--- | :--- |
+| **Local Ollama** | `qwen3.8:27b`, `gemma4:12b` | `OLLAMA_HOST=http://192.168.0.5:11434/v1` の `/v1` 除去→ネイティブ `/api/chat` 接続で全 Tool Call 往復成功。連続ターンで `prompt_eval_cached_count`（`cachedTokens`）の上昇を確認（例: `qwen3.8:27b` `2,117` → `14,843` → `23,864` / `0.9882`、`gemma4:12b` `0` → `1,691` / `0.9872`）。 |
+| **OpenRouter** | `openai/gpt-4o-mini`, `anthropic/claude-haiku-4.5` | - `openai/gpt-4o-mini`: `session_id` / `x-session-id` Sticky Routing 併用により、最小閾値（2,048 tokens 以上）環境下で連続ターン `cachedTokens` 上昇（`0` → `1,792` [`0.8339`]、`0` → `13,440` [`0.9871`] → `13,696` [`0.9956`]、`0` → `5,120` [`0.9217`]）および `costMicroUsd` 低下（`792` → `644`）を確認。<br>- `anthropic/claude-haiku-4.5`: `anthropic/` 向け `cache_control: {"type": "ephemeral"}` 自動射影により、1 ターン目 `cachedTokens: 0, cacheWriteTokens: 6,825`（`$0.009073`）→ 2 ターン目 `cachedTokens: 6,825`（`0.9629`, `$0.001650`）のキャッシュヒットを確認。 |
+| **Ollama Cloud** | `gpt-oss:120b` | `https://ollama.com/api/chat` にて Tool Call 往復成功。連続ターンで `prompt_eval_cached_count`（`cachedTokens`）上昇（`64` → `3,008` [`0.9801`]、`1,776` → `13,344` [`0.9752`]、`64` → `6,080` [`0.9872`]）を確認。 |
+| **3 プロバイダ連続切替** | 同一セッション内で `local-ollama` → `openrouter` → `ollama-cloud` → `local-ollama` | Canonical IR 射影（`tool_call_id` 正規化・`reasoning_details` 扱い・Segment 0〜2 構造）により、`400 Bad Request` ゼロで前ターンの文脈・読取値を継承して Tool Call 完走を確認。 |
+
+> **残る運用上の注意**:
+> - 短プロンプト（1,024〜2,048 tokens 未満）時は OpenRouter 側仕様により `cached_tokens: 0` のままとなる（実機でも小規模リポジトリ単発ターンでは `0`、Prefix 2,048 tokens 以上では一貫して上昇することを確認）。
+> - OpenRouter / Ollama Cloud を別リポジトリ（`--cwd <target_repo>`）で運用する場合は、子デーモンが `<target_repo>` で起動されるため、プロセス環境変数または `<target_repo>/.agent_os/.env` へ API キーを設定すること。

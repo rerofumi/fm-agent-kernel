@@ -1,5 +1,5 @@
 tier: Full
-state: accepting
+state: done
 worklog: disabled
 
 # 90_status.md — 進捗正本（`plan_20261119_stage1_kernel_agent`）
@@ -25,13 +25,13 @@ worklog: disabled
 | 現在の工程 / 担当 | `implement` / `Lv.2 implement`（`fm-dev-process` 兼任トップ agent） |
 | 担当leaderの実行参照 | `conversation://e2b8df2b-9e1b-44fe-a11a-fef38f2977b6` |
 | 呼び出し元 / 返却先 | 利用者 / 利用者（Lv.1 `fm-dev-process`） |
-| 工程の結果 | 進行中（`WP-1`〜`WP-9` 実装・統合完了、独立受け入れ `accepting` へ移行） |
+| 工程の結果 | `complete`（`WP-1`〜`WP-9` 完了・独立受け入れ `AT-01` 全 11 REQ `pass`・完了処理 `RL-01` 完了） |
 | 採用計画 | `r1`（復元用参照: `jj` commit `4cff83b3`［`main`］＋ `docs/plan_20261119_stage1_kernel_agent/env_manifest.md` の 30 ファイル SHA-256、最終レビュー承認: `50_review_notes.md` §6 `PT-11`） |
-| 利用可能な計画版 | `r1`（採用済み） |
+| 利用可能な計画版 | `r1`（採用済み・完了） |
 | 改訂案 | なし |
 | 再計画要求 | なし |
-| 現在の作業 / 次の作業 | `IT-09`（`WP-9`）完了・全 `REQ-01`〜`REQ-11` 実装および 3 プロバイダ＋両 `.exe` 通し E2E 証跡（`evidence_wp9.md`）確定。次は `AT-01`（独立受け入れ `fm-dev-acceptance`）を依頼予定 / 受け入れ全 pass 後に `fm-dev-release` を実行 |
-| 保留理由 / 再開条件 | 保留なし |
+| 現在の作業 / 次の作業 | 未了作業なし（Stage 1 全範囲 `REQ-01`〜`REQ-11` 受け入れ完了・現行文書 `README.md` および `docs/cheatsheet/` 反映・`.planworks/` 整理済み） |
+| 保留理由 / 再開条件 | なし（完了） |
 
 ## 計画成果物と担当範囲
 
@@ -49,10 +49,7 @@ worklog: disabled
 
 ## 現在進行中・未了の作業
 
-| 作業ID | 参照REQ / WP | 担当役・実行参照 | 状況 | 開始条件・成果・次の条件 |
-| --- | --- | --- | --- | --- |
-| `AT-01` | `REQ-01`〜`REQ-11` 全件 / 最終受け入れ | `fm-dev-acceptance` / 依頼予定（`swarm:acceptance-agent`, `gemini-4-hydrogen-high`） | 依頼予定 | 製品・テスト確定版 `d57bbe16226385daee987e77583ee69499a91e3d`＋両 `.exe`＋`env_manifest.md`＋`evidence_wp9.md` を作成者から独立に照合・E1/E2/E3 確認し `REQ-01`〜`REQ-11` 判定を返却 |
-| `RL-01` | 完了処理・文書反映 | `fm-dev-release`（予定） | 未着手 | `AT-01` で現行全 REQ が `pass` となった後に実施 |
+- 未了作業: **なし**（全実装作業 `IT-01`〜`IT-09`、独立受け入れ `AT-01`、完了処理 `RL-01` はすべて完了・回収済み。詳細は下記「履歴」節を参照）。
 
 ## おまかせ判断記録
 
@@ -71,17 +68,17 @@ worklog: disabled
 
 | ID | Requirement summary | 対象設計ID | 状態 | Verification method | Evidence class | WP | Implementer state | Evidence | Acceptance |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `REQ-01` | 防波堤カーネル骨格（`SyscallGate` 単一通過・PCB/Ring・依存分離）と I/O 出力サイズ強制キャップ | `D-001, D-002, D-004, D-005, D-006` | 今回実装 | 依存構造確認＋キャップ境界自動テスト＋1万行超/大量検索の実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-4, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"静的解析・全単体/統合テスト・構造確認（E1 / E3）"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-02` | Read-Only 探索（`sys_read_lines`/`glob`/`grep`）と `JjDriver` 非破壊読取によるリポジトリ自律読解 | `D-003, D-004, D-011, D-012, D-014` | 今回実装 | 保護/スコープ外遮断・未スナップショット下の `op_id` 不変テスト＋実 `jj` リポジトリ読解観測 | `E1 / E2` | `WP-2, WP-3, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 1：3 プロバイダ実機 API 疎通＆同一セッション連続ターン切替"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-03` | Canonical IR と 3 プロバイダ（Local Ollama / OpenRouter / Ollama Cloud）実機対応・毎ターン切替 | `D-002, D-004, D-007, D-008, D-009` | 今回実装 | IR射影・優先順位・異常系テスト＋3プロバイダ全実機 Tool Call・連続切替観測 | `E1 / E2` | `WP-2, WP-4, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 1：3 プロバイダ実機 API 疎通＆同一セッション連続ターン切替"` | `unverified`: 独立受け入れ待ち |
-| `REQ-04` | `syscalls.jsonl`（`jjOpId` 紐付け）監査ログと `llm_io.jsonl`（`cached_tokens` 上昇）監視 | `D-002, D-003, D-004, D-010, D-014` | 今回実装 | 全経路出力・秘密マスクテスト＋`jj op show` 突合・復元後ログ保持・連続ターン `cachedTokens` 上昇観測 | `E1 / E2` | `WP-2, WP-3, WP-4, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"監査ログ突合・秘密非露出検査"` | `unverified`: 独立受け入れ待ち |
-| `REQ-05` | `JjDriver` トランザクション制御（`op_id` 記録・`jj new` 分離で `@-` 保護・`squash`・`op restore` 1発復元） | `D-003, D-014, D-015` | 今回実装 | `@-` バイト一致・`op restore` 完全復元・非対話 `squash`・不正 `op_id` 拒否テスト＋実機観測 | `E1 / E2` | `WP-3, WP-6, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-06` | CAS（SHA-256 ハッシュ照合）付きファイル編集（`sys_edit_block`, `sys_write_file`） | `D-004, D-011, D-012, D-013` | 今回実装 | CAS一致/不一致・未読上書き・曖昧一致・保護/スコープ外拒否（元ファイル無変更）テスト＋実機観測 | `E1 / E2` | `WP-2, WP-6, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-07` | Windows Job Object（Win32 FFI）外部コマンド実行 `sys_exec` とタイムアウト時の子孫一括強制終了 | `D-006, D-016` | 今回実装 | 144B FFI＆APIキー除外構造確認＋短命レース確認＋親・孫 PID 生存0件テスト・実機観測 | `E1 / E2 / E3` | `WP-1, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"静的解析・全単体/統合テスト・構造確認（E1 / E3）"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-08` | `beforeSyscall` Hook 機構と Anti-Git-Habit Guard（生 `git`/`jj` 遮断と `sys_jj_*` 自律誘導） | `D-002, D-017` | 今回実装 | 承認要求0回での複合生 `git`/`jj` 事前遮断テスト＋遮断→次ステップ `sys_jj_*` 自律切替観測 | `E1 / E2` | `WP-2, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-09` | ACP（JSON-RPC 2.0 over `stdio`）サーバー分離・リアルタイム状態通知・簡易 CLI クライアント | `D-018, D-019, D-021` | 今回実装 | `stdout` NDJSON純度・`_meta` 準拠・異常系テスト＋`acp_cli_client` 対話・ストリーム・`/model` 切替観測 | `E1 / E2` | `WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 1：3 プロバイダ実機 API 疎通＆同一セッション連続ターン切替"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-10` | 保護リング（Ring 2）承認ゲート（`WAITING_APPROVAL` 一時停止・承認進行・拒否時 `EACCES` 防波堤） | `D-002, D-003, D-004, D-016, D-020` | 今回実装 | 5条件境界・拒否時副作用ゼロ＆`EACCES` テスト＋ACP 承認確定および拒否→代替/ロールバック実機観測 | `E1 / E2` | `WP-2, WP-7, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
-| `REQ-11` | `dart compile exe` 単一ネイティブ実行ファイル化と Stage 1 通しシナリオ完走 | `D-001, D-021, D-022` | 今回実装 | 両 `.exe` ビルド＆`dart` 除外 `PATH` 起動確認＋ビルド済み `.exe` による Stage 1 E2E 通し実機観測 | `E1 / E2` | `WP-1, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"ネイティブ .exe SHA-256 整合と dart 除外 PATH 単体起動"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `unverified`: 独立受け入れ待ち |
+| `REQ-01` | 防波堤カーネル骨格（`SyscallGate` 単一通過・PCB/Ring・依存分離）と I/O 出力サイズ強制キャップ | `D-001, D-002, D-004, D-005, D-006` | 今回実装 | 依存構造確認＋キャップ境界自動テスト＋1万行超/大量検索の実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-4, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"00:44 +101: All tests passed!"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-02` | Read-Only 探索（`sys_read_lines`/`glob`/`grep`）と `JjDriver` 非破壊読取によるリポジトリ自律読解 | `D-003, D-004, D-011, D-012, D-014` | 今回実装 | 保護/スコープ外遮断・未スナップショット下の `op_id` 不変テスト＋実 `jj` リポジトリ読解観測 | `E1 / E2` | `WP-2, WP-3, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"E2 実機再現による独立確認結果"`, `evidence_wp9.md:"Part 1：3 プロバイダ実機 API 疎通＆同一セッション連続ターン切替"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-03` | Canonical IR と 3 プロバイダ（Local Ollama / OpenRouter / Ollama Cloud）実機対応・毎ターン切替 | `D-002, D-004, D-007, D-008, D-009` | 今回実装 | IR射影・優先順位・異常系テスト＋3プロバイダ全実機 Tool Call・連続切替観測 | `E1 / E2` | `WP-2, WP-4, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"E2 実機再現による独立確認結果"`, `evidence_wp9.md:"Part 1：3 プロバイダ実機 API 疎通＆同一セッション連続ターン切替"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-04` | `syscalls.jsonl`（`jjOpId` 紐付け）監査ログと `llm_io.jsonl`（`cached_tokens` 上昇）監視 | `D-002, D-003, D-004, D-010, D-014` | 今回実装 | 全経路出力・秘密マスクテスト＋`jj op show` 突合・復元後ログ保持・連続ターン `cachedTokens` 上昇観測 | `E1 / E2` | `WP-2, WP-3, WP-4, WP-5, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"syscalls.jsonl 54 / 54 レコード"`, `evidence_wp9.md:"matched = 62 / 62"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-05` | `JjDriver` トランザクション制御（`op_id` 記録・`jj new` 分離で `@-` 保護・`squash`・`op restore` 1発復元） | `D-003, D-014, D-015` | 今回実装 | `@-` バイト一致・`op restore` 完全復元・非対話 `squash`・不正 `op_id` 拒否テスト＋実機観測 | `E1 / E2` | `WP-3, WP-6, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"/rollback 1 発復元＋ログ保持"`, `evidence_wp9.md:"Part 2：Stage 1 全 REQ 横断 E2E 通しシナリオ"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-06` | CAS（SHA-256 ハッシュ照合）付きファイル編集（`sys_edit_block`, `sys_write_file`） | `D-004, D-011, D-012, D-013` | 今回実装 | CAS一致/不一致・未読上書き・曖昧一致・保護/スコープ外拒否（元ファイル無変更）テスト＋実機観測 | `E1 / E2` | `WP-2, WP-6, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"CAS 拒否と無変更保証"`, `evidence_wp9.md:"CAS_HASH_MISMATCH"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-07` | Windows Job Object（Win32 FFI）外部コマンド実行 `sys_exec` とタイムアウト時の子孫一括強制終了 | `D-006, D-016` | 今回実装 | 144B FFI＆APIキー除外構造確認＋短命レース確認＋親・孫 PID 生存0件テスト・実機観測 | `E1 / E2 / E3` | `WP-1, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"Win32 Job Object 強制終了"`, `packages/agent_drivers/lib/src/exec/win32_job_exec_driver.dart:"jobExtendedLimitInfoStructBytes = 144"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-08` | `beforeSyscall` Hook 機構と Anti-Git-Habit Guard（生 `git`/`jj` 遮断と `sys_jj_*` 自律誘導） | `D-002, D-017` | 今回実装 | 承認要求0回での複合生 `git`/`jj` 事前遮断テスト＋遮断→次ステップ `sys_jj_*` 自律切替観測 | `E1 / E2` | `WP-2, WP-7, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"Anti-Git-Habit Guard（REQ-08）"`, `evidence_wp9.md:"decision=HOOK_BLOCKED"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-09` | ACP（JSON-RPC 2.0 over `stdio`）サーバー分離・リアルタイム状態通知・簡易 CLI クライアント | `D-018, D-019, D-021` | 今回実装 | `stdout` NDJSON純度・`_meta` 準拠・異常系テスト＋`acp_cli_client` 対話・ストリーム・`/model` 切替観測 | `E1 / E2` | `WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"E2 実機再現による独立確認結果"`, `packages/agent_acp/lib/src/acp_server.dart:"class AcpServer"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-10` | 保護リング（Ring 2）承認ゲート（`WAITING_APPROVAL` 一時停止・承認進行・拒否時 `EACCES` 防波堤） | `D-002, D-003, D-004, D-016, D-020` | 今回実装 | 5条件境界・拒否時副作用ゼロ＆`EACCES` テスト＋ACP 承認確定および拒否→代替/ロールバック実機観測 | `E1 / E2` | `WP-2, WP-7, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"Ring 2 reject_once 副作用ゼロ"`, `evidence_wp9.md:"decision=DENIED_BY_USER"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
+| `REQ-11` | `dart compile exe` 単一ネイティブ実行ファイル化と Stage 1 通しシナリオ完走 | `D-001, D-021, D-022` | 今回実装 | 両 `.exe` ビルド＆`dart` 除外 `PATH` 起動確認＋ビルド済み `.exe` による Stage 1 E2E 通し実機観測 | `E1 / E2` | `WP-1, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"dart / mise 除外 PATH での単体 .exe ハンドシェイク"`, `acceptance_report.md:"allow_once sys_tx_squash"` | `pass`（`fm-dev-acceptance` `AT-01`, 版 `d57bbe16`: `acceptance_report.md`） |
 
 ## 履歴
 
@@ -157,7 +154,17 @@ worklog: disabled
 未了・次の引き渡し: ビルド済み両 `.exe` を `WP-9`（3 プロバイダ実機 API 全 REQ 通し E2E 確認）へ引き渡し
 
 履歴ID / 対象（作業・REQ/WP・文書）: IT-09 / WP-9（Stage 1 最終統合確認ゲート：3 プロバイダ実機 API＋両 `.exe` 全 REQ 通し E2E 確認：REQ-01〜REQ-11）
-担当 / 実行参照 / 対象版: fm-dev-develop / swarm:wp9-dev (conversation://c896c65c-f760-45cc-84a4-5fa8fc73472f, gemini-4-hydrogen-high) / 計画版 r1・製品確定版 d57bbe16226385daee987e77583ee69499a91e3d（製品コード修正 0 件）
+担当 / 実行参照 / 対象版: fm-dev-develop / swarm:wp9-dev (conversation://c896c65c-f760-45cc-84a4-5fa8fc73472f, gemini-4-hydrogen-high) / 計画版 r1・製品確定版 d57bbe16226385daee987e77583ee69499a91e3d（証跡確定版 uzwmyton 13ed1124）
 結果 / 証跡への参照: 完了（E1/E2/E3：dart analyze 0 issues, 101/101 pass, 両 .exe SHA-256 一致・dart 除外 PATH 起動、local-ollama/openrouter/ollama-cloud 3 プロバイダ連続切替＆全 8 ステップ E2E 完走、syscalls.jsonl 62/62 jjOpId 突合、secretLeaks=0） / docs/plan_20261119_stage1_kernel_agent/evidence_wp9.md:"監査ログ突合・秘密非露出検査"
 未了・次の引き渡し: 確定成果版・両 `.exe`・`env_manifest.md`・`evidence_wp9.md` を独立受け入れ担当（`fm-dev-acceptance`）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: AT-01 / 独立最終受け入れ（REQ-01〜REQ-11 全件）
+担当 / 実行参照 / 対象版: fm-dev-acceptance / swarm:acceptance-agent (conversation://2d9ee60e-f1d1-477d-9835-3b15b94f567b, gemini-4-hydrogen-high) / 計画版 r1・製品確定版 d57bbe16226385daee987e77583ee69499a91e3d（証跡版 uzwmyton 13ed1124）
+結果 / 証跡への参照: 全 11 REQ `pass`（Critical=0, Must-fix=0, Suggest=1 [S-01: .planworks/wp1_ffi_gate 整理推奨]）。env_manifest 30/30＋両 .exe SHA-256 一致、E1 101/101 pass、E3 構造確認、E2 3プロバイダ独立実機再現（cachedTokens 3プロバイダ全上昇、syscalls.jsonl 54/54 突合、secretLeaks=0） / docs/plan_20261119_stage1_kernel_agent/acceptance_report.md:"総合結論"
+未了・次の引き渡し: 完了処理・現行文書反映・`.planworks/` 整理を `fm-dev-release`（`RL-01`）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: RL-01 / 完了処理・現行文書反映・一時領域整理（`README.md`, `docs/cheatsheet/*`, `.planworks/` 削除）
+担当 / 実行参照 / 対象版: fm-dev-release / swarm:release-agent (conversation://be6501de-7bd8-4d9a-b90b-1d0e2ba17588, gemini-4-hydrogen-high) / 計画版 r1・製品確定版 d57bbe16226385daee987e77583ee69499a91e3d（製品コード・テスト・`.exe` 無変更確認済み）
+結果 / 証跡への参照: 完了（E1/E3：`README.md` 新規作成、`docs/cheatsheet/llm_providers_and_cache.md`・`index.md` 実測反映、`.planworks/` 削除整理 [`S-01` 解消]、リンク検証 `linkErrors=0`、`secretLeaks=0`、製品差分 `0 files changed`、両 `.exe` SHA-256 一致） / README.md:"fm-agent-os-2"
+未了・次の引き渡し: 全完了条件成立。`90_status.md` および `docs/plan_index.md` を `done` として利用者へ返却
 ```
