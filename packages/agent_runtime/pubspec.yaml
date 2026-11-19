@@ -1,0 +1,19 @@
+name: agent_runtime
+description: User-space ProcessRunner, LeadAgent ReAct loop, and compile-time KernelBootstrap.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+
+resolution: workspace
+
+dependencies:
+  agent_drivers: ^0.1.0
+  agent_kernel: ^0.1.0
+  args: ^2.5.0
+  path: ^1.9.0
+
+dev_dependencies:
+  lints: ">=5.0.0 <7.0.0"
+  test: ^1.25.0

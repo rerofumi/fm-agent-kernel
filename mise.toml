@@ -1,0 +1,5 @@
+[tools]
+dart = "3.14.1"
+
+[env]
+OLLAMA_HOST = "http://192.168.0.5:11434/v1"

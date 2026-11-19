@@ -1,5 +1,5 @@
 tier: Full
-state: planned
+state: implementing
 worklog: disabled
 
 # 90_status.md — 進捗正本（`plan_20261119_stage1_kernel_agent`）
@@ -11,22 +11,27 @@ worklog: disabled
 - **細部判断方針**: **おまかせ合意済み**（`docs/01_idea.md`、`docs/02_development_step.md`、`docs/references/agent_kernel_plan/` の方針を損なわない解釈を採用し、本ファイルの「おまかせ判断記録」に `選択肢 → 採用 → 理由 → 残る制約` を記録済み）。
 - **指摘対応モード / 反復上限**: `通常` モード（`Critical` / `Must-fix` を修正対象、`Suggest` は記録・見送り可）/ 修正ラウンド上限 `3` 回（plan 工程では `1 / 3` 回使用し `Must-fix` 0 件で完了）。
 - **検証環境の合意条件**: Stage 1 の実機動作確認（`E2`）では **`Local Ollama`・`OpenRouter`・`Ollama Cloud` の 3 プロバイダすべてで実機 API 動作確認** を行う前提とする。
+- **実装工程の利用者指示（2026-11-19 追加反映）**:
+  - 開発環境は **`mise`（`mise.toml` による Dart SDK `>=3.10.0` 管理）** と **`jj`（既存 colocated リポジトリ `4cff83b3` を起点とした変更管理）** で整備する。
+  - Lv.3 subagent モデルは **`gemini-4-hydrogen-high`（Gemini 4 Hydrogen）** を使用する（委譲ネスト禁止・深度 1 固定）。
+  - Local Ollama の接続先は **`http://192.168.0.5:11434/v1`** を使用する（`OM-07` のネイティブ `/api/chat` ストリーミング＋`prompt_eval_cached_count` 取得仕様と両立させるため、`OllamaDriver` で末尾 `/v1` を正規化除去して `http://192.168.0.5:11434/api/chat` へ接続する）。
+  - その他 LLM プロバイダ（`OPENROUTER_API_KEY` / `OLLAMA_API_KEY`：前提 `P-2`）が必要になる時点（`WP-9` 開始前）で利用者へ尋ねる。
 - **環境宣言ファイル**: `docs/plan_20261119_stage1_kernel_agent/env_manifest.md`
 
 ## 現在の進行
 
 | 項目 | 内容 |
 | --- | --- |
-| 現在の工程 / 担当 | `plan`（返却済み） / 次の担当: `implement` (`Lv.2 implement` / `fm-dev-implement`) |
-| 担当leaderの実行参照 | `conversation://e79345a5-33ab-40b4-92da-95704e65364b` |
-| 呼び出し元 / 返却先 | 利用者 / 利用者（次工程入口: `fm-dev-implement` または `fm-dev-process`） |
-| 工程の結果 | `ready`（計画版 `r1` 確定・独立レビュー阻害事項 `0` 件：`50_review_notes.md` §6 参照） |
-| 採用計画 | 未採用（初回計画返却済み・`implement` 取り込み前） |
-| 利用可能な計画版 | `r1`（復元用ハッシュ参照: `docs/plan_20261119_stage1_kernel_agent/env_manifest.md`、最終レビュー承認: `docs/plan_20261119_stage1_kernel_agent/50_review_notes.md` §6） |
+| 現在の工程 / 担当 | `implement` / `Lv.2 implement`（`fm-dev-process` 兼任トップ agent） |
+| 担当leaderの実行参照 | `conversation://e2b8df2b-9e1b-44fe-a11a-fef38f2977b6` |
+| 呼び出し元 / 返却先 | 利用者 / 利用者（Lv.1 `fm-dev-process`） |
+| 工程の結果 | 進行中（`WP-1` 着手） |
+| 採用計画 | `r1`（復元用参照: `jj` commit `4cff83b3`［`main`］＋ `docs/plan_20261119_stage1_kernel_agent/env_manifest.md` の 30 ファイル SHA-256、最終レビュー承認: `50_review_notes.md` §6 `PT-11`） |
+| 利用可能な計画版 | `r1`（採用済み） |
 | 改訂案 | なし |
 | 再計画要求 | なし |
-| 現在の作業 / 次の作業 | 計画工程の未了作業なし / 次工程 `fm-dev-implement` にて計画版 `r1` を採用し、`WP-1`（前提 `P-1` Dart SDK 導入・`jj git init --colocate`・4 パッケージ骨格・AOT Job Object FFI 最小ゲート確認）から実装開始 |
-| 保留理由 / 再開条件 | 計画工程の保留なし（実装工程での開始条件：① `WP-1` 内で前提 `P-1`［Dart SDK `>=3.10.0`］を導入し Go 判定 4 条件を通過してから `WP-2`〜`WP-9` へ進むこと、② `WP-9`［3 プロバイダ全実機 E2E 確認］の開始前までに利用者が `OPENROUTER_API_KEY` および `OLLAMA_API_KEY`［前提 `P-2`］を実行環境へ設定すること。なお `WP-1`〜`WP-8` は `P-2` 未設定でも完遂可能） |
+| 現在の作業 / 次の作業 | `IT-01`（`WP-1`）完了・Go 4 条件通過。次は `IT-02`（`WP-2`: Ring 0 カーネルコア基盤と共有抽象 IF `packages/agent_kernel/**`）を `fm-dev-develop` へ依頼予定 / `WP-2` 完了後に `WP-3 ∥ WP-4` を並列開始 |
+| 保留理由 / 再開条件 | 保留なし（`WP-9` 開始前までに前提 `P-2`［`OPENROUTER_API_KEY` / `OLLAMA_API_KEY`］を利用者へ確認する） |
 
 ## 計画成果物と担当範囲
 
@@ -44,8 +49,10 @@ worklog: disabled
 
 ## 現在進行中・未了の作業
 
-- `plan` 工程の未了作業: **なし**（全専門作業 `PT-01`〜`PT-11` は完了・回収済み。詳細は下記「履歴」節を参照）。
-- 次に開始可能な `implement` 工程の先頭作業: **`WP-1`**（`41_work_packages.md` §4 `WP-1` 参照）。
+| 作業ID | 参照REQ / WP | 担当役・実行参照 | 状況 | 開始条件・成果・次の条件 |
+| --- | --- | --- | --- | --- |
+| `IT-02` | `REQ-01`〜`04, 06, 08, 10` / `WP-2` | `fm-dev-develop` / 依頼予定（`swarm:wp2-dev`, `gemini-4-hydrogen-high`） | 依頼予定 | `WP-1` 確定版基準。`packages/agent_kernel/**` の Ring 0 コアと共有抽象 IF 実装・単体テスト通過後に `WP-3 ∥ WP-4` を開始 |
+| `IT-03`〜`IT-09` | `REQ-01`〜`REQ-11` / `WP-3`〜`WP-9` | 未割当 | 未着手 | `WP-2` 完了後に `WP-3 ∥ WP-4` 並列開始（`WP-9` は前提 `P-2` 確認後） |
 
 ## おまかせ判断記録
 
@@ -64,17 +71,17 @@ worklog: disabled
 
 | ID | Requirement summary | 対象設計ID | 状態 | Verification method | Evidence class | WP | Implementer state | Evidence | Acceptance |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `REQ-01` | 防波堤カーネル骨格（`SyscallGate` 単一通過・PCB/Ring・依存分離）と I/O 出力サイズ強制キャップ | `D-001, D-002, D-004, D-005, D-006` | 今回実装 | 依存構造確認＋キャップ境界自動テスト＋1万行超/大量検索の実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-4, WP-5, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
+| `REQ-01` | 防波堤カーネル骨格（`SyscallGate` 単一通過・PCB/Ring・依存分離）と I/O 出力サイズ強制キャップ | `D-001, D-002, D-004, D-005, D-006` | 今回実装 | 依存構造確認＋キャップ境界自動テスト＋1万行超/大量検索の実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-4, WP-5, WP-9` | `in_progress` | `WP-1` 基盤完了（`agent_kernel` 禁止依存 0 件・smoke pass：`env_manifest.md`:"WP-1 基盤ゲート完了"） | `unverified`: `WP-2` 以降・受け入れ未実施 |
 | `REQ-02` | Read-Only 探索（`sys_read_lines`/`glob`/`grep`）と `JjDriver` 非破壊読取によるリポジトリ自律読解 | `D-003, D-004, D-011, D-012, D-014` | 今回実装 | 保護/スコープ外遮断・未スナップショット下の `op_id` 不変テスト＋実 `jj` リポジトリ読解観測 | `E1 / E2` | `WP-2, WP-3, WP-5, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
 | `REQ-03` | Canonical IR と 3 プロバイダ（Local Ollama / OpenRouter / Ollama Cloud）実機対応・毎ターン切替 | `D-002, D-004, D-007, D-008, D-009` | 今回実装 | IR射影・優先順位・異常系テスト＋3プロバイダ全実機 Tool Call・連続切替観測 | `E1 / E2` | `WP-2, WP-4, WP-5, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
 | `REQ-04` | `syscalls.jsonl`（`jjOpId` 紐付け）監査ログと `llm_io.jsonl`（`cached_tokens` 上昇）監視 | `D-002, D-003, D-004, D-010, D-014` | 今回実装 | 全経路出力・秘密マスクテスト＋`jj op show` 突合・復元後ログ保持・連続ターン `cachedTokens` 上昇観測 | `E1 / E2` | `WP-2, WP-3, WP-4, WP-5, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
 | `REQ-05` | `JjDriver` トランザクション制御（`op_id` 記録・`jj new` 分離で `@-` 保護・`squash`・`op restore` 1発復元） | `D-003, D-014, D-015` | 今回実装 | `@-` バイト一致・`op restore` 完全復元・非対話 `squash`・不正 `op_id` 拒否テスト＋実機観測 | `E1 / E2` | `WP-3, WP-6, WP-7, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
 | `REQ-06` | CAS（SHA-256 ハッシュ照合）付きファイル編集（`sys_edit_block`, `sys_write_file`） | `D-004, D-011, D-012, D-013` | 今回実装 | CAS一致/不一致・未読上書き・曖昧一致・保護/スコープ外拒否（元ファイル無変更）テスト＋実機観測 | `E1 / E2` | `WP-2, WP-6, WP-7, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
-| `REQ-07` | Windows Job Object（Win32 FFI）外部コマンド実行 `sys_exec` とタイムアウト時の子孫一括強制終了 | `D-006, D-016` | 今回実装 | 144B FFI＆APIキー除外構造確認＋短命レース確認＋親・孫 PID 生存0件テスト・実機観測 | `E1 / E2 / E3` | `WP-1, WP-7, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
+| `REQ-07` | Windows Job Object（Win32 FFI）外部コマンド実行 `sys_exec` とタイムアウト時の子孫一括強制終了 | `D-006, D-016` | 今回実装 | 144B FFI＆APIキー除外構造確認＋短命レース確認＋親・孫 PID 生存0件テスト・実機観測 | `E1 / E2 / E3` | `WP-1, WP-7, WP-9` | `in_progress` | `WP-1` 144B Job Object FFI AOT ゲート通過（子・孫 PID 生存 0 件：`env_manifest.md`:"WP-1 基盤ゲート完了"） | `unverified`: `WP-7` 本実装・受け入れ未実施 |
 | `REQ-08` | `beforeSyscall` Hook 機構と Anti-Git-Habit Guard（生 `git`/`jj` 遮断と `sys_jj_*` 自律誘導） | `D-002, D-017` | 今回実装 | 承認要求0回での複合生 `git`/`jj` 事前遮断テスト＋遮断→次ステップ `sys_jj_*` 自律切替観測 | `E1 / E2` | `WP-2, WP-7, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
 | `REQ-09` | ACP（JSON-RPC 2.0 over `stdio`）サーバー分離・リアルタイム状態通知・簡易 CLI クライアント | `D-018, D-019, D-021` | 今回実装 | `stdout` NDJSON純度・`_meta` 準拠・異常系テスト＋`acp_cli_client` 対話・ストリーム・`/model` 切替観測 | `E1 / E2` | `WP-8, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
 | `REQ-10` | 保護リング（Ring 2）承認ゲート（`WAITING_APPROVAL` 一時停止・承認進行・拒否時 `EACCES` 防波堤） | `D-002, D-003, D-004, D-016, D-020` | 今回実装 | 5条件境界・拒否時副作用ゼロ＆`EACCES` テスト＋ACP 承認確定および拒否→代替/ロールバック実機観測 | `E1 / E2` | `WP-2, WP-7, WP-8, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
-| `REQ-11` | `dart compile exe` 単一ネイティブ実行ファイル化と Stage 1 通しシナリオ完走 | `D-001, D-021, D-022` | 今回実装 | 両 `.exe` ビルド＆`dart` 除外 `PATH` 起動確認＋ビルド済み `.exe` による Stage 1 E2E 通し実機観測 | `E1 / E2` | `WP-1, WP-8, WP-9` | `todo` | — | `unverified`: 実装・受け入れ未実施 |
+| `REQ-11` | `dart compile exe` 単一ネイティブ実行ファイル化と Stage 1 通しシナリオ完走 | `D-001, D-021, D-022` | 今回実装 | 両 `.exe` ビルド＆`dart` 除外 `PATH` 起動確認＋ビルド済み `.exe` による Stage 1 E2E 通し実機観測 | `E1 / E2` | `WP-1, WP-8, WP-9` | `in_progress` | `WP-1` Pub Workspaces 4 パッケージ骨格＋AOT `dart compile exe` 疎通完了 | `unverified`: `WP-8`〜`WP-9`・受け入れ未実施 |
 
 ## 履歴
 
@@ -108,4 +115,9 @@ worklog: disabled
 担当 / 実行参照 / 対象版: fm-dev-reviewer / conversation://b3fa5ac0-4794-453d-b1e1-95594363ef2c / 計画版 r1（env_manifest.md 参照）
 結果 / 証跡への参照: 完了（E4：Critical=0, Must-fix=0, ready 移行可能判定） / docs/plan_20261119_stage1_kernel_agent/50_review_notes.md:"最終レビュー結論（進行可否）"
 未了・次の引き渡し: 阻害事項 0 件を確認し plan 工程完了（ready 返却）
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-01 / WP-1（mise Dart 3.14.1 導入・jj 整備・4 パッケージ骨格・AOT Job Object FFI 最小ゲート：REQ-01, REQ-07, REQ-11）
+担当 / 実行参照 / 対象版: fm-dev-develop / swarm:wp1-dev (conversation://e03917f9-442a-44b7-aef3-0e80c673ea41, gemini-4-hydrogen-high) / 計画版 r1・WP-1 完了版
+結果 / 証跡への参照: 完了（E1/E2/E3：Go 4条件全成立。dart 3.14.1, pub get/analyze/test +4 pass, 144B Job Object FFI AOT exe 親・孫 PID 生存 0 件） / docs/plan_20261119_stage1_kernel_agent/env_manifest.md:"WP-1 基盤ゲート完了"
+未了・次の引き渡し: pubspec.lock および 4 パッケージ骨格を WP-2 基準版として引き渡し
 ```

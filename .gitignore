@@ -1,0 +1,12 @@
+# Dart / Pub Workspaces
+.dart_tool/
+build/
+coverage/
+
+# Kernel runtime artifacts & temporary verification workspace
+.agent_os/
+.planworks/
+
+# Secrets / environment files
+.env
+.env.*
