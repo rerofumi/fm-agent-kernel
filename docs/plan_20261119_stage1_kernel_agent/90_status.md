@@ -30,7 +30,7 @@ worklog: disabled
 | 利用可能な計画版 | `r1`（採用済み） |
 | 改訂案 | なし |
 | 再計画要求 | なし |
-| 現在の作業 / 次の作業 | `IT-03`（`WP-3`）∥ `IT-04`（`WP-4`）並列完了・差分合流済み（競合 0 件）。次は `IT-05`（`WP-5`: Step 1-1 統合確認ゲート `KernelBootstrap`・`step1_harness` 統合および全 4 事象確認）を `fm-dev-develop` へ依頼予定 / Step 1-1 ゲート通過後に `WP-6`（Step 1-2）へ進む |
+| 現在の作業 / 次の作業 | `IT-05`（`WP-5`: Step 1-1 統合ゲート）完了・全 65 テスト＆Step 1-1 全 4 事象 E2 通過。次は `IT-06`（`WP-6`: Step 1-2 `JjDriver` CoW トランザクション制御と CAS ファイル編集）を `fm-dev-develop` へ依頼予定 / `WP-6` 完了後に `WP-7`（Step 1-2 統合ゲート）へ進む |
 | 保留理由 / 再開条件 | 保留なし（`WP-9` 開始前までに前提 `P-2`［`OPENROUTER_API_KEY` / `OLLAMA_API_KEY`］を利用者へ確認する） |
 
 ## 計画成果物と担当範囲
@@ -51,8 +51,8 @@ worklog: disabled
 
 | 作業ID | 参照REQ / WP | 担当役・実行参照 | 状況 | 開始条件・成果・次の条件 |
 | --- | --- | --- | --- | --- |
-| `IT-05` | `REQ-01`〜`REQ-04` / `WP-5`（Step 1-1 ゲート） | `fm-dev-develop` / 依頼予定（`swarm:wp5-dev`, `gemini-4-hydrogen-high`） | 依頼予定 | `WP-3`＋`WP-4` 合流確定版基準。`agent_drivers.dart` / `agent_runtime.dart` / `KernelBootstrap` / `step1_harness` 統合・全体 `analyze`/`test`・Step 1-1 全 4 事象 E2 確認 |
-| `IT-06`〜`IT-09` | `REQ-01`〜`REQ-11` / `WP-6`〜`WP-9` | 未割当 | 未着手 | `WP-5`（Step 1-1 ゲート）通過後に `WP-6` 開始（`WP-9` は前提 `P-2` 確認後） |
+| `IT-06` | `REQ-05, REQ-06` / `WP-6`（Step 1-2 VCS/CAS編集） | `fm-dev-develop` / 依頼予定（`swarm:wp6-dev`, `gemini-4-hydrogen-high`） | 依頼予定 | `WP-5`（Step 1-1 ゲート）確定版基準。`JjDriver` CoW トランザクション（`[D-015]`・`RV-001` 反映）と `HostFsDriver` CAS 編集（`[D-013]`）実装・単体テスト通過後に `WP-7` 開始 |
+| `IT-07`〜`IT-09` | `REQ-01`〜`REQ-11` / `WP-7`〜`WP-9` | 未割当 | 未着手 | `WP-6` 完了後に `WP-7`（Step 1-2 ゲート）→ `WP-8`（Step 1-3 EXEゲート）→ `WP-9`（前提 `P-2` 確認後） |
 
 ## おまかせ判断記録
 
@@ -71,10 +71,10 @@ worklog: disabled
 
 | ID | Requirement summary | 対象設計ID | 状態 | Verification method | Evidence class | WP | Implementer state | Evidence | Acceptance |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `REQ-01` | 防波堤カーネル骨格（`SyscallGate` 単一通過・PCB/Ring・依存分離）と I/O 出力サイズ強制キャップ | `D-001, D-002, D-004, D-005, D-006` | 今回実装 | 依存構造確認＋キャップ境界自動テスト＋1万行超/大量検索の実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-4, WP-5, WP-9` | `in_progress` | `WP-1`/`WP-2`/`WP-4` 完了（`agent_kernel` 禁止依存 0 件・29/29 pass、`LeadAgent` 非参照・14/14 pass） | `unverified`: `WP-5/9`・受け入れ未実施 |
-| `REQ-02` | Read-Only 探索（`sys_read_lines`/`glob`/`grep`）と `JjDriver` 非破壊読取によるリポジトリ自律読解 | `D-003, D-004, D-011, D-012, D-014` | 今回実装 | 保護/スコープ外遮断・未スナップショット下の `op_id` 不変テスト＋実 `jj` リポジトリ読解観測 | `E1 / E2` | `WP-2, WP-3, WP-5, WP-9` | `in_progress` | `WP-2`/`WP-3` 完了（`HostFsDriver`/`JjDriver` 読取・`op_id` 不変・15/15 pass） | `unverified`: `WP-5/9`・受け入れ未実施 |
-| `REQ-03` | Canonical IR と 3 プロバイダ（Local Ollama / OpenRouter / Ollama Cloud）実機対応・毎ターン切替 | `D-002, D-004, D-007, D-008, D-009` | 今回実装 | IR射影・優先順位・異常系テスト＋3プロバイダ全実機 Tool Call・連続切替観測 | `E1 / E2` | `WP-2, WP-4, WP-5, WP-9` | `in_progress` | `WP-2`/`WP-4` 完了（3プロバイダモック 14/14 pass＋Local Ollama `http://192.168.0.5:11434/api/chat` `gemma4:12b` 実機疎通 pass） | `unverified`: `WP-5/9`・受け入れ未実施 |
-| `REQ-04` | `syscalls.jsonl`（`jjOpId` 紐付け）監査ログと `llm_io.jsonl`（`cached_tokens` 上昇）監視 | `D-002, D-003, D-004, D-010, D-014` | 今回実装 | 全経路出力・秘密マスクテスト＋`jj op show` 突合・復元後ログ保持・連続ターン `cachedTokens` 上昇観測 | `E1 / E2` | `WP-2, WP-3, WP-4, WP-5, WP-9` | `in_progress` | `WP-2`/`WP-3`/`WP-4` 完了（`syscalls.jsonl` `jjOpId` 突合 pass、Local Ollama 2ターン `cachedTokens: 0 -> 1691, cacheHitRate: 0.9872` 実測） | `unverified`: `WP-5/9`・受け入れ未実施 |
+| `REQ-01` | 防波堤カーネル骨格（`SyscallGate` 単一通過・PCB/Ring・依存分離）と I/O 出力サイズ強制キャップ | `D-001, D-002, D-004, D-005, D-006` | 今回実装 | 依存構造確認＋キャップ境界自動テスト＋1万行超/大量検索の実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-4, WP-5, WP-9` | `in_progress` | `WP-5` Step 1-1 ゲート通過（65/65 pass、E2 事象 1-1-2 10,500行/大量検索 `truncated: true`＋狭範囲再読取完走） | `unverified`: `WP-9`・受け入れ未実施 |
+| `REQ-02` | Read-Only 探索（`sys_read_lines`/`glob`/`grep`）と `JjDriver` 非破壊読取によるリポジトリ自律読解 | `D-003, D-004, D-011, D-012, D-014` | 今回実装 | 保護/スコープ外遮断・未スナップショット下の `op_id` 不変テスト＋実 `jj` リポジトリ読解観測 | `E1 / E2` | `WP-2, WP-3, WP-5, WP-9` | `in_progress` | `WP-5` Step 1-1 ゲート通過（E2 事象 1-1-1 実 `jj` 自律読解＆未スナップショット下 `op_id` 不変確認） | `unverified`: `WP-9`・受け入れ未実施 |
+| `REQ-03` | Canonical IR と 3 プロバイダ（Local Ollama / OpenRouter / Ollama Cloud）実機対応・毎ターン切替 | `D-002, D-004, D-007, D-008, D-009` | 今回実装 | IR射影・優先順位・異常系テスト＋3プロバイダ全実機 Tool Call・連続切替観測 | `E1 / E2` | `WP-2, WP-4, WP-5, WP-9` | `in_progress` | `WP-5` Step 1-1 ゲート通過（3プロバイダワイヤモック連続切替 E1 pass＋Local Ollama `gemma4:12b <-> qwen3.8:27b` 切替 E2 pass；クラウド実機は `WP-9`） | `unverified`: `WP-9`・受け入れ未実施 |
+| `REQ-04` | `syscalls.jsonl`（`jjOpId` 紐付け）監査ログと `llm_io.jsonl`（`cached_tokens` 上昇）監視 | `D-002, D-003, D-004, D-010, D-014` | 今回実装 | 全経路出力・秘密マスクテスト＋`jj op show` 突合・復元後ログ保持・連続ターン `cachedTokens` 上昇観測 | `E1 / E2` | `WP-2, WP-3, WP-4, WP-5, WP-9` | `in_progress` | `WP-5` Step 1-1 ゲート通過（`syscalls.jsonl` `jjOpId` 実在突合＋`llm_io.jsonl` `cachedTokens: 0 -> 12376 (0.9932)` 実測） | `unverified`: `WP-9`・受け入れ未実施 |
 | `REQ-05` | `JjDriver` トランザクション制御（`op_id` 記録・`jj new` 分離で `@-` 保護・`squash`・`op restore` 1発復元） | `D-003, D-014, D-015` | 今回実装 | `@-` バイト一致・`op restore` 完全復元・非対話 `squash`・不正 `op_id` 拒否テスト＋実機観測 | `E1 / E2` | `WP-3, WP-6, WP-7, WP-9` | `in_progress` | `WP-3` 完了（`AsyncMutex` 直列化・非破壊読取・`syncWorkingCopySnapshot` 基盤 pass） | `unverified`: `WP-6/7/9`・受け入れ未実施 |
 | `REQ-06` | CAS（SHA-256 ハッシュ照合）付きファイル編集（`sys_edit_block`, `sys_write_file`） | `D-004, D-011, D-012, D-013` | 今回実装 | CAS一致/不一致・未読上書き・曖昧一致・保護/スコープ外拒否（元ファイル無変更）テスト＋実機観測 | `E1 / E2` | `WP-2, WP-6, WP-7, WP-9` | `in_progress` | `WP-2` 完了（`VfsNamespace`・`SyscallErrorCode.econflict`/`eexist` 基盤 pass） | `unverified`: `WP-6/7/9`・受け入れ未実施 |
 | `REQ-07` | Windows Job Object（Win32 FFI）外部コマンド実行 `sys_exec` とタイムアウト時の子孫一括強制終了 | `D-006, D-016` | 今回実装 | 144B FFI＆APIキー除外構造確認＋短命レース確認＋親・孫 PID 生存0件テスト・実機観測 | `E1 / E2 / E3` | `WP-1, WP-7, WP-9` | `in_progress` | `WP-1` 144B Job Object FFI AOT ゲート通過（子・孫 PID 生存 0 件：`env_manifest.md`:"WP-1 基盤ゲート完了"） | `unverified`: `WP-7` 本実装・受け入れ未実施 |
@@ -132,7 +132,12 @@ worklog: disabled
 未了・次の引き渡し: `fs_jj_drivers.dart` を `WP-5`（バレル統合・`KernelBootstrap` 配線）および `WP-6` へ引き渡し
 
 履歴ID / 対象（作業・REQ/WP・文書）: IT-04 / WP-4（3 プロバイダ `LlmDriver`・`LeadAgent` コアループ・Local Ollama 実機疎通：REQ-01, REQ-03, REQ-04）
-担当 / 実行参照 / 対象版: fm-dev-develop / swarm:wp4-dev (conversation://de8aa91c-8a39-479b-90bb-3b27d5202667, gemini-4-hydrogen-high) / 計画版 r1・WP-3+WP-4 合流版（jj change soolxnwt）
+担当 / 実行参照 / 対象版: fm-dev-develop / swarm:wp4-dev (conversation://de8aa91c-8a39-479b-90bb-3b27d5202667, gemini-4-hydrogen-high) / 計画版 r1・WP-3+WP-4 合流確定版（jj commit soolxnwt 7f23e763）
 結果 / 証跡への参照: 完了（E1：dart analyze 0 issues, dart test +14/14 pass、E2：Local Ollama http://192.168.0.5:11434/v1 -> /api/chat gemma4:12b 2ターン実機疎通 cachedTokens 0->1691, cacheHitRate 0.9872） / packages/agent_drivers/lib/llm_drivers.dart:"ollama_driver"
 未了・次の引き渡し: `llm_drivers.dart` および `process_runner.dart` を `WP-5`（Step 1-1 統合確認ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-05 / WP-5（Step 1-1 統合確認ゲート：`KernelBootstrap`・`step1_harness`・全 4 事象 E2 確認：REQ-01〜REQ-04）
+担当 / 実行参照 / 対象版: fm-dev-develop / swarm:wp5-dev (conversation://c958399b-6c62-4e79-ab8f-c422e83e31e9, gemini-4-hydrogen-high) / 計画版 r1・WP-5 完了版（jj change qqtlktnw）
+結果 / 証跡への参照: 完了（E1：全体 dart analyze 0 issues, dart test +65/65 pass、E2：事象 1-1-1 op_id 不変・事象 1-1-2 10,500行キャップ＋再読取・事象 1-1-3 gemma4:12b<->qwen3.8:27b 切替・事象 1-1-4 syscalls.jsonl jjOpId 突合＆llm_io.jsonl cachedTokens 0->12376 [0.9932] 全4事象確認） / packages/agent_runtime/test/step1_1_integration_test.dart:"step1_1"
+未了・次の引き渡し: Step 1-1 ゲート通過版を `WP-6`（Step 1-2 CoW トランザクション＆CAS 編集）へ引き渡し（P-2 クラウド実機は `WP-9`）
 ```
