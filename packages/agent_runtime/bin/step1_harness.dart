@@ -46,6 +46,13 @@ Future<void> main(List<String> args) async {
       defaultsTo: '32',
       help: 'Maximum ReAct steps per user turn.',
     )
+    ..addOption(
+      'approval-policy',
+      allowed: const <String>['allow', 'deny', 'prompt'],
+      defaultsTo: 'allow',
+      help:
+          'Ring 2 approval policy for ASK_USER syscalls (allow | deny | prompt).',
+    )
     ..addFlag(
       'verbose',
       abbr: 'v',
@@ -75,7 +82,7 @@ Future<void> main(List<String> args) async {
   }
 
   if (parsed.flag('help')) {
-    stdout.writeln('FM Agent OS — Step 1-1 Verification Harness');
+    stdout.writeln('FM Agent OS — Step 1-1 / 1-2 Verification Harness');
     stdout.writeln(parser.usage);
     return;
   }
@@ -125,17 +132,7 @@ Future<void> main(List<String> args) async {
 
   final verbose = parsed.flag('verbose');
   final failOnError = parsed.flag('fail-on-error');
-
-  final bootstrap = KernelBootstrap.create(
-    KernelBootstrapConfig(
-      workspaceHostRoot: workspaceHostRoot,
-      sessionId: parsed.option('session-id'),
-      startupModel: startupModel,
-      systemInstruction: systemInstruction,
-      localOllamaBaseUrl: parsed.option('ollama-url'),
-      maxStepsPerTurn: maxSteps,
-    ),
-  );
+  final approvalPolicy = parsed.option('approval-policy') ?? 'allow';
 
   final batchInputs = <String>[
     ...parsed.multiOption('prompt'),
@@ -145,7 +142,6 @@ Future<void> main(List<String> args) async {
     final file = File(p.normalize(p.absolute(commandsFile.trim())));
     if (!file.existsSync()) {
       stderr.writeln('Commands file not found: ${file.path}');
-      await bootstrap.dispose();
       exitCode = 64;
       return;
     }
@@ -156,11 +152,34 @@ Future<void> main(List<String> args) async {
     }
   }
 
+  final _StdinLineReader? stdinReader =
+      (batchInputs.isEmpty || approvalPolicy == 'prompt')
+          ? _StdinLineReader()
+          : null;
+
+  final approvalHandler = switch (approvalPolicy) {
+    'deny' => PolicyApprovalHandler.alwaysReject(),
+    'prompt' => _InteractiveApprovalHandler(stdinReader!),
+    _ => PolicyApprovalHandler.alwaysAllow(),
+  };
+
+  final bootstrap = KernelBootstrap.create(
+    KernelBootstrapConfig(
+      workspaceHostRoot: workspaceHostRoot,
+      sessionId: parsed.option('session-id'),
+      startupModel: startupModel,
+      systemInstruction: systemInstruction,
+      approvalHandler: approvalHandler,
+      localOllamaBaseUrl: parsed.option('ollama-url'),
+      maxStepsPerTurn: maxSteps,
+    ),
+  );
+
   final printer = _HarnessEventPrinter(verbose: verbose);
   final eventSub = bootstrap.processRunner.events.listen(printer.onEvent);
 
   try {
-    await _printBanner(bootstrap);
+    await _printBanner(bootstrap, approvalPolicy: approvalPolicy);
 
     var anyFailure = false;
     if (batchInputs.isNotEmpty) {
@@ -178,13 +197,21 @@ Future<void> main(List<String> args) async {
         }
       }
     } else {
+      if (approvalPolicy == 'prompt') {
+        stdout.writeln(
+          '[Note] Interactive approval uses stdin; prefer --approval-policy=allow|deny in non-batch REPL or respond via prompts.',
+        );
+      }
       final isTty = stdin.hasTerminal;
       if (isTty) {
         stdout.writeln('Type a prompt or /help for commands (/quit to exit).');
         stdout.write('> ');
       }
-      await for (final line
-          in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+      while (true) {
+        final line = await stdinReader!.readLine();
+        if (line == null) {
+          break;
+        }
         final trimmed = line.trim();
         if (trimmed.isEmpty) {
           if (isTty) {
@@ -213,6 +240,7 @@ Future<void> main(List<String> args) async {
       exitCode = 1;
     }
   } finally {
+    await stdinReader?.close();
     await eventSub.cancel();
     await bootstrap.dispose();
     stdout.writeln('');
@@ -223,7 +251,10 @@ Future<void> main(List<String> args) async {
   }
 }
 
-Future<void> _printBanner(KernelBootstrap bootstrap) async {
+Future<void> _printBanner(
+  KernelBootstrap bootstrap, {
+  required String approvalPolicy,
+}) async {
   final jjInfo = await bootstrap.jjDriver.getAuditInfo();
   final envStatus = bootstrap.envLoader.configuredStatus(const <String>[
     'OPENROUTER_API_KEY',
@@ -231,12 +262,13 @@ Future<void> _printBanner(KernelBootstrap bootstrap) async {
   ]);
   final ollamaEndpoint = bootstrap.localOllamaEndpoint;
 
-  stdout.writeln('=== FM Agent OS — Step 1-1 Harness ===');
+  stdout.writeln('=== FM Agent OS — Step 1-1 / 1-2 Harness ===');
   stdout.writeln('Session ID   : ${bootstrap.sessionId}');
   stdout.writeln('Workspace    : ${bootstrap.workspaceHostRoot}');
   stdout.writeln(
     'Active Model : ${bootstrap.modelResolver.effectiveModelString()}',
   );
+  stdout.writeln('Approval     : $approvalPolicy');
   if (ollamaEndpoint != null) {
     stdout.writeln('Local Ollama : $ollamaEndpoint');
   }
@@ -245,10 +277,10 @@ Future<void> _printBanner(KernelBootstrap bootstrap) async {
     'OLLAMA_API_KEY=${envStatus['OLLAMA_API_KEY'] == true ? 'configured' : 'unset'}',
   );
   stdout.writeln(
-    'jj Head      : change=${jjInfo.jjChangeId ?? '(none)'} op=${jjInfo.jjOpId ?? '(none)'}',
+    'jj Head      : change=${jjInfo.jjChangeId ?? '(none)'} op=${jjInfo.jjOpId ?? '(none)'} tx=${bootstrap.pcb.jjContext.state.name}',
   );
   stdout.writeln('Logs Dir     : ${bootstrap.auditLogger.sessionLogDirPath}');
-  stdout.writeln('======================================');
+  stdout.writeln('============================================');
 }
 
 class _InputAction {
@@ -277,7 +309,7 @@ Future<_InputAction> _handleInputLine(
 
   if (trimmed == '/help') {
     stdout.writeln(
-      'Commands: /model <provider>/<model> | /models | /status | /quit',
+      'Commands: /model <provider>/<model> | /models | /status | /rollback [opId] | /quit',
     );
     return const _InputAction();
   }
@@ -308,13 +340,49 @@ Future<_InputAction> _handleInputLine(
   if (trimmed == '/status') {
     final jjInfo = await bootstrap.jjDriver.getAuditInfo();
     final quota = bootstrap.pcb.quotaUsage;
+    final tx = bootstrap.pcb.jjContext;
     stdout.writeln(
       '[Status] session=${bootstrap.sessionId} '
       'model=${bootstrap.modelResolver.effectiveModelString()} '
       'tokens=${quota.totalTokensUsed} '
+      'tx=${tx.state.name} '
+      'baseOp=${tx.baseOpId ?? '(none)'} '
+      'parentChange=${tx.parentChangeId ?? '(none)'} '
       'jjChange=${jjInfo.jjChangeId ?? '(none)'} '
       'jjOp=${jjInfo.jjOpId ?? '(none)'} '
       'logs=${bootstrap.auditLogger.sessionLogDirPath}',
+    );
+    return const _InputAction();
+  }
+
+  if (trimmed == '/rollback' || trimmed.startsWith('/rollback ')) {
+    final targetOpId = trimmed == '/rollback'
+        ? null
+        : trimmed.substring('/rollback '.length).trim();
+    final res = await bootstrap.syscallGate.invoke(
+      SyscallContext(
+        pid: bootstrap.pcb.pid,
+        capHandle: bootstrap.capHandle,
+        sessionId: bootstrap.sessionId,
+      ),
+      SyscallRequest(
+        name: 'sys_tx_rollback',
+        args: <String, dynamic>{
+          if (targetOpId != null && targetOpId.isNotEmpty)
+            'targetOpId': targetOpId,
+        },
+      ),
+    );
+    if (!res.ok) {
+      final err = res.error!;
+      stdout.writeln(
+        '[Rollback Error] ${err.code.codeName} (${err.reason}): ${err.message}',
+      );
+      return const _InputAction(turnFailed: true);
+    }
+    stdout.writeln(
+      '[Rollback] Restored to op=${res.value!['restoredToOpId']} '
+      '(newOp=${res.value!['jjOpId']}, change=${res.value!['workingChangeId']}, tx=${res.value!['state']})',
     );
     return const _InputAction();
   }
@@ -435,5 +503,93 @@ class _HarnessEventPrinter {
       return encoded;
     }
     return '${encoded.substring(0, 117)}...';
+  }
+}
+
+class _StdinLineReader {
+  _StdinLineReader() {
+    _subscription = stdin
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .listen(
+          _onLine,
+          onDone: _onDone,
+          onError: (_) => _onDone(),
+        );
+  }
+
+  late final StreamSubscription<String> _subscription;
+  final List<String> _bufferedLines = <String>[];
+  final List<Completer<String?>> _waiters = <Completer<String?>>[];
+  bool _closed = false;
+
+  void _onLine(String line) {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete(line);
+    } else {
+      _bufferedLines.add(line);
+    }
+  }
+
+  void _onDone() {
+    _closed = true;
+    while (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete(null);
+    }
+  }
+
+  Future<String?> readLine() {
+    if (_bufferedLines.isNotEmpty) {
+      return Future<String?>.value(_bufferedLines.removeAt(0));
+    }
+    if (_closed) {
+      return Future<String?>.value(null);
+    }
+    final completer = Completer<String?>();
+    _waiters.add(completer);
+    return completer.future;
+  }
+
+  Future<void> close() async {
+    _onDone();
+    await _subscription.cancel();
+  }
+}
+
+class _InteractiveApprovalHandler implements ApprovalHandler {
+  _InteractiveApprovalHandler(this._reader);
+
+  final _StdinLineReader _reader;
+
+  @override
+  Future<ApprovalDecision> requestApproval(
+    ApprovalRequest request, {
+    CancellationToken? cancelToken,
+  }) async {
+    stdout.writeln('');
+    stdout.writeln('=== [RING 2 APPROVAL REQUIRED] ===');
+    stdout.writeln('Syscall : ${request.syscallName}');
+    stdout.writeln('Title   : ${request.title}');
+    stdout.writeln('Kind    : ${request.kind}');
+    for (final block in request.content) {
+      final text = (block['content'] as Map<String, dynamic>?)?['text'];
+      if (text is String && text.trim().isNotEmpty) {
+        stdout.writeln(text);
+      }
+    }
+    stdout.write('Approve? [y=allow_once / a=allow_always / n=reject]: ');
+
+    final answer = await _reader.readLine();
+    if (answer == null || cancelToken?.isCancelled == true) {
+      return const ApprovalDecision.cancelled();
+    }
+    final normalized = answer.trim().toLowerCase();
+    if (normalized == 'a' || normalized == 'always') {
+      return const ApprovalDecision.allowAlways();
+    }
+    if (normalized == 'y' || normalized == 'yes') {
+      return const ApprovalDecision.allowOnce();
+    }
+    return const ApprovalDecision.rejectOnce();
   }
 }

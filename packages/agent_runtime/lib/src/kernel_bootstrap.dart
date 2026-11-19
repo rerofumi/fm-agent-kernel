@@ -16,6 +16,7 @@ class KernelBootstrapConfig {
     this.systemInstruction,
     this.approvalHandler,
     this.hooks = const <SyscallHook>[],
+    this.enableAntiGitHabitGuard = true,
     this.llmDrivers,
     this.llmRouter,
     this.envLoader,
@@ -42,6 +43,7 @@ class KernelBootstrapConfig {
   final String? systemInstruction;
   final ApprovalHandler? approvalHandler;
   final List<SyscallHook> hooks;
+  final bool enableAntiGitHabitGuard;
   final Map<LlmProviderId, LlmDriver>? llmDrivers;
   final LlmRouter? llmRouter;
   final LlmEnvLoader? envLoader;
@@ -76,6 +78,7 @@ class KernelBootstrap {
     required this.auditLogger,
     required this.hostFsDriver,
     required this.jjDriver,
+    required this.win32JobExecDriver,
     required this.llmRouter,
     required this.syscallGate,
     required this.modelResolver,
@@ -84,13 +87,13 @@ class KernelBootstrap {
     required List<void Function()> ownedClosers,
   }) : _ownedClosers = ownedClosers;
 
-  /// Default immutable Segment 0 instruction for Stage 1 Step 1-1 Read-Only exploration ([D-007]).
+  /// Default immutable Segment 0 instruction for Stage 1 Step 1-1/1-2 execution ([D-007]).
   static const String defaultStep1Instruction = '''
 You are the LeadAgent running inside FM Agent OS (Stage 1).
 All file and repository paths inside tool calls MUST use the virtual root `/workspace` (never host OS paths like `C:\\...`).
 Your workspace is managed by Jujutsu (`jj`), where `@` is the current working-copy change and `@-` is its parent change.
 
-Available Step 1-1 Read-Only exploration syscalls:
+Available Read-Only exploration syscalls:
 - `sys_glob`: Find files matching a glob pattern under `/workspace`.
 - `sys_grep`: Search UTF-8 text files under `/workspace` for strings or regexes.
 - `sys_read_lines`: Read a 1-based line range from a file under `/workspace` (returns `content`, `sha256`, `totalLines`).
@@ -98,11 +101,19 @@ Available Step 1-1 Read-Only exploration syscalls:
 - `sys_jj_log`: List Jujutsu commits matching a revset.
 - `sys_jj_diff`: Inspect unified Git-format diff for a revision.
 
+Available CoW transaction, CAS editing, and isolated execution syscalls:
+- `sys_edit_block`: Replace a unique `oldBlock` in an existing file after verifying `expectedSha256` from `sys_read_lines`.
+- `sys_write_file`: Create a new file (`expectedSha256` omitted) or overwrite an existing file with `expectedSha256`.
+- `sys_tx_begin` / `sys_tx_describe` / `sys_tx_squash` / `sys_tx_rollback`: Manage isolated `@` CoW transactions (leaving `@-` untouched).
+- `sys_exec`: Execute an external command inside a Win32 Job Object within `/workspace` (safe `dart test` / `dart analyze` / `dart format --output=none` run directly; other commands require user approval).
+
 Rules:
-1. Always inspect the actual files and `jj` history via syscalls before answering; never invent file contents, paths, or commit history.
-2. If a syscall output is truncated by the Kernel I/O Cap (`truncated: true`), use `totalLines` / `omittedLines` and call `sys_read_lines(path, startLine, endLine)` or narrow `sys_grep` patterns to inspect the needed sections.
-3. Protected internal paths (`.jj`, `.git`, `.agent_os`, `.env*`) are denied by the kernel and must not be read.
-4. Keep answers concise, accurate, and grounded in observed tool outputs.
+1. Always inspect the actual files and `jj` history via syscalls before answering or editing; never invent file contents, paths, hashes, or commit history.
+2. Before modifying an existing file with `sys_edit_block` or `sys_write_file`, read it with `sys_read_lines` to obtain its current `sha256`.
+3. Never invoke raw `git` or `jj` CLI commands via `sys_exec` (blocked by kernel policy); always use `sys_jj_*` and `sys_tx_*` syscalls instead.
+4. If a syscall output is truncated by the Kernel I/O Cap (`truncated: true`), use `totalLines` / `omittedLines` and call `sys_read_lines(path, startLine, endLine)` or narrow `sys_grep` patterns to inspect the needed sections.
+5. Protected internal paths (`.jj`, `.git`, `.agent_os`, `.env*`) are denied by the kernel and must not be read or written.
+6. Keep answers concise, accurate, and grounded in observed tool outputs.
 ''';
 
   final String sessionId;
@@ -117,6 +128,7 @@ Rules:
   final AuditLogger auditLogger;
   final HostFsDriver hostFsDriver;
   final JjDriver jjDriver;
+  final Win32JobExecDriver win32JobExecDriver;
   final LlmRouter llmRouter;
   final SyscallGate syscallGate;
   final ModelResolver modelResolver;
@@ -170,8 +182,9 @@ Rules:
     );
 
     final toolSchemas = <SyscallToolSchema>[
-      ...HostFsDriver.readToolSchemas(),
-      ...JjDriver.readToolSchemas(),
+      ...HostFsDriver.allToolSchemas(),
+      ...JjDriver.allToolSchemas(),
+      ...Win32JobExecDriver.toolSchemas(),
       ...config.extraToolSchemas,
     ];
 
@@ -202,11 +215,21 @@ Rules:
       );
     }
 
-    final hostFsDriver = HostFsDriver(namespace: namespace);
     final jjDriver = JjDriver(
       namespace: namespace,
       txContext: jjContext,
       jjExecutable: config.jjExecutable,
+    );
+    final hostFsDriver = HostFsDriver(
+      namespace: namespace,
+      ensureActiveTransaction: jjDriver.ensureActiveTransaction,
+      syncWorkingCopySnapshot: jjDriver.syncWorkingCopySnapshot,
+    );
+    final win32JobExecDriver = Win32JobExecDriver(
+      namespace: namespace,
+      ensureActiveTransaction: jjDriver.ensureActiveTransaction,
+      syncWorkingCopySnapshot: jjDriver.syncWorkingCopySnapshot,
+      ioCapper: ioCapper,
     );
 
     final ownedClosers = <void Function()>[];
@@ -267,13 +290,20 @@ Rules:
       effectiveRouter = LlmRouter(drivers: drivers);
     }
 
+    final effectiveHooks = <SyscallHook>[
+      if (config.enableAntiGitHabitGuard &&
+          !config.hooks.any((h) => h is AntiGitHabitGuardHook))
+        AntiGitHabitGuardHook(),
+      ...config.hooks,
+    ];
+
     final syscallGate = SyscallGate(
       processTable: processTable,
       approvalGate: approvalGate,
       ioCapper: ioCapper,
       auditLogger: auditLogger,
       redactor: effectiveRedactor,
-      hooks: config.hooks,
+      hooks: effectiveHooks,
       jjAuditInfoProvider: jjDriver.getAuditInfo,
     );
 
@@ -291,9 +321,10 @@ Rules:
       maxStepsPerTurn: config.maxStepsPerTurn,
     );
 
-    // Register Step 1-1 Read-Only VFS, Jujutsu, and LLM syscalls.
-    hostFsDriver.registerReadSyscalls(syscallGate);
-    jjDriver.registerReadSyscalls(syscallGate);
+    // Register Step 1-1 & Step 1-2 VFS, Jujutsu, Win32 Job Object exec, and LLM syscalls.
+    hostFsDriver.registerAllSyscalls(syscallGate);
+    jjDriver.registerAllSyscalls(syscallGate);
+    win32JobExecDriver.registerSyscalls(syscallGate);
     syscallGate.registerSyscall(
       buildLlmChatSyscallDefinition(
         router: effectiveRouter,
@@ -325,6 +356,7 @@ Rules:
       auditLogger: auditLogger,
       hostFsDriver: hostFsDriver,
       jjDriver: jjDriver,
+      win32JobExecDriver: win32JobExecDriver,
       llmRouter: effectiveRouter,
       syscallGate: syscallGate,
       modelResolver: modelResolver,
