@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:agent_acp/agent_acp.dart';
 
-void main(List<String> args) {
-  print('acp_cli_client skeleton: ${agentAcpWorkspaceBanner()} [args=${args.length}]');
+Future<void> main(List<String> args) async {
+  final runner = AcpCliRunner();
+  exitCode = await runner.run(args);
 }
