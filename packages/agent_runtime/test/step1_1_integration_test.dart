@@ -111,6 +111,11 @@ void main() {
 
       var localStep = 0;
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         expect(req.uri.path, equals('/api/chat'));
         final body = jsonDecode(await utf8.decoder.bind(req).join())
             as Map<String, dynamic>;
@@ -182,6 +187,11 @@ void main() {
 
       var openRouterStep = 0;
       openRouterServer.listen((req) async {
+        if (req.uri.path != '/api/v1/chat/completions') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         expect(req.uri.path, equals('/api/v1/chat/completions'));
         capturedOpenRouterHeaders.add(req.headers);
         final body = jsonDecode(await utf8.decoder.bind(req).join())
@@ -297,6 +307,11 @@ void main() {
 
       var cloudStep = 0;
       cloudServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         expect(req.uri.path, equals('/api/chat'));
         capturedCloudAuth.add(req.headers.value('authorization'));
         final body = jsonDecode(await utf8.decoder.bind(req).join())
@@ -510,6 +525,11 @@ void main() {
       var step = 0;
 
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         final body = jsonDecode(await utf8.decoder.bind(req).join())
             as Map<String, dynamic>;
         capturedRequests.add(body);
@@ -678,6 +698,11 @@ void main() {
 
       var step = 0;
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         await utf8.decoder.bind(req).drain<void>();
         step += 1;
 
@@ -832,6 +857,11 @@ void main() {
       var turn = 0;
 
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         final body = jsonDecode(await utf8.decoder.bind(req).join())
             as Map<String, dynamic>;
         capturedBodies.add(body);

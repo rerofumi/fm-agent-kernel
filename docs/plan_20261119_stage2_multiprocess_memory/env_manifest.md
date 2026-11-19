@@ -24,6 +24,11 @@
    - 未導入・未設定の前提条件: **なし（`0` 件）**（`WP-1`〜`WP-9` の実装・実機 `E2` 検証に必要な SDK・`jj`・3 プロバイダ・Web Search API キーはすべて現環境で充足確認済み）。
 
 2. **対象ソース版・成果物**:
+   - **対象参照（実装完了・受け入れ対象スナップショット）**:
+     - **Stage 2 実装完了・受け入れ対象製品ソース版**: 不変 `jj` `commit_id`: `fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f`（`IM-12` 完了・クリーン AOT ビルド元。`WP-9` 証跡保存後 `@` `75ff64dc224ddfb13f98e7d1099389ee06578a7f` / change `qzzvklrl` との製品コード差分 `0` 件）。
+     - **クリーンビルド済み単一ネイティブ `.exe` 成果物（2 本）**:
+       - `build/agent_os_daemon.exe`（`9,620,992` bytes）: SHA-256 `4899640A0A9E841D701D397E0E0AEFA5D198808FBEA88CA847E5F62026AFD2E8`
+       - `build/acp_cli_client.exe`（`6,780,928` bytes）: SHA-256 `61A964912D8FFBE5324F6A80F7A2DD8508A267ACD60DB62734D16DF2E928AA01`
    - **対象参照（計画版 `r1` 出発点スナップショット）**:
      - **製品コード・ワークスペース設定の基準版**: 不変 `jj` `commit_id`: `d11c47480b41d52b2b43f866b245f2996a874873`（change `wnmvvtxzppzyprsrqwlzqurskpnltzpo`, bookmark `main`, Stage 1 受け入れ・リリース完了版）。計画策定時点で製品パッケージ・ルート設定ファイル（`packages/**`, `pubspec.yaml`, `pubspec.lock`, `analysis_options.yaml`, `mise.toml`）に未コミット差分は **`0` 件**。
      - **計画入力原典・Cheatsheet・計画版 `r1` 正本ファイル集合（計 20 ファイル）の実サイズ・SHA-256 ハッシュ**（※自己参照によるハッシュ再帰を避けるため、管理・レビュー台帳である `env_manifest.md`, `50_review_notes.md`, `90_status.md`, `docs/plan_index.md` は一覧から除く）：
@@ -60,9 +65,9 @@
 3. **テスト資産・fixture**:
    - **対象範囲**: `packages/{agent_kernel,agent_drivers,agent_runtime,agent_acp}/test/**/*_test.dart`
    - **期待件数・出所 / 確認件数**:
-     - 計画時点（Stage 1 完了版ベースライン）: **期待 `22` テストファイル（計 `101` テストケース） / 実測確認 `22` ファイル**。
-     - 実装工程（`WP-1`〜`WP-8`）で Stage 2 新規テストファイルを追加し、`WP-9` 完了・`acceptance` 引き渡し時に最終テストファイル数・テストケース総数を項目 5 へ記録する。
-   - **対象参照**: 基準 `jj` `commit_id`: `d11c47480b41d52b2b43f866b245f2996a874873` 上の `packages/*/test/**`（未コミット差分 `0` 件）。
+     - 計画時点（Stage 1 完了版ベースライン）: 期待 `22` テストファイル（計 `101` テストケース） / 実測確認 `22` ファイル。
+     - **Stage 2 実装完了・受け入れ時点（`WP-9` 確定）**: **期待 `32` テストファイル（計 `175` テストケース：Stage 1 `101` 件 ＋ Stage 2 新規 `74` 件） / 実測確認 `32` ファイル・`175 / 175` 件 pass（skip `0`, fail `0`）**。
+   - **対象参照**: 実装完了 `jj` `commit_id`: `fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f` 上の `packages/*/test/**`（基準 `d11c47480b41d52b2b43f866b245f2996a874873` から Stage 2 新規 10 ファイル・74 ケースを追加）。
    - **特記事項**:
      - 自動テストおよび実機 `E2` で用いる検証用 `jj` リポジトリ・外部スキルフォルダはすべて OS 一時ディレクトリまたは `.planworks/` 配下に動的生成・削除し、本リポジトリを汚染しない（現在 `.planworks/` 残留 `0` 件を確認済み）。
      - 事象 2-3-2 用の悪性インジェクション HTML フィクスチャは `FixtureOverlayWebFetchTransport`（`@visibleForTesting` コンストラクタ DI のみ、公開 CLI フラグなし）で分離注入し、ホスト環境変数や本番通信経路を汚染しない。
@@ -73,8 +78,9 @@
      - 代替方法: 不変 `jj` `commit_id`、製品コード差分 `0` 件確認、テストファイル件数、および計画・Cheatsheet 正本 20 ファイルの実バイトサイズ・SHA-256 ハッシュ完全突合。
      - 機械IDスクリプトを取得しない理由: Python 実行環境への追加依存を持たせず、OS 標準の SHA-256 と `jj` 不変コミットハッシュで独立担当が 100% 再現・検証できるため。
    - **照合結果**:
-     - `照合済み（一致）`: ①基準 `commit_id` `d11c47480b41d52b2b43f866b245f2996a874873` に対して製品コード・テスト資産（22 ファイル）の未コミット変更が `0` 件であること、②`.planworks/` の残留が `False`（`0` 件）であること、③上記正本 20 ファイルすべての実在・バイトサイズ・SHA-256 ハッシュ一致を確認済み。
-     - `自己申告のみ（未照合）`: Stage 2 実装完了後に生成される新規 `build/agent_os_daemon.exe` / `build/acp_cli_client.exe` の最終 SHA-256 ハッシュ（理由：計画完了時点では Stage 2 実装未着手のため。実装最終ゲート `WP-9` および受け入れ移行時に採取・記録して独立照合する）。
+     - `照合済み（一致）`（独立 `fm-dev-acceptance` `IM-14` `conversation://997c2375-a7d8-4fb8-a6c8-8cc455bdad23` による read-only 独立照合済み）: ①最終製品ソース版 `fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f` と現作業ツリーの製品コード差分 `0` 件、②テスト資産 `32` ファイル・独立実行 `175 / 175` 件 pass（skip `0`, fail `0`）・`dart analyze` `0` 件、③`build/agent_os_daemon.exe`（`9,620,992` bytes, `4899640A0A9E841D701D397E0E0AEFA5D198808FBEA88CA847E5F62026AFD2E8`）および `build/acp_cli_client.exe`（`6,780,928` bytes, `61A964912D8FFBE5324F6A80F7A2DD8508A267ACD60DB62734D16DF2E928AA01`）の実在・サイズ・SHA-256 完全一致、④`.planworks/` 残留 `0` 件、⑤計画正本 20 ファイルのサイズ・SHA-256 `20 / 20` 完全一致。
+     - `自己申告のみ（未照合）`: §1 の OS ビルド番号・導入済み Local Ollama モデル一覧（22 モデル）・`.agent_os/.env` キー有無（ただし実稼働・実機証跡により前提充足確認済み）。
 
 5. **変更履歴（ready以降）**:
    - `2026-11-19` / 初版 `r1` 策定（Lv.2 `fm-dev-plan`） / Stage 2 初回計画（Full tier）作成に伴い基準ソース版 `d11c47480b41d52b2b43f866b245f2996a874873`・既存テスト資産 22 ファイル・計画正本 20 ファイルの SHA-256 を記録 / 実装最終ゲート `WP-9` 完了・`acceptance` 引き渡し時に最終 `commit_id`・テスト総数・両 `.exe` SHA-256 を本節へ追記すること / 影響を受ける試験結果: なし（Stage 2 実装未着手、Stage 1 101 件維持）
+   - `2026-11-20` / `WP-9` 最終統合ゲート完了・受け入れ引き渡し更新（Lv.2 `fm-dev-implement`, 根拠: `IM-12`/`IM-13` `evidence/wp9_final_e2.md`） / 最終製品ソース版 `fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f`、自動テスト資産 `32` ファイル・`175` 件全通過、およびクリーンビルド済み `build/agent_os_daemon.exe`（SHA-256 `4899640A0A9E841D701D397E0E0AEFA5D198808FBEA88CA847E5F62026AFD2E8`）・`build/acp_cli_client.exe`（SHA-256 `61A964912D8FFBE5324F6A80F7A2DD8508A267ACD60DB62734D16DF2E928AA01`）を確定記録 / 再確認範囲: 独立 `fm-dev-acceptance`（`IM-14`）による全 `REQ-01`〜`REQ-10` および本宣言の read-only 照合 / 影響を受ける試験結果: 最終版上で `WP-9` 全 `E1`/`E2`/`E3` 再実行完了（旧 Step 2-1/2-2/2-3 個別証跡は `WP-9` 通し E2E ＆全 175 テストと合わせて有効性評価対象）

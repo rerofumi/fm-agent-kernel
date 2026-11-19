@@ -120,9 +120,11 @@ class SyscallGate {
     required this.auditLogger,
     SecretRedactor? redactor,
     List<SyscallHook> hooks = const <SyscallHook>[],
+    List<TxHook> txHooks = const <TxHook>[],
     this.jjAuditInfoProvider,
   })  : redactor = redactor ?? auditLogger.redactor,
-        _hooks = List<SyscallHook>.from(hooks);
+        _hooks = List<SyscallHook>.from(hooks),
+        _txHooks = List<TxHook>.from(txHooks);
 
   final KernelProcessTable processTable;
   final ApprovalGate approvalGate;
@@ -132,6 +134,7 @@ class SyscallGate {
   final JjAuditInfoProvider? jjAuditInfoProvider;
 
   final List<SyscallHook> _hooks;
+  final List<TxHook> _txHooks;
   final Map<String, SyscallDefinition> _definitions =
       <String, SyscallDefinition>{};
 
@@ -142,9 +145,14 @@ class SyscallGate {
     _definitions[definition.name] = definition;
   }
 
-  /// Registers a Stage 3/6 hook.
+  /// Registers a Stage 3/6 hook (executed in FIFO registration order).
   void addHook(SyscallHook hook) {
     _hooks.add(hook);
+  }
+
+  /// Registers a Stage 3.5 `sys_tx_squash` transaction hook (executed in FIFO registration order) ([D-202], [D-220]).
+  void addTxHook(TxHook hook) {
+    _txHooks.add(hook);
   }
 
   /// Executes a syscall strictly through Stages 1 to 8 ([D-002]).
@@ -237,7 +245,9 @@ class SyscallGate {
       if (request.name == 'sys_spawn') {
         final spawnError = processTable.validateSpawnAllowed(pcb.pid);
         if (spawnError != null) {
-          decision = AuditDecision.deniedByPolicy;
+          decision = spawnError.code == SyscallErrorCode.edquot
+              ? AuditDecision.quotaExceeded
+              : AuditDecision.deniedByPolicy;
           result = SyscallResult<Map<String, dynamic>>.failure(
             _redactError(spawnError),
           );
@@ -245,7 +255,11 @@ class SyscallGate {
         }
       }
 
-      if (!pcb.cspace.hasRight(context.capHandle, definition.requiredRight)) {
+      final hasCapability = pcb.cspace.hasRightForContext(
+        context.capHandle,
+        definition.requiredRight,
+      );
+      if (!hasCapability) {
         decision = AuditDecision.deniedByPolicy;
         result = SyscallResult<Map<String, dynamic>>.failure(
           SyscallError(
@@ -272,8 +286,8 @@ class SyscallGate {
 
       pcb.quotaUsage.recordSyscall();
 
-      // Stage 3: beforeSyscall hook chain (MUST execute before Stage 4 Ring 2 gate).
-      final hookContext = SyscallHookContext(
+      // Stage 3: beforeSyscall hook chain in FIFO order (MUST execute before Stage 4 Ring 2 gate).
+      var hookContext = SyscallHookContext(
         pid: pcb.pid,
         ring: pcb.ring,
         sessionId: context.sessionId,
@@ -297,22 +311,136 @@ class SyscallGate {
                 details: <String, dynamic>{
                   'hookName': hook.name,
                   'blockReason': hookResult.reason,
+                  'hookPoint': 'beforeSyscall',
                 },
               ),
             ),
           );
           return result;
         }
+        if (hookResult is HookModifyArgs) {
+          final modifiedArgs = Map<String, dynamic>.from(hookResult.args);
+          final revalidationError = definition.validateArgs?.call(modifiedArgs);
+          if (revalidationError != null) {
+            decision = AuditDecision.invalidArgs;
+            result = SyscallResult<Map<String, dynamic>>.failure(
+              _redactError(revalidationError),
+            );
+            return result;
+          }
+          currentArgs = definition.normalizeArgs != null
+              ? Map<String, dynamic>.from(
+                  definition.normalizeArgs!(modifiedArgs),
+                )
+              : modifiedArgs;
+          if (definition.checkPreconditions != null) {
+            final preError = await definition.checkPreconditions!(
+              pcb,
+              currentArgs,
+            );
+            if (preError != null) {
+              decision = _decisionForPreconditionError(preError.code);
+              result = SyscallResult<Map<String, dynamic>>.failure(
+                _redactError(preError),
+              );
+              return result;
+            }
+          }
+          hookContext = SyscallHookContext(
+            pid: pcb.pid,
+            ring: pcb.ring,
+            sessionId: context.sessionId,
+            syscallName: request.name,
+            args: currentArgs,
+            jjContext: pcb.jjContext,
+          );
+        }
       }
 
-      // Stage 4: Ring 2 approval gate.
-      var ringDecision = definition.evaluatePolicy != null
+      // Stage 3.5: sys_tx_squash dedicated TxHook.onTxSquash chain BEFORE Stage 4 ApprovalGate ([D-202], [D-220]).
+      if (request.name == 'sys_tx_squash' && _txHooks.isNotEmpty) {
+        for (final txHook in _txHooks) {
+          final txResult = await txHook.onTxSquash(hookContext);
+          if (txResult is HookBlock) {
+            decision = AuditDecision.hookBlocked;
+            result = SyscallResult<Map<String, dynamic>>.failure(
+              _redactError(
+                SyscallError(
+                  code: SyscallErrorCode.eperm,
+                  reason: 'HOOK_BLOCKED',
+                  message: txResult.message,
+                  recoverable: true,
+                  hint: txResult.hint,
+                  details: <String, dynamic>{
+                    'hookName': txHook.name,
+                    'blockReason': txResult.reason,
+                    'hookPoint': 'onTxSquash',
+                  },
+                ),
+              ),
+            );
+            return result;
+          }
+          if (txResult is HookModifyArgs) {
+            final modifiedArgs = Map<String, dynamic>.from(txResult.args);
+            final revalidationError =
+                definition.validateArgs?.call(modifiedArgs);
+            if (revalidationError != null) {
+              decision = AuditDecision.invalidArgs;
+              result = SyscallResult<Map<String, dynamic>>.failure(
+                _redactError(revalidationError),
+              );
+              return result;
+            }
+            currentArgs = definition.normalizeArgs != null
+                ? Map<String, dynamic>.from(
+                    definition.normalizeArgs!(modifiedArgs),
+                  )
+                : modifiedArgs;
+            if (definition.checkPreconditions != null) {
+              final preError = await definition.checkPreconditions!(
+                pcb,
+                currentArgs,
+              );
+              if (preError != null) {
+                decision = _decisionForPreconditionError(preError.code);
+                result = SyscallResult<Map<String, dynamic>>.failure(
+                  _redactError(preError),
+                );
+                return result;
+              }
+            }
+            hookContext = SyscallHookContext(
+              pid: pcb.pid,
+              ring: pcb.ring,
+              sessionId: context.sessionId,
+              syscallName: request.name,
+              args: currentArgs,
+              jjContext: pcb.jjContext,
+            );
+          }
+        }
+      }
+
+      // Stage 4: Ring 2 approval gate & TTY monopoly enforcement ([D-202], [D-213]).
+      final ringDecision = definition.evaluatePolicy != null
           ? await definition.evaluatePolicy!(pcb, currentArgs)
           : RingDecision.allow;
 
-      if (pcb.ring == ProtectionRing.ring3 &&
-          ringDecision == RingDecision.askUser) {
-        ringDecision = RingDecision.deny;
+      if (ringDecision == RingDecision.askUser &&
+          (pcb.ring == ProtectionRing.ring3 ||
+              (pcb.ring == ProtectionRing.ring2 && pcb.pid != 1))) {
+        decision = AuditDecision.deniedByPolicy;
+        result = SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eperm,
+            reason: 'TTY_MONOPOLY_DENIED',
+            message:
+                'Process "${pcb.name}" (pid=${pcb.pid}, ${pcb.ring.name}) cannot request user approval for "${request.name}" (TTY monopoly).',
+            recoverable: false,
+          ),
+        );
+        return result;
       }
 
       if (ringDecision == RingDecision.deny) {
@@ -452,8 +580,24 @@ class SyscallGate {
         );
       }
 
-      // Stage 6: afterSyscall hook chain.
+      // Stage 6: afterSyscall hook chain (FIFO transform + observation; never falsifies failure into success) ([D-202], [D-220]).
       for (final hook in _hooks) {
+        if (hook is SyscallAfterTransformHook) {
+          try {
+            final transformed = await hook.transformAfterSyscall(
+              hookContext,
+              result,
+            );
+            // TCB invariant: HookAfterReplace is only applied when Stage 5 succeeded.
+            if (transformed is HookAfterReplace && result.ok) {
+              result = SyscallResult<Map<String, dynamic>>.success(
+                Map<String, dynamic>.from(transformed.payload),
+              );
+            }
+          } catch (_) {
+            // Do not fail completed syscall on non-critical post-hook transform error.
+          }
+        }
         try {
           await hook.afterSyscall(hookContext, result);
         } catch (_) {
@@ -461,7 +605,7 @@ class SyscallGate {
         }
       }
 
-      // Stage 7: I/O payload output capper.
+      // Stage 7: I/O payload output capper (always applied AFTER Stage 6 transformAfterSyscall).
       if (result.ok && definition.applyIoCap && result.value != null) {
         final capped = await ioCapper.capStructuredPayload(
           payload: result.value!,
@@ -472,6 +616,13 @@ class SyscallGate {
         );
         truncated = capped.truncated;
         result = SyscallResult<Map<String, dynamic>>.success(capped.payload);
+      }
+
+      // Stage 8 pre-return guard: SecretRedactor enforced on successful payload as well ([D-220]).
+      if (result.ok && result.value != null) {
+        final redactedPayload =
+            redactor.redactJson(result.value!) as Map<String, dynamic>;
+        result = SyscallResult<Map<String, dynamic>>.success(redactedPayload);
       }
 
       return result;
@@ -505,6 +656,8 @@ class SyscallGate {
           timestamp: DateTime.now().toUtc(),
           sessionId: context.sessionId,
           pid: context.pid,
+          parentPid: pcb?.parentPid,
+          processName: pcb?.name,
           ring: pcb?.ring ?? ProtectionRing.ring2,
           syscallName: request.name,
           argsSummary: _buildArgsSummary(currentArgs),

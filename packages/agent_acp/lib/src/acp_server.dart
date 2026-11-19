@@ -37,7 +37,7 @@ class AcpModelOption {
   }
 }
 
-/// Configuration options for [AcpServer] ([D-018], [D-022]).
+/// Configuration options for [AcpServer] ([D-018], [D-022], [D-219]).
 class AcpServerConfig {
   const AcpServerConfig({
     this.startupModel,
@@ -47,6 +47,8 @@ class AcpServerConfig {
     this.openRouterBaseUrl,
     this.maxStepsPerTurn = 32,
     this.jjExecutable = 'jj',
+    this.skillsDirs = const <String>[],
+    this.skillsDirEnv,
     this.bootstrapFactory,
   });
 
@@ -57,6 +59,13 @@ class AcpServerConfig {
   final String? openRouterBaseUrl;
   final int maxStepsPerTurn;
   final String jjExecutable;
+
+  /// Repeatable `--skills-dir <path>` directories in priority order ([D-203], [D-219]).
+  final List<String> skillsDirs;
+
+  /// Captured `AGENT_OS_SKILLS_DIR` environment value for session skill loading ([D-203], [D-219]).
+  final String? skillsDirEnv;
+
   final AcpBootstrapFactory? bootstrapFactory;
 }
 
@@ -261,10 +270,19 @@ class AcpServer {
       localOllamaBaseUrl: config.localOllamaBaseUrl,
       ollamaCloudBaseUrl: config.ollamaCloudBaseUrl,
       openRouterBaseUrl: config.openRouterBaseUrl,
+      quota: ResourceQuota.stage2Default,
+      enableStage2Multiprocess: true,
       maxStepsPerTurn: config.maxStepsPerTurn,
       jjExecutable: config.jjExecutable,
+      skillsDirs: config.skillsDirs,
+      skillsDirEnv: config.skillsDirEnv,
+      onPagingReport: (report, {Pid pid = 1}) {
+        if (pid == 1) {
+          mapper.recordPagingReport(report);
+        }
+      },
       onLlmStreamEvent: (sid, turnIndex, event) {
-        mapper.onLlmStreamEvent(sid, turnIndex, event);
+        mapper.onLlmStreamEvent(sid, turnIndex, event, pid: 1);
       },
     );
 
@@ -434,6 +452,13 @@ class AcpServer {
       'jjOpId': jjInfo.jjOpId,
       'txState': session.bootstrap.pcb.jjContext.state.name,
       'totalTokensUsed': session.bootstrap.pcb.quotaUsage.totalTokensUsed,
+      'activeChildProcesses':
+          session.bootstrap.pcb.quotaUsage.activeChildProcesses,
+      'spawnedChildrenCount':
+          session.bootstrap.workerHost?.spawnedChildrenCount ?? 0,
+      ...session.mapper.buildTurnSummaryPagingMeta(
+        session.bootstrap.pcb.memory,
+      ),
       if (result.usage != null)
         'usage': <String, dynamic>{
           'promptTokens': result.usage!.promptTokens,
@@ -561,6 +586,13 @@ class AcpServer {
       'baseOpId': tx.baseOpId,
       'parentChangeId': tx.parentChangeId,
       'totalTokensUsed': session.bootstrap.pcb.quotaUsage.totalTokensUsed,
+      'activeChildProcesses':
+          session.bootstrap.pcb.quotaUsage.activeChildProcesses,
+      'spawnedChildrenCount':
+          session.bootstrap.workerHost?.spawnedChildrenCount ?? 0,
+      ...session.mapper.buildTurnSummaryPagingMeta(
+        session.bootstrap.pcb.memory,
+      ),
     };
   }
 
@@ -629,7 +661,7 @@ class _DeferredAcpObserverHook extends BaseSyscallHook {
 
   @override
   Future<HookBeforeResult> beforeSyscall(SyscallHookContext context) async {
-    if (context.syscallName != 'sys_llm_chat') {
+    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
       _mapperProvider().recordBeforeSyscall(context);
     }
     return const HookAllow();
@@ -640,7 +672,7 @@ class _DeferredAcpObserverHook extends BaseSyscallHook {
     SyscallHookContext context,
     SyscallResult<Map<String, dynamic>> result,
   ) async {
-    if (context.syscallName != 'sys_llm_chat') {
+    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
       _mapperProvider().recordAfterSyscall(context, result);
     }
   }

@@ -140,6 +140,7 @@ class AcpCliRunner {
     String? model,
     String? ollamaUrl,
     int? maxSteps,
+    List<String> skillsDirs = const <String>[],
   }) {
     final extraArgs = <String>[
       if (model != null && model.trim().isNotEmpty) ...<String>[
@@ -151,6 +152,8 @@ class AcpCliRunner {
         ollamaUrl.trim(),
       ],
       if (maxSteps != null) ...<String>['--max-steps', '$maxSteps'],
+      for (final dir in skillsDirs)
+        if (dir.trim().isNotEmpty) ...<String>['--skills-dir', dir.trim()],
     ];
 
     if (explicitDaemonPath != null && explicitDaemonPath.trim().isNotEmpty) {
@@ -220,6 +223,12 @@ class AcpCliRunner {
         'max-steps',
         defaultsTo: '32',
         help: 'Maximum ReAct steps per user turn.',
+      )
+      ..addMultiOption(
+        'skills-dir',
+        splitCommas: false,
+        help:
+            'External directory containing <skill>/SKILL.md packages passed to the daemon (repeatable).',
       )
       ..addMultiOption(
         'batch-commands',
@@ -338,12 +347,18 @@ class AcpCliRunner {
     final failOnError = parsed.flag('fail-on-error');
     final useColor = _useAnsiColor && !parsed.flag('no-color');
     final ollamaUrl = parsed.option('ollama-url');
+    final skillsDirs = parsed
+        .multiOption('skills-dir')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList(growable: false);
 
     final launchSpec = resolveDaemonLaunch(
       explicitDaemonPath: parsed.option('daemon'),
       model: startupModel,
       ollamaUrl: ollamaUrl,
       maxSteps: maxSteps,
+      skillsDirs: skillsDirs,
     );
     if (launchSpec == null) {
       _err.writeln(

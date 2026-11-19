@@ -2,6 +2,8 @@ import 'dart:collection';
 
 import 'capability.dart';
 import 'context_memory.dart';
+import 'mailbox.dart';
+import 'process_profile.dart';
 import 'quota.dart';
 import 'syscall_error.dart';
 import 'vfs_namespace.dart';
@@ -100,7 +102,7 @@ class JjTxContext {
   }
 }
 
-/// Kernel Process Control Block holding isolation, capability, quota, and context state ([D-005]).
+/// Kernel Process Control Block holding isolation, capability, quota, mailbox, and context state ([D-005], [D-211], [D-212]).
 class ProcessControlBlock {
   ProcessControlBlock({
     required this.pid,
@@ -114,8 +116,11 @@ class ProcessControlBlock {
     required this.namespace,
     JjTxContext? jjContext,
     required this.memory,
+    BoundedMailbox? mailbox,
+    this.profile,
   })  : quotaUsage = quotaUsage ?? QuotaConsumption(),
-        jjContext = jjContext ?? JjTxContext();
+        jjContext = jjContext ?? JjTxContext(),
+        mailbox = mailbox ?? BoundedMailbox();
 
   final Pid pid;
   final Pid? parentPid;
@@ -128,17 +133,31 @@ class ProcessControlBlock {
   final VfsNamespace namespace;
   final JjTxContext jjContext;
   final VirtualContextMemory memory;
+  final BoundedMailbox mailbox;
+  final ProcessProfileId? profile;
+
+  /// Alias matching audit log attribution naming ([D-215]).
+  String get processName => name;
 }
 
-/// Process table enforcing the Stage 1 single-process safety lock ([D-005]).
+/// Process table enforcing the Stage 1 single-process safety lock and Stage 2 multi-process limits ([D-005], [D-211]).
 class KernelProcessTable {
   KernelProcessTable({this.maxActiveProcesses = stage1MaxActiveProcesses})
       : assert(maxActiveProcesses >= 1);
 
+  /// Creates a Stage 2 multi-process table supporting up to [maxActiveProcesses] concurrent processes ([D-211]).
+  factory KernelProcessTable.stage2({
+    int maxActiveProcesses = stage2DefaultMaxActiveProcesses,
+  }) {
+    return KernelProcessTable(maxActiveProcesses: maxActiveProcesses);
+  }
+
   static const int stage1MaxActiveProcesses = 1;
+  static const int stage2DefaultMaxActiveProcesses = 16;
 
   final int maxActiveProcesses;
   final Map<Pid, ProcessControlBlock> _processes = <Pid, ProcessControlBlock>{};
+  int _nextPid = 1;
 
   /// Unmodifiable view of registered PCBs.
   UnmodifiableMapView<Pid, ProcessControlBlock> get processes =>
@@ -147,27 +166,77 @@ class KernelProcessTable {
   /// Looks up a PCB by [pid].
   ProcessControlBlock? getProcess(Pid pid) => _processes[pid];
 
+  /// Allocates the next strictly monotonically increasing PID without ever reusing terminated PIDs ([D-211]).
+  Pid allocateNextPid() {
+    while (_processes.containsKey(_nextPid)) {
+      _nextPid += 1;
+    }
+    final allocated = _nextPid;
+    _nextPid += 1;
+    return allocated;
+  }
+
+  /// Returns all registered child PCBs spawned by [parentPid].
+  List<ProcessControlBlock> childrenOf(Pid parentPid) {
+    return _processes.values
+        .where((p) => p.parentPid == parentPid)
+        .toList(growable: false);
+  }
+
+  /// Returns non-terminated child PCBs spawned by [parentPid].
+  List<ProcessControlBlock> activeChildrenOf(Pid parentPid) {
+    return _processes.values
+        .where(
+          (p) => p.parentPid == parentPid && p.state != ProcessState.terminated,
+        )
+        .toList(growable: false);
+  }
+
   /// Registers a process while enforcing [maxActiveProcesses].
   SyscallResult<ProcessControlBlock> registerProcess(ProcessControlBlock pcb) {
     final activeCount = _processes.values
         .where((p) => p.state != ProcessState.terminated)
         .length;
     if (!_processes.containsKey(pcb.pid) && activeCount >= maxActiveProcesses) {
+      if (maxActiveProcesses == stage1MaxActiveProcesses) {
+        return SyscallResult<ProcessControlBlock>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eperm,
+            reason: 'STAGE1_SINGLE_PROCESS_LOCK',
+            message:
+                'Cannot register process ${pcb.pid}: Stage 1 single-process lock limits active processes to $maxActiveProcesses.',
+            recoverable: false,
+          ),
+        );
+      }
       return SyscallResult<ProcessControlBlock>.failure(
         SyscallError(
-          code: SyscallErrorCode.eperm,
-          reason: 'STAGE1_SINGLE_PROCESS_LOCK',
+          code: SyscallErrorCode.edquot,
+          reason: 'CHILD_PROCESS_QUOTA_EXCEEDED',
           message:
-              'Cannot register process ${pcb.pid}: Stage 1 single-process lock limits active processes to $maxActiveProcesses.',
-          recoverable: false,
+              'Cannot register process ${pcb.pid}: active process table limit ($maxActiveProcesses) reached.',
+          recoverable: true,
+          hint: 'Wait for running child processes with sys_wait before spawning more.',
+          details: <String, dynamic>{
+            'activeProcesses': activeCount,
+            'maxActiveProcesses': maxActiveProcesses,
+          },
         ),
       );
     }
     _processes[pcb.pid] = pcb;
+    if (pcb.pid >= _nextPid) {
+      _nextPid = pcb.pid + 1;
+    }
     return SyscallResult<ProcessControlBlock>.success(pcb);
   }
 
-  /// Validates whether [parentPid] is permitted to spawn a child process (`EPERM` when locked).
+  /// Validates whether [parentPid] is permitted to spawn a child process ([D-005], [D-211]).
+  ///
+  /// - Stage 1 lock (`maxChildProcesses == 0` or `maxActiveProcesses == 1`):
+  ///   returns `EPERM: STAGE1_SINGLE_PROCESS_LOCK` (`recoverable: false`).
+  /// - Stage 2 active child / table capacity reached:
+  ///   returns `EDQUOT: CHILD_PROCESS_QUOTA_EXCEEDED` (`recoverable: true`).
   SyscallError? validateSpawnAllowed(Pid parentPid) {
     final parent = _processes[parentPid];
     if (parent == null) {
@@ -177,7 +246,8 @@ class KernelProcessTable {
         message: 'Unknown parent process $parentPid.',
       );
     }
-    if (parent.quota.maxChildProcesses == 0) {
+    if (parent.quota.maxChildProcesses == 0 ||
+        maxActiveProcesses == stage1MaxActiveProcesses) {
       return const SyscallError(
         code: SyscallErrorCode.eperm,
         reason: 'STAGE1_SINGLE_PROCESS_LOCK',
@@ -192,11 +262,19 @@ class KernelProcessTable {
     if (parent.quotaUsage.activeChildProcesses >=
             parent.quota.maxChildProcesses ||
         activeCount >= maxActiveProcesses) {
-      return const SyscallError(
-        code: SyscallErrorCode.eperm,
-        reason: 'STAGE1_SINGLE_PROCESS_LOCK',
-        message: 'Process limit reached; cannot spawn child process.',
-        recoverable: false,
+      return SyscallError(
+        code: SyscallErrorCode.edquot,
+        reason: 'CHILD_PROCESS_QUOTA_EXCEEDED',
+        message:
+            'Concurrent child process quota exceeded (activeChildren=${parent.quotaUsage.activeChildProcesses}/${parent.quota.maxChildProcesses}, activeProcesses=$activeCount/$maxActiveProcesses).',
+        recoverable: true,
+        hint: 'Wait for active child processes with sys_wait before spawning another child.',
+        details: <String, dynamic>{
+          'activeChildProcesses': parent.quotaUsage.activeChildProcesses,
+          'maxChildProcesses': parent.quota.maxChildProcesses,
+          'activeProcesses': activeCount,
+          'maxActiveProcesses': maxActiveProcesses,
+        },
       );
     }
     return null;

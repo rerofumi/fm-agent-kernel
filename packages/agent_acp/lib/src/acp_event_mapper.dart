@@ -16,7 +16,7 @@ class AcpSyscallObserverHook extends BaseSyscallHook {
 
   @override
   Future<HookBeforeResult> beforeSyscall(SyscallHookContext context) async {
-    if (context.syscallName != 'sys_llm_chat') {
+    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
       _mapper.recordBeforeSyscall(context);
     }
     return const HookAllow();
@@ -27,7 +27,7 @@ class AcpSyscallObserverHook extends BaseSyscallHook {
     SyscallHookContext context,
     SyscallResult<Map<String, dynamic>> result,
   ) async {
-    if (context.syscallName != 'sys_llm_chat') {
+    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
       _mapper.recordAfterSyscall(context, result);
     }
   }
@@ -42,18 +42,65 @@ class AcpEventMapper {
     required VfsNamespace namespace,
     required JjTxContext jjContext,
     SecretRedactor? redactor,
-    this.contextWindowSize = 32768,
+    int contextWindowSize = 32768,
   })  : _peer = peer,
         _namespace = namespace,
         _jjContext = jjContext,
-        _redactor = redactor ?? SecretRedactor();
+        _redactor = redactor ?? SecretRedactor(),
+        _contextWindowSize = contextWindowSize;
 
   final String sessionId;
   final JsonRpcPeer _peer;
   final VfsNamespace _namespace;
   final JjTxContext _jjContext;
   final SecretRedactor _redactor;
-  final int contextWindowSize;
+  int _contextWindowSize;
+
+  /// Current effective context window size reflected in ACP `usage_update.size` ([D-209]).
+  int get contextWindowSize => _contextWindowSize;
+
+  ContextPagingReport? _lastPagingReport;
+  Map<String, dynamic>? _lastPagingSummary;
+
+  /// Latest [ContextPagingReport] recorded for `pid == 1`, if any.
+  ContextPagingReport? get lastPagingReport => _lastPagingReport;
+
+  /// Updates the effective context window size used for ACP `usage_update.size` ([D-209]).
+  void updateEffectiveContextWindow(int size) {
+    if (size > 0) {
+      _contextWindowSize = size;
+    }
+  }
+
+  /// Records a pre-inference [ContextPagingReport] and updates [contextWindowSize] ([D-209], [D-215]).
+  void recordPagingReport(ContextPagingReport report) {
+    _lastPagingReport = report;
+    if (report.effectiveWindowTokens > 0) {
+      _contextWindowSize = report.effectiveWindowTokens;
+    }
+    _lastPagingSummary = <String, dynamic>{
+      'effectiveWindowTokens': report.effectiveWindowTokens,
+      'effectiveInputBudget': report.effectiveInputBudget,
+      'evictedPagesInStep': report.evictedPagesInStep,
+      'residentCleanPages': report.residentCleanPages,
+      'evictedCleanPages': report.evictedCleanPages,
+      'stalePagesCount': report.stalePagesCount,
+    };
+  }
+
+  /// Builds paging telemetry fields suitable for `turnSummary._meta` and `_fm_agent_os/status` ([D-215]).
+  Map<String, dynamic> buildTurnSummaryPagingMeta(
+    VirtualContextMemory memory,
+  ) {
+    return <String, dynamic>{
+      'effectiveContextWindow': _contextWindowSize,
+      'residentCleanPagesCount': memory.pageTable.residentCleanPagesCount,
+      'evictedCleanPagesCount': memory.pageTable.evictedCleanPagesCount,
+      'stalePagesCount': memory.pageTable.stalePagesCount,
+      if (_lastPagingReport != null)
+        'lastEvictedPagesInStep': _lastPagingReport!.evictedPagesInStep,
+    };
+  }
 
   ModelIdentifier? _currentTurnModel;
   String? _activeCallId;
@@ -92,13 +139,14 @@ class AcpEventMapper {
     }
   }
 
-  /// Forwards `LlmDoneEvent` from `sys_llm_chat` as an ACP `usage_update` ([D-019]).
+  /// Forwards `LlmDoneEvent` from `sys_llm_chat` (strictly for `pid == 1`) as an ACP `usage_update` ([D-019], [D-215]).
   void onLlmStreamEvent(
     String eventSessionId,
     int turnIndex,
-    LlmStreamEvent event,
-  ) {
-    if (eventSessionId != sessionId) {
+    LlmStreamEvent event, {
+    Pid pid = 1,
+  }) {
+    if (pid != 1 || eventSessionId != sessionId) {
       return;
     }
     if (event is LlmDoneEvent) {
@@ -190,21 +238,33 @@ class AcpEventMapper {
           },
         });
         _resetActiveCall();
-      case AgentTurnCompletedEvent():
+      case AgentTurnCompletedEvent(:final pagingSummary):
+        if (pagingSummary != null) {
+          _lastPagingSummary = pagingSummary;
+          final effWin = (pagingSummary['effectiveWindowTokens'] as num?)?.toInt();
+          if (effWin != null && effWin > 0) {
+            _contextWindowSize = effWin;
+          }
+        }
+        _resetActiveCall();
       case AgentTurnFailedEvent():
         _resetActiveCall();
     }
   }
 
-  /// Maps syscall names to ACP standard `tool_call.kind` enumeration values ([D-019]).
+  /// Maps syscall names to ACP standard `tool_call.kind` enumeration values ([D-019], [D-202]).
   static String mapToolKind(String toolName) {
     return switch (toolName) {
       'sys_read_lines' ||
       'sys_jj_status' ||
       'sys_jj_log' ||
-      'sys_jj_diff' =>
+      'sys_jj_diff' ||
+      'sys_mem_pagein' ||
+      'sys_skill_list' ||
+      'sys_skill_read' =>
         'read',
-      'sys_glob' || 'sys_grep' => 'search',
+      'sys_glob' || 'sys_grep' || 'sys_web_search' => 'search',
+      'sys_web_fetch' => 'fetch',
       'sys_edit_block' ||
       'sys_write_file' ||
       'sys_tx_begin' ||
@@ -257,6 +317,33 @@ class AcpEventMapper {
             ? '$cmd ${rawArgs.join(' ')}'
             : cmd;
         return 'Execute: $full';
+      case 'sys_mem_pagein':
+        return 'Page in ${args['pageId'] ?? ''}';
+      case 'sys_spawn':
+        final profile = args['profile'] ?? 'child';
+        final name = args['name'];
+        return name is String && name.trim().isNotEmpty
+            ? 'Spawn $profile ($name)'
+            : 'Spawn $profile';
+      case 'sys_wait':
+        final pids = args['pids'];
+        return pids is List && pids.isNotEmpty
+            ? 'Wait for children (${pids.join(', ')})'
+            : 'Wait for children';
+      case 'sys_exit':
+        return 'Exit child process (${args['exitCode'] ?? 0})';
+      case 'sys_send':
+        return 'Send IPC to pid=${args['toPid'] ?? ''}';
+      case 'sys_recv':
+        return 'Receive IPC messages';
+      case 'sys_web_search':
+        return 'Web search "${args['query'] ?? ''}"';
+      case 'sys_web_fetch':
+        return 'Fetch ${args['url'] ?? ''}';
+      case 'sys_skill_list':
+        return 'List skills';
+      case 'sys_skill_read':
+        return 'Read skill ${args['name'] ?? ''}';
       default:
         return toolName;
     }
@@ -266,7 +353,7 @@ class AcpEventMapper {
     final update = <String, dynamic>{
       'sessionUpdate': 'usage_update',
       'used': usage.totalTokens,
-      'size': contextWindowSize,
+      'size': _contextWindowSize,
       if (usage.costMicroUsd != null)
         'cost': <String, dynamic>{
           'amount': double.parse((usage.costMicroUsd! / 1e6).toStringAsFixed(6)),
@@ -283,6 +370,8 @@ class AcpEventMapper {
           'cacheHitRate': usage.cacheHitRate,
           'ttftMs': usage.ttftMs,
           'durationMs': usage.durationMs,
+          'effectiveContextWindow': _contextWindowSize,
+          if (_lastPagingSummary != null) 'paging': _lastPagingSummary,
         },
       },
     };

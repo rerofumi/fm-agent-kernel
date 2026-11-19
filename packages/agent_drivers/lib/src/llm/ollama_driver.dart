@@ -172,8 +172,11 @@ class OllamaDriver implements LlmDriver {
       _redactor.registerSecret(key);
       return key;
     }
-    final fromEnv = _envLoader?.get('OLLAMA_API_KEY') ??
-        Platform.environment['OLLAMA_API_KEY'];
+    final fromEnv = _envLoader != null
+        ? (_envLoader.get('OLLAMA_API_KEY') ??
+            _envLoader.get('OLLAMA_CLOUD_API_KEY'))
+        : (Platform.environment['OLLAMA_API_KEY'] ??
+            Platform.environment['OLLAMA_CLOUD_API_KEY']);
     if (fromEnv != null && fromEnv.trim().isNotEmpty) {
       final key = fromEnv.trim();
       _redactor.registerSecret(key);
@@ -183,6 +186,9 @@ class OllamaDriver implements LlmDriver {
   }
 
   /// Builds the native Ollama `/api/chat` JSON payload from a canonical [LlmChatRequest].
+  ///
+  /// Intentionally never emits per-turn dynamic `options.num_ctx` ([D-209] §4.2) so Ollama
+  /// does not reload the model or evict its VRAM KV cache between turns.
   Map<String, dynamic> buildRequestBody(LlmChatRequest request) {
     final messages = <Map<String, dynamic>>[];
     for (final msg in request.prompt.messages) {

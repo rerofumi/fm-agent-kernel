@@ -159,6 +159,7 @@ class AgentTurnCompletedEvent extends AgentLoopEvent {
     required this.steps,
     required this.toolCallsExecuted,
     this.usage,
+    this.pagingSummary,
   });
 
   final ModelIdentifier model;
@@ -166,6 +167,7 @@ class AgentTurnCompletedEvent extends AgentLoopEvent {
   final int steps;
   final int toolCallsExecuted;
   final LlmUsageTelemetry? usage;
+  final Map<String, dynamic>? pagingSummary;
 }
 
 class AgentTurnFailedEvent extends AgentLoopEvent {
@@ -191,6 +193,7 @@ class AgentTurnResult {
     this.steps = 0,
     this.toolCallsExecuted = 0,
     this.usage,
+    this.pagingSummary,
     this.error,
   });
 
@@ -202,6 +205,7 @@ class AgentTurnResult {
     required int steps,
     required int toolCallsExecuted,
     LlmUsageTelemetry? usage,
+    Map<String, dynamic>? pagingSummary,
   }) : this._(
           ok: true,
           turnIndex: turnIndex,
@@ -211,6 +215,7 @@ class AgentTurnResult {
           steps: steps,
           toolCallsExecuted: toolCallsExecuted,
           usage: usage,
+          pagingSummary: pagingSummary,
         );
 
   const AgentTurnResult.failure({
@@ -219,12 +224,14 @@ class AgentTurnResult {
     required SyscallError error,
     int steps = 0,
     int toolCallsExecuted = 0,
+    Map<String, dynamic>? pagingSummary,
   }) : this._(
           ok: false,
           turnIndex: turnIndex,
           model: model,
           steps: steps,
           toolCallsExecuted: toolCallsExecuted,
+          pagingSummary: pagingSummary,
           error: error,
         );
 
@@ -236,6 +243,7 @@ class AgentTurnResult {
   final int steps;
   final int toolCallsExecuted;
   final LlmUsageTelemetry? usage;
+  final Map<String, dynamic>? pagingSummary;
   final SyscallError? error;
 }
 
@@ -250,6 +258,7 @@ class LeadAgent {
     required this.modelResolver,
     String? sessionUuid,
     this.maxStepsPerTurn = 32,
+    this.onTurnExitCleanup,
   }) : sessionUuid = sessionUuid ?? _generateUuidV4();
 
   final ProcessControlBlock pcb;
@@ -259,11 +268,19 @@ class LeadAgent {
   final String sessionUuid;
   final int maxStepsPerTurn;
 
+  /// Optional pure-Dart async cleanup callback invoked in [runTurn]'s `finally` block
+  /// (e.g., force-reaping active child processes and settling quotas before turn return; [D-204], [D-210]).
+  final Future<void> Function()? onTurnExitCleanup;
+
   final StreamController<AgentLoopEvent> _eventController =
       StreamController<AgentLoopEvent>.broadcast(sync: true);
 
   int _turnCounter = 0;
   int _canonicalCallSeq = 0;
+  ModelIdentifier? _activeTurnModel;
+
+  /// Model fixed at the current turn boundary, or `null` when idle ([D-203] §3.1(1)).
+  ModelIdentifier? get activeTurnModel => _activeTurnModel;
 
   /// Broadcast stream of real-time agent loop events.
   Stream<AgentLoopEvent> get events => _eventController.stream;
@@ -341,6 +358,7 @@ class LeadAgent {
       );
     }
     final resolvedModel = modelRes.value!;
+    _activeTurnModel = resolvedModel;
 
     // Reset per-turn syscall counter while preserving cumulative token/cost counters.
     pcb.quotaUsage.resetTurn();
@@ -377,6 +395,7 @@ class LeadAgent {
     var hasAnyCost = false;
     int? lastTtftMs;
     var durationAgg = 0;
+    Map<String, dynamic>? lastPagingSummary;
 
     try {
       while (steps < maxStepsPerTurn) {
@@ -489,6 +508,11 @@ class LeadAgent {
           durationAgg += (usageMap['durationMs'] as num?)?.toInt() ?? 0;
         }
 
+        final pagingMap = payload['paging'];
+        if (pagingMap is Map) {
+          lastPagingSummary = Map<String, dynamic>.from(pagingMap);
+        }
+
         // Commit user prompt into Segment 1 once Step 1 succeeds and clear Segment 2.
         if (!userTurnCommitted) {
           pcb.memory.appendUserTurn(userInput);
@@ -547,6 +571,7 @@ class LeadAgent {
               steps: steps,
               toolCallsExecuted: toolCallsExecuted,
               usage: telemetry,
+              pagingSummary: lastPagingSummary,
             ),
           );
           return AgentTurnResult.success(
@@ -557,11 +582,13 @@ class LeadAgent {
             steps: steps,
             toolCallsExecuted: toolCallsExecuted,
             usage: telemetry,
+            pagingSummary: lastPagingSummary,
           );
         }
 
         // Execute each requested tool syscall sequentially through SyscallGate.
-        for (final tc in canonicalCalls) {
+        for (var i = 0; i < canonicalCalls.length; i++) {
+          final tc = canonicalCalls[i];
           if (cancelToken?.isCancelled ?? false) {
             const err = SyscallError(
               code: SyscallErrorCode.ecancelled,
@@ -569,6 +596,7 @@ class LeadAgent {
               message: 'Turn cancelled before executing tool call.',
               recoverable: true,
             );
+            _appendAbortedToolResults(canonicalCalls.sublist(i), err);
             _emit(
               AgentTurnFailedEvent(
                 sessionId: sessionId,
@@ -620,6 +648,10 @@ class LeadAgent {
               ? jsonEncode(toolRes.value ?? const <String, dynamic>{})
               : toolRes.error!.toJsonString();
 
+          final cleanSource = (toolRes.ok && toolRes.value != null)
+              ? buildCleanPageSourceMeta(tc, toolRes.value!)
+              : null;
+
           pcb.memory.appendToolResultTurn(
             CanonicalToolResultTurn(
               canonicalCallId: tc.canonicalCallId,
@@ -627,26 +659,34 @@ class LeadAgent {
               content: resultText,
               isError: !toolRes.ok,
             ),
+            cleanSource: cleanSource,
           );
 
-          if (!toolRes.ok &&
-              (toolRes.error!.code == SyscallErrorCode.edquot ||
-                  toolRes.error!.code == SyscallErrorCode.ecancelled)) {
-            _emit(
-              AgentTurnFailedEvent(
-                sessionId: sessionId,
+          if (!toolRes.ok) {
+            final err = toolRes.error!;
+            final isFatalQuota =
+                err.code == SyscallErrorCode.edquot && !err.recoverable;
+            final isCancelled = err.code == SyscallErrorCode.ecancelled;
+            if (isFatalQuota || isCancelled) {
+              if (i + 1 < canonicalCalls.length) {
+                _appendAbortedToolResults(canonicalCalls.sublist(i + 1), err);
+              }
+              _emit(
+                AgentTurnFailedEvent(
+                  sessionId: sessionId,
+                  turnIndex: turnIndex,
+                  model: resolvedModel,
+                  error: err,
+                ),
+              );
+              return AgentTurnResult.failure(
                 turnIndex: turnIndex,
                 model: resolvedModel,
-                error: toolRes.error!,
-              ),
-            );
-            return AgentTurnResult.failure(
-              turnIndex: turnIndex,
-              model: resolvedModel,
-              error: toolRes.error!,
-              steps: steps,
-              toolCallsExecuted: toolCallsExecuted,
-            );
+                error: err,
+                steps: steps,
+                toolCallsExecuted: toolCallsExecuted,
+              );
+            }
           }
         }
       }
@@ -674,11 +714,33 @@ class LeadAgent {
         toolCallsExecuted: toolCallsExecuted,
       );
     } finally {
+      _activeTurnModel = null;
       pcb.memory.ephemeralSegment.dynamicContextSummary = null;
       pcb.memory.ephemeralSegment.currentUserInput = null;
       if (pcb.state != ProcessState.terminated) {
         pcb.state = ProcessState.ready;
       }
+      if (onTurnExitCleanup != null) {
+        await onTurnExitCleanup!();
+      }
+    }
+  }
+
+  /// Appends synthetic error tool results for unexecuted trailing calls to preserve 1:1 `tool_call_id` pairing ([D-207], [D-214]).
+  void _appendAbortedToolResults(
+    List<CanonicalToolCall> remainingCalls,
+    SyscallError abortError,
+  ) {
+    final content = abortError.toJsonString();
+    for (final remaining in remainingCalls) {
+      pcb.memory.appendToolResultTurn(
+        CanonicalToolResultTurn(
+          canonicalCallId: remaining.canonicalCallId,
+          toolName: remaining.name,
+          content: content,
+          isError: true,
+        ),
+      );
     }
   }
 
@@ -686,6 +748,95 @@ class LeadAgent {
   Future<void> dispose() async {
     if (!_eventController.isClosed) {
       await _eventController.close();
+    }
+  }
+
+  /// Builds [CleanPageSourceMeta] for reproducible Read-Only syscalls ([D-202], [D-206], `OM-203`).
+  ///
+  /// Returns `null` for side-effecting, non-deterministic, or incomplete results so they remain Dirty Pages.
+  static CleanPageSourceMeta? buildCleanPageSourceMeta(
+    CanonicalToolCall tc,
+    Map<String, dynamic> resultPayload,
+  ) {
+    switch (tc.name) {
+      case 'sys_read_lines':
+        final sha = (resultPayload['sha256'] as String?)?.trim();
+        if (sha == null || sha.isEmpty) {
+          return null;
+        }
+        final virtualPath = (resultPayload['path'] as String?) ??
+            (tc.arguments['path'] as String?);
+        final isSkill =
+            virtualPath != null && virtualPath.startsWith('/skills');
+        final rawModified = resultPayload['modifiedUtc'];
+        final modifiedUtc = rawModified is String
+            ? DateTime.tryParse(rawModified)?.toUtc()
+            : null;
+        final byteLength = (resultPayload['byteLength'] as num?)?.toInt();
+        final startLine = (resultPayload['startLine'] as num?)?.toInt() ??
+            (tc.arguments['startLine'] as num?)?.toInt();
+        final endLine = (resultPayload['endLine'] as num?)?.toInt() ??
+            (tc.arguments['endLine'] as num?)?.toInt();
+        return CleanPageSourceMeta(
+          sourceKind: isSkill
+              ? CleanSourceKind.skillFile
+              : CleanSourceKind.workspaceFile,
+          syscallName: tc.name,
+          replayArgs: tc.arguments,
+          virtualPath: virtualPath,
+          startLine: startLine,
+          endLine: endLine,
+          readSha256: sha,
+          readModifiedUtc: modifiedUtc,
+          readByteLength: byteLength,
+        );
+      case 'sys_skill_read':
+        final sha = (resultPayload['sha256'] as String?)?.trim();
+        if (sha == null || sha.isEmpty) {
+          return null;
+        }
+        final virtualPath = (resultPayload['virtualPath'] as String?) ??
+            (resultPayload['path'] as String?) ??
+            (tc.arguments['path'] as String?);
+        final rawModified = resultPayload['modifiedUtc'];
+        final modifiedUtc = rawModified is String
+            ? DateTime.tryParse(rawModified)?.toUtc()
+            : null;
+        final byteLength = (resultPayload['byteLength'] as num?)?.toInt();
+        return CleanPageSourceMeta(
+          sourceKind: CleanSourceKind.skillFile,
+          syscallName: tc.name,
+          replayArgs: tc.arguments,
+          virtualPath: virtualPath,
+          readSha256: sha,
+          readModifiedUtc: modifiedUtc,
+          readByteLength: byteLength,
+        );
+      case 'sys_jj_status':
+      case 'sys_jj_log':
+      case 'sys_jj_diff':
+      case 'sys_glob':
+      case 'sys_grep':
+        var commitId = (resultPayload['commitId'] as String?)?.trim();
+        if (commitId == null || commitId.isEmpty) {
+          final wc = resultPayload['workingCopy'];
+          if (wc is Map) {
+            commitId = (wc['commit_id'] as String?)?.trim();
+          }
+        }
+        if (commitId == null || commitId.isEmpty) {
+          return null;
+        }
+        final opId = (resultPayload['opId'] as String?)?.trim();
+        return CleanPageSourceMeta(
+          sourceKind: CleanSourceKind.vcsSnapshot,
+          syscallName: tc.name,
+          replayArgs: tc.arguments,
+          readCommitId: commitId,
+          readOpId: (opId == null || opId.isEmpty) ? null : opId,
+        );
+      default:
+        return null;
     }
   }
 

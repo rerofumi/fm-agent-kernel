@@ -51,6 +51,12 @@ Future<void> _runDaemon(List<String> args) async {
       defaultsTo: '32',
       help: 'Maximum ReAct steps per turn.',
     )
+    ..addMultiOption(
+      'skills-dir',
+      splitCommas: false,
+      help:
+          'External directory containing <skill>/SKILL.md packages (repeatable; earlier entries win).',
+    )
     ..addFlag(
       'help',
       abbr: 'h',
@@ -113,6 +119,12 @@ Future<void> _runDaemon(List<String> args) async {
     onProtocolError: (msg) => stderr.writeln('[acp-rpc] $msg'),
   );
 
+  final skillsDirs = parsed
+      .multiOption('skills-dir')
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .toList(growable: false);
+
   final server = AcpServer(
     peer: peer,
     config: AcpServerConfig(
@@ -122,6 +134,8 @@ Future<void> _runDaemon(List<String> args) async {
       ollamaCloudBaseUrl: parsed.option('ollama-cloud-url'),
       openRouterBaseUrl: parsed.option('openrouter-url'),
       maxStepsPerTurn: maxSteps,
+      skillsDirs: skillsDirs,
+      skillsDirEnv: Platform.environment['AGENT_OS_SKILLS_DIR'],
     ),
   );
 

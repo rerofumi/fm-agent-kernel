@@ -66,7 +66,7 @@ class JjDriver {
   final String jjExecutable;
   final AsyncMutex _mutex = AsyncMutex();
 
-  String get workspaceHostRoot => namespace.workspaceHostRoot;
+  String get workspaceHostRoot => namespace.workspaceHostRoot!;
 
   /// Custom JSON Lines `-T` template exposing `conflict` and `empty` omitted by `json(self)` ([D-014]).
   static const String commitJsonTemplate =
@@ -106,7 +106,11 @@ class JjDriver {
     String? rev,
     String? revset,
     String? atOp,
+    bool forceIgnoreWorkingCopy = false,
   }) {
+    if (forceIgnoreWorkingCopy) {
+      return true;
+    }
     if (txContext.state == TxState.readOnly) {
       return true;
     }
@@ -120,6 +124,34 @@ class JjDriver {
       return true;
     }
     return false;
+  }
+
+  /// Non-destructively reads the current `@` `commit_id` using `--ignore-working-copy` ([D-204], [D-208]).
+  ///
+  /// Never triggers a working-copy snapshot or advances `jj op log`.
+  Future<String?> getCurrentCommitIdNonDestructive() {
+    return _mutex.synchronized(_readCurrentCommitIdLocked);
+  }
+
+  Future<String?> _readCurrentCommitIdLocked({String? atOp}) async {
+    final res = await _runJjRaw(<String>[
+      'log',
+      '--no-graph',
+      '-r',
+      '@',
+      '--ignore-working-copy',
+      if (atOp != null && atOp.trim().isNotEmpty) ...<String>[
+        '--at-op',
+        atOp.trim(),
+      ],
+      '-T',
+      'commit_id',
+    ]);
+    if (!res.ok) {
+      return null;
+    }
+    final commitId = (res.value!.stdout as String).trim();
+    return commitId.isEmpty ? null : commitId;
   }
 
   /// Non-destructively reads the current `jjChangeId` and `jjOpId` for Stage 8 audit logs ([D-010], [D-014]).
@@ -221,15 +253,22 @@ class JjDriver {
     });
   }
 
-  /// Reads `@`, `@-`, changed files summary, and current `opId` (`sys_jj_status`) ([D-014]).
-  Future<SyscallResult<Map<String, dynamic>>> status({String? atOp}) async {
+  /// Reads `@`, `@-`, changed files summary, and current `opId` (`sys_jj_status`) ([D-014], [D-208]).
+  Future<SyscallResult<Map<String, dynamic>>> status({
+    String? atOp,
+    bool forceIgnoreWorkingCopy = false,
+  }) async {
     final opValidation = _validateOptionalAtOp(atOp);
     if (opValidation != null) {
       return SyscallResult<Map<String, dynamic>>.failure(opValidation);
     }
 
     return _mutex.synchronized(() async {
-      final ignoreWc = shouldIgnoreWorkingCopy(rev: '@', atOp: atOp);
+      final ignoreWc = shouldIgnoreWorkingCopy(
+        rev: '@',
+        atOp: atOp,
+        forceIgnoreWorkingCopy: forceIgnoreWorkingCopy,
+      );
       final baseFlags = <String>[
         if (ignoreWc) '--ignore-working-copy',
         if (atOp != null && atOp.trim().isNotEmpty) ...<String>[
@@ -311,8 +350,11 @@ class JjDriver {
       final summaryText = (diffRes.value!.stdout as String).trimRight();
       final changedFiles = _parseDiffSummary(summaryText);
 
+      final commitId = workingCopy['commit_id'] as String?;
+
       return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
         'opId': opId,
+        if (commitId != null && commitId.isNotEmpty) 'commitId': commitId,
         'workingCopy': workingCopy,
         'parent': parentCommit,
         'changedFiles': changedFiles,
@@ -323,11 +365,12 @@ class JjDriver {
     });
   }
 
-  /// Reads commit history matching [revset] using the custom JSON Lines `-T` template (`sys_jj_log`) ([D-014]).
+  /// Reads commit history matching [revset] using the custom JSON Lines `-T` template (`sys_jj_log`) ([D-014], [D-208]).
   Future<SyscallResult<Map<String, dynamic>>> log({
     String revset = '::@ | @-',
     int limit = 20,
     String? atOp,
+    bool forceIgnoreWorkingCopy = false,
   }) async {
     final trimmedRevset = revset.trim();
     if (trimmedRevset.isEmpty || trimmedRevset.startsWith('-')) {
@@ -356,7 +399,11 @@ class JjDriver {
     }
 
     return _mutex.synchronized(() async {
-      final ignoreWc = shouldIgnoreWorkingCopy(revset: trimmedRevset, atOp: atOp);
+      final ignoreWc = shouldIgnoreWorkingCopy(
+        revset: trimmedRevset,
+        atOp: atOp,
+        forceIgnoreWorkingCopy: forceIgnoreWorkingCopy,
+      );
       final args = <String>[
         'log',
         '--no-graph',
@@ -384,22 +431,27 @@ class JjDriver {
       }
 
       final commits = parsed.value!;
+      final commitId = await _readCurrentCommitIdLocked(atOp: atOp);
       return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
         'revset': trimmedRevset,
         'limit': limit,
         'commits': commits,
         'count': commits.length,
+        'commitId': ?commitId,
         'ignoredWorkingCopy': ignoreWc,
       });
     });
   }
 
-  /// Reads unified Git-format diff for [rev] (`sys_jj_diff`) ([D-014]).
+  /// Reads unified Git-format diff for [rev] (`sys_jj_diff`) ([D-014], [D-208]).
   Future<SyscallResult<Map<String, dynamic>>> diff({
     String rev = '@',
     List<String>? paths,
     String? atOp,
+    bool forceIgnoreWorkingCopy = false,
+    VfsNamespace? namespaceOverride,
   }) async {
+    final effectiveNamespace = namespaceOverride ?? namespace;
     final trimmedRev = rev.trim();
     if (trimmedRev.isEmpty || trimmedRev.startsWith('-')) {
       return const SyscallResult<Map<String, dynamic>>.failure(
@@ -419,7 +471,7 @@ class JjDriver {
     final resolvedRelPaths = <String>[];
     if (paths != null) {
       for (final rawPath in paths) {
-        final vfsRes = namespace.resolveVirtualPath(
+        final vfsRes = effectiveNamespace.resolveVirtualPath(
           rawPath,
           allowRoot: true,
           checkProtected: true,
@@ -436,7 +488,11 @@ class JjDriver {
     }
 
     return _mutex.synchronized(() async {
-      final ignoreWc = shouldIgnoreWorkingCopy(rev: trimmedRev, atOp: atOp);
+      final ignoreWc = shouldIgnoreWorkingCopy(
+        rev: trimmedRev,
+        atOp: atOp,
+        forceIgnoreWorkingCopy: forceIgnoreWorkingCopy,
+      );
       final args = <String>[
         'diff',
         '--git',
@@ -458,9 +514,11 @@ class JjDriver {
         return SyscallResult<Map<String, dynamic>>.failure(res.error!);
       }
 
+      final commitId = await _readCurrentCommitIdLocked(atOp: atOp);
       return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
         'rev': trimmedRev,
         'diff': res.value!.stdout as String,
+        'commitId': ?commitId,
         'ignoredWorkingCopy': ignoreWc,
       });
     });
@@ -1075,8 +1133,12 @@ class JjDriver {
     ];
   }
 
-  /// Builds [SyscallDefinition] entries for Read-Only Jujutsu syscalls ([D-002], [D-006], [D-014]).
+  /// Builds [SyscallDefinition] entries for Read-Only Jujutsu syscalls ([D-002], [D-006], [D-014], [D-204]).
   List<SyscallDefinition> buildReadSyscallDefinitions() {
+    bool shouldForceIgnoreWc(ProcessControlBlock pcb) =>
+        pcb.ring == ProtectionRing.ring3 ||
+        (pcb.profile?.forcesVcsIgnoreWorkingCopy ?? false);
+
     return <SyscallDefinition>[
       SyscallDefinition(
         name: 'sys_jj_status',
@@ -1088,6 +1150,7 @@ class JjDriver {
         evaluatePolicy: (_, _) async => RingDecision.allow,
         handler: (exec) => status(
           atOp: exec.args['atOp'] as String?,
+          forceIgnoreWorkingCopy: shouldForceIgnoreWc(exec.pcb),
         ),
       ),
       SyscallDefinition(
@@ -1102,6 +1165,7 @@ class JjDriver {
           revset: exec.args['revset'] as String? ?? '::@ | @-',
           limit: exec.args['limit'] as int? ?? 20,
           atOp: exec.args['atOp'] as String?,
+          forceIgnoreWorkingCopy: shouldForceIgnoreWc(exec.pcb),
         ),
       ),
       SyscallDefinition(
@@ -1118,6 +1182,8 @@ class JjDriver {
             rev: exec.args['rev'] as String? ?? '@',
             paths: rawPaths?.cast<String>(),
             atOp: exec.args['atOp'] as String?,
+            forceIgnoreWorkingCopy: shouldForceIgnoreWc(exec.pcb),
+            namespaceOverride: exec.pcb.namespace,
           );
         },
       ),

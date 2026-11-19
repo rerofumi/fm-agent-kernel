@@ -136,6 +136,7 @@ environment:
         'sys_jj_diff',
         'sys_jj_log',
         'sys_jj_status',
+        'sys_mem_pagein',
         'sys_read_lines',
         'sys_tx_begin',
         'sys_tx_describe',
@@ -164,6 +165,11 @@ environment:
 
       var step = 0;
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         await utf8.decoder.bind(req).drain<void>();
         step += 1;
 
@@ -304,6 +310,11 @@ environment:
 
       var step = 0;
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         await utf8.decoder.bind(req).drain<void>();
         step += 1;
         req.response.statusCode = 200;
@@ -468,6 +479,11 @@ Start-Sleep -Seconds 60
 
       var step = 0;
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         final body = jsonDecode(await utf8.decoder.bind(req).join())
             as Map<String, dynamic>;
         step += 1;
@@ -572,6 +588,11 @@ Start-Sleep -Seconds 60
 
       var step = 0;
       localServer.listen((req) async {
+        if (req.uri.path != '/api/chat') {
+          req.response.statusCode = 404;
+          await req.response.close();
+          return;
+        }
         await utf8.decoder.bind(req).drain<void>();
         step += 1;
         req.response.statusCode = 200;

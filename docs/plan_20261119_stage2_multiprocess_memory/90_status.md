@@ -1,5 +1,5 @@
 tier: Full
-state: planned
+state: done
 worklog: disabled
 
 # 90_status.md — 進捗正本（`plan_20261119_stage2_multiprocess_memory`）
@@ -25,17 +25,17 @@ worklog: disabled
 
 | 項目 | 内容 |
 | --- | --- |
-| 現在の工程 / 担当 | `plan` / `Lv.2 plan`（`fm-dev-plan` 単独実行完了・返却済み） |
-| 担当leaderの実行参照 | `conversation://c932b4f7-d155-49a0-9f4d-c1926925c7cb` |
-| 呼び出し元 / 返却先 | 利用者 / 利用者 |
-| 工程の結果 | **`ready`**（独立レビュー `PT-06`・差分再レビュー `PT-09` 通過、阻害事項 `0` 件。詳細は `50_review_notes.md` §6 参照） |
-| 基準ソース版（Stage 1 完了版） | `jj` commit `d11c47480b41d52b2b43f866b245f2996a874873`（change `wnmvvtxz`, bookmark `main`、製品コード未コミット差分 `0` 件） |
-| 採用計画 | 未採用（次工程 `implement` 開始時に利用可能な計画版 `r1` を採用する） |
-| 利用可能な計画版 | **`r1`**（復元用参照: 基準 `jj` commit `d11c47480b41d52b2b43f866b245f2996a874873` ＋ `docs/plan_20261119_stage2_multiprocess_memory/env_manifest.md` 正本 20 ファイル SHA-256、最終レビュー承認: `50_review_notes.md` §6 `PT-09`） |
+| 現在の工程 / 担当 | `implement` / `Lv.2 implement`（Lv.1 `fm-dev-process` と兼任） |
+| 担当leaderの実行参照 | `conversation://40164a41-851e-48f8-ba54-8351e310f5d8` |
+| 呼び出し元 / 返却先 | 利用者（Lv.1 `fm-dev-process`） / 利用者 |
+| 工程の結果 | **`complete`**（`REQ-01`〜`REQ-10` 全 10 件独立 `fm-dev-acceptance` `pass`、完了処理 `fm-dev-release` 完了、残件 `0` 件） |
+| 基準ソース版（Stage 1 完了版） | `jj` commit `d11c47480b41d52b2b43f866b245f2996a874873`（change `wnmvvtxz`, bookmark `main`、Stage 2 Planning commit `df5f148aab6af12c4bc937f096cb10aedfe4675a`、作業ツリー差分 `0` 件） |
+| 採用計画 | **`r1`**（復元用参照: 基準 `jj` commit `d11c47480b41d52b2b43f866b245f2996a874873` ＋ `Stage2 Planning` commit `df5f148aab6af12c4bc937f096cb10aedfe4675a` ＋ `docs/plan_20261119_stage2_multiprocess_memory/env_manifest.md` 正本 20 ファイル SHA-256、最終レビュー承認: `50_review_notes.md` §6 `PT-09`） |
+| 利用可能な計画版 | **`r1`**（採用済み） |
 | 改訂案 | なし |
 | 再計画要求 | なし |
-| 現在の作業 / 次の作業 | 計画工程完了（未了作業なし） / 次工程 `implement`（`fm-dev-process` または `fm-dev-implement`）にて計画版 `r1` を採用し、先行依存なしの **`WP-1`** から順次着手可能 |
-| 保留理由 / 再開条件 | なし（`WP-1` 即時開始条件成立） |
+| 現在の作業 / 次の作業 | 完了（全工程 `WP-1`〜`WP-9`・独立受け入れ・完了処理完了、未了作業なし） / なし（VCS コミット・push は利用者の明示判断時に実施） |
+| 保留理由 / 再開条件 | なし |
 
 ## 計画成果物と担当範囲
 
@@ -53,8 +53,7 @@ worklog: disabled
 
 ## 現在進行中・未了の作業
 
-- 未了作業: **なし**（全計画作業 `PT-01`〜`PT-09` は完了・回収済み、全 subagent アイドル確認済み。詳細は下記「履歴」節を参照）。
-- 次工程引き継ぎ作業: `implement` 工程にて `WP-1` → `WP-2`（Step 2-1 ゲート）→ `WP-3` → `WP-4`（Step 2-2 ゲート）→ `WP-5` → `WP-6 ∥ WP-7` → `WP-8`（Step 2-3 ゲート）→ `WP-9`（最終 AOT `.exe` E2E 統合ゲート）の順に実装・検証を進める。
+- 未了作業: **なし**（全実装・ゲート検証・独立受け入れ・完了処理 `IM-01`〜`IM-15` はすべて完了・回収済み。詳細は下記「履歴」節を参照）。
 
 ## おまかせ判断記録
 
@@ -74,16 +73,16 @@ worklog: disabled
 
 | ID | Requirement summary | 対象設計ID | 状態 | Verification method | Evidence class | WP | Implementer state | Evidence | Acceptance |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `REQ-01` | Prefix 保持 3 セグメント拡張・PageTable・High Watermark バッチ Clean Page スタブ退避 | `D-202, D-204, D-206, D-207, D-215` | `今回実装` | 単体/統合自動テスト＋`local-ollama` 40ターン超連続対話（退避2回以上実発火）と `cachedTokens` 維持・回復観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-02` | Clean Page 鮮度検知（`[STALE]`）と `sys_mem_pagein` 再展開 | `D-202, D-204, D-208` | `今回実装` | 4ケース鮮度判定・Prefix不変テスト＋編集後再読込の実機観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-03` | モデル別実効コンテキスト窓解決と小窓モデル切替時の自動フレーム縮小 | `D-203, D-204, D-209` | `今回実装` | 窓解決/フォールバック・自動退避・Dirty超過エラーテスト＋クラウド大窓→ローカル小窓切替実機観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-04` | Dart `Isolate` 子プロセス（`sys_spawn`/`sys_wait`/`sys_exit`）と有界メールボックス IPC（`sys_send`/`sys_recv`） | `D-201, D-202, D-204, D-210, D-211, D-212, D-215` | `今回実装` | AOT互換3並列Isolate・IPC上限・異常回収テスト＋3並列 `Explorer` 実機観測 | `E1 / E2` | `WP-3, WP-4, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-05` | ケーパビリティ単調減少（`Explorer: Read-Only`）・Tool Schema 隠蔽・TTY 独占原則（子の承認要求即 `EPERM`） | `D-202, D-204, D-211, D-213` | `今回実装` | 権限減衰・Schema除外・Approval 0回 `EPERM` テスト＋並列稼働時混線ゼロ＆`op_id` 不変観測 | `E1 / E2` | `WP-1, WP-3, WP-4, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-06` | 階層クオータ寄贈・未使用分返還・超過時 `EDQUOT` 局所停止 | `D-202, D-211, D-214` | `今回実装` | 並列事前予約寄贈/返還保存則・極小予算 `EDQUOT` テスト＋実機子局所停止・親 `end_turn` 完走観測 | `E1 / E2` | `WP-3, WP-4, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-07` | 権限分離 Web 読取ドライバ（`sys_web_search`［Ollama Web Search API 標準］, `sys_web_fetch`：API キー秘匿・SSRF 完全遮断・Markdown 抽出） | `D-201, D-202, D-205, D-216, D-217` | `今回実装` | SSRF/DNS Rebinding/リダイレクト20+ケース・Markdown抽出・CLIバイパス不在確認＋実疎通/Local遮断観測 | `E1 / E2 / E3` | `WP-1, WP-5, WP-6, WP-8, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-08` | 無菌室 `WebResearcher`（Ring 3・個別モデル指定可）と間接プロンプトインジェクション 100% 封じ込め | `D-203, D-204, D-205, D-211, D-218` | `今回実装` | CSpace/VFSゼロ・直接呼び出し `EPERM` テスト＋レイヤA外部仕様要約＆レイヤB悪性インジェクション封じ込め監査観測 | `E1 / E2` | `WP-3, WP-4, WP-6, WP-8, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-09` | 外部フォルダからの `SKILL.md` 動的マウント（`--skills-dir`/`.agent_os/skills`・既存形式互換・権限昇格ゼロ）と Pre/Post Hook 拡充 | `D-201, D-202, D-203, D-219, D-220` | `今回実装` | `/skills` Read-Only・省略互換・権限不足拒否・全Hookポイント網羅テスト＋外部スキル動的マウント `.exe` 実機観測 | `E1 / E2` | `WP-1, WP-5, WP-7, WP-8, WP-9` | `todo` | — | `unverified`: 実装未着手 |
-| `REQ-10` | Stage 1 全機能非回帰・マルチ Isolate 下での Zed ACP `stdio` 純度維持・`dart compile exe` 単一 `.exe` 完結 | `D-201, D-210, D-215` | `今回実装` | 依存分離・`stdout` 単一所有・AOT子 `print`/例外純度・Stage 1+2 全自動テスト・SDK除外 `.exe` 起動＋統合完走観測 | `E1 / E2 / E3` | `WP-1, WP-4, WP-9` | `todo` | — | `unverified`: 実装未着手 |
+| `REQ-01` | Prefix 保持 3 セグメント拡張・PageTable・High Watermark バッチ Clean Page スタブ退避 | `D-202, D-204, D-206, D-207, D-215` | `今回実装` | 単体/統合自動テスト＋`local-ollama` 40ターン超連続対話（退避2回以上実発火）と `cachedTokens` 維持・回復観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp2_step2_1_e2.md:"### 2.1 事象 2-1-1"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-02` | Clean Page 鮮度検知（`[STALE]`）と `sys_mem_pagein` 再展開 | `D-202, D-204, D-208` | `今回実装` | 4ケース鮮度判定・Prefix不変テスト＋編集後再読込の実機観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp2_step2_1_e2.md:"### 2.3 事象 2-1-3"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-03` | モデル別実効コンテキスト窓解決と小窓モデル切替時の自動フレーム縮小 | `D-203, D-204, D-209` | `今回実装` | 窓解決/フォールバック・自動退避・Dirty超過エラーテスト＋クラウド大窓→ローカル小窓切替実機観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp2_step2_1_e2.md:"### 2.2 事象 2-1-2"` ＆ `wp2_step2_1_e2.md:"EDQUOT: CONTEXT_FRAME_EXCEEDED"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-04` | Dart `Isolate` 子プロセス（`sys_spawn`/`sys_wait`/`sys_exit`）と有界メールボックス IPC（`sys_send`/`sys_recv`） | `D-201, D-202, D-204, D-210, D-211, D-212, D-215` | `今回実装` | AOT互換3並列Isolate・IPC上限・異常回収テスト＋3並列 `Explorer` 実機観測 | `E1 / E2` | `WP-3, WP-4, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp4_step2_2_e2.md:"### 2.1 事象 2-2-1"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-05` | ケーパビリティ単調減少（`Explorer: Read-Only`）・Tool Schema 隠蔽・TTY 独占原則（子の承認要求即 `EPERM`） | `D-202, D-204, D-211, D-213` | `今回実装` | 権限減衰・Schema除外・Approval 0回 `EPERM` テスト＋並列稼働時混線ゼロ＆`op_id` 不変観測 | `E1 / E2` | `WP-1, WP-3, WP-4, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp4_step2_2_e2.md:"### 2.3 事象 2-2-3"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-06` | 階層クオータ寄贈・未使用分返還・超過時 `EDQUOT` 局所停止 | `D-202, D-211, D-214` | `今回実装` | 並列事前予約寄贈/返還保存則・極小予算 `EDQUOT` テスト＋実機子局所停止・親 `end_turn` 完走観測 | `E1 / E2` | `WP-3, WP-4, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp4_step2_2_e2.md:"### 2.2 事象 2-2-2"` ＆ `packages/agent_runtime/test/capability_tty_and_quota_test.dart` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-07` | 権限分離 Web 読取ドライバ（`sys_web_search`［Ollama Web Search API 標準］, `sys_web_fetch`：API キー秘匿・SSRF 完全遮断・Markdown 抽出） | `D-201, D-202, D-205, D-216, D-217` | `今回実装` | SSRF/DNS Rebinding/リダイレクト20+ケース・Markdown抽出・CLIバイパス不在確認＋実疎通/Local遮断観測 | `E1 / E2 / E3` | `WP-1, WP-5, WP-6, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp8_step2_3_e2.md:"### 3.1"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-08` | 無菌室 `WebResearcher`（Ring 3・個別モデル指定可）と間接プロンプトインジェクション 100% 封じ込め | `D-203, D-204, D-205, D-211, D-218` | `今回実装` | CSpace/VFSゼロ・直接呼び出し `EPERM` テスト＋レイヤA外部仕様要約＆レイヤB悪性インジェクション封じ込め監査観測 | `E1 / E2` | `WP-3, WP-4, WP-6, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp8_step2_3_e2.md:"## 2. レイヤ B 封じ込め実証"` ＆ `"### 3.1"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-09` | 外部フォルダからの `SKILL.md` 動的マウント（`--skills-dir`/`.agent_os/skills`・既存形式互換・権限昇格ゼロ）と Pre/Post Hook 拡充 | `D-201, D-202, D-203, D-219, D-220` | `今回実装` | `/skills` Read-Only・省略互換・権限不足拒否・全Hookポイント網羅テスト＋外部スキル動的マウント `.exe` 実機観測 | `E1 / E2` | `WP-1, WP-5, WP-7, WP-8, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp8_step2_3_e2.md:"### 3.2 事象 2-3-3"` ＆ `evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`） |
+| `REQ-10` | Stage 1 全機能非回帰・マルチ Isolate 下での Zed ACP `stdio` 純度維持・`dart compile exe` 単一 `.exe` 完結 | `D-201, D-210, D-215` | `今回実装` | 依存分離・`stdout` 単一所有・AOT子 `print`/例外純度・Stage 1+2 全自動テスト・SDK除外 `.exe` 起動＋統合完走観測 | `E1 / E2 / E3` | `WP-1, WP-4, WP-9` | `implemented` | `docs/plan_20261119_stage2_multiprocess_memory/evidence/wp9_final_e2.md:"## 2. 全自動テスト"` ＆ `"### 3.1 Stage 1 非回帰"` ＆ `"### 3.2 Stage 2 通し横断統合"` | **`pass`**（`fm-dev-acceptance` `IM-14` / 製品 `fbc80b0b`、合意 `B-02` 準拠） |
 
 ## 履歴
 
@@ -117,4 +116,79 @@ worklog: disabled
 担当 / 実行参照 / 対象版: fm-dev-reviewer / conversation://4dfa41a7-5af4-478c-97f4-1624d6ea22a4 / 計画版 r1（env_manifest.md 20/20 SHA-256 一致確認済み）
 結果 / 証跡への参照: 完了（E1/E3/E4：Critical=0, Must-fix=0, 新規指摘=0、ready 移行可能判定） / docs/plan_20261119_stage2_multiprocess_memory/50_review_notes.md:"## 6. 差分再レビュー結論（`PT-09` / 最終進行可否）"
 未了・次の引き渡し: 阻害事項 0 件を確認し plan 工程完了（ready 返却）。次工程 implement（WP-1〜WP-9）へ引き渡し可能
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-01 / WP-1（Pub Workspaces 新規依存確定 & Ring 0 コンテキストページング基盤実装：REQ-01, REQ-02, REQ-03, REQ-05, REQ-07, REQ-09, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://dc45500e-4e6f-49b8-8cc8-0f49f65ce27e / jj commit 000334b54e78bbfeb1e10c1a55f33a24cddf7954（計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、全 4 パッケージ 111 テスト通過［既存 101 + 新規 10］、Ring 0 禁止依存・stdout 直接参照 0 件、yaml 3.1.4 / html 0.15.7 解決確認） / packages/agent_kernel/test/context_pager_test.dart:"batch-evicts oldest Clean Pages from high to low watermark while preserving tool_call_id pairs and Dirty/Pinned pages", packages/agent_kernel/test/audit_logger_and_redactor_test.dart:"writes Stage 2 process attribution and paging telemetry fields ([D-207], [D-215])"
+未了・次の引き渡し: WP-1 完了。確定した pubspec.lock と agent_kernel ページング・監査共有 IF を WP-2（Step 2-1 ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-02 / WP-2 実装・統合（鮮度検知・sys_mem_pagein・3 プロバイダ実効窓解決・ランタイム統合：REQ-01, REQ-02, REQ-03, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://d7acf5d1-0cef-41f4-8eba-cbe2fbed1332 / jj commit 29facd1fa611b28b3d5eb3f4dd74689b9b580f74（計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、全 4 パッケージ 117 テスト通過［既存 111 + 新規 6］、process_runner.dart 禁止依存 0 件、--ignore-working-copy 使用・options.num_ctx 不送信確認） / packages/agent_drivers/test/page_freshness_and_window_test.dart:"detects all 4 freshness cases without false positives/negatives, preserves Segment 1, and keeps jj op log unchanged", packages/agent_drivers/test/page_freshness_and_window_test.dart:"auto-evicts Clean Pages on large-to-small model switch, logs paging telemetry, and returns EDQUOT when Dirty exceeds small window"
+未了・次の引き渡し: Step 2-1 実機 E2 全 3 事象（2-1-1, 2-1-2, 2-1-3）検証を IM-03（fm-dev-tester）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-03 / WP-2 Step 2-1 完了ゲート独立検証（E1/E3 再実行＋隔離 jj リポジトリ実機 E2 全 3 事象：REQ-01, REQ-02, REQ-03, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-tester / conversation://074cf019-a81b-4745-ab60-aac9ca7753dc / jj commit 497c2bc7c1a28a28ac7ecaf1e3ed0355097929b9（計画版 r1）
+結果 / 証跡への参照: 完了・Step 2-1 ゲート通過（E1/E2/E3：dart analyze 0 件、117/117 pass、2-1-1 40/40ターン・退避10回・70/70 cachedTokens>0 平均87.94%、2-1-2 1M→8k切替 evictedPagesInStep=6・400 0件、2-1-3 stalePagesCount=1→再読込/pagein正答、秘密漏洩0・クリーンアップ済） / docs/plan_20261119_stage2_multiprocess_memory/evidence/wp2_step2_1_e2.md:"### 2.1 事象 2-1-1", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp2_step2_1_e2.md:"### 2.2 事象 2-1-2", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp2_step2_1_e2.md:"### 2.3 事象 2-1-3"
+未了・次の引き渡し: Step 2-1 完了ゲート通過。Step 2-2（WP-3: Ring 0 マルチプロセス基盤）を解禁し IM-04 へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-04 / WP-3（Ring 0 マルチプロセス・有界 IPC・権限単調減少・TTY 独占・階層クオータ基盤：REQ-04, REQ-05, REQ-06, REQ-08）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://c043e2a0-0381-416c-b261-e058240126c3 / jj commit 8d81762e0cdc9b68485c50457648302dd1b841e8（計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、全 4 パッケージ 130 テスト通過［既存 117 + 新規 13］、Ring 0 禁止依存・stdout 直接参照 0 件） / packages/agent_kernel/test/mailbox_test.dart:"BoundedMailbox", packages/agent_kernel/test/pcb_capability_quota_test.dart:"QuotaLedger", packages/agent_kernel/test/syscall_gate_and_approval_test.dart:"TTY_MONOPOLY_DENIED"
+未了・次の引き渡し: Ring 0 マルチプロセス基盤一式を WP-4（Isolate ワーカーホスト・Step 2-2 完了ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-05 / WP-4 実装・統合（Dart Isolate 実行ホスト・子 Zone stdout 純度強制・sys_spawn/wait/exit/send/recv・Tool Schema 隠蔽・pid==1 ACP 分離：REQ-04, REQ-05, REQ-06, REQ-08, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://82f85bbb-6ebb-4f14-b1da-a0aa406c16ac / jj commit 7105381b03d1d072b0259bd82b0551400eb25599（計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、全 4 パッケージ 141 テスト通過［既存 130 + 新規 11］、AOT 両 .exe ビルド＆SDK 除外起動・子 Isolate print/例外時 stdout 100% NDJSON 純度確認、lib/** 直接 stdout 0 件、process_runner.dart 禁止依存 0 件） / packages/agent_runtime/test/isolate_multiprocess_ipc_test.dart:"runs 3 parallel real Isolate Explorers", packages/agent_runtime/test/capability_tty_and_quota_test.dart:"enforces hierarchical quota conservation", packages/agent_acp/test/multiprocess_stdout_purity_test.dart:"production childIsolateEntryPoint redirects child print() to stderr"
+未了・次の引き渡し: Step 2-2 実機 E2 全 3 事象（2-2-1, 2-2-2, 2-2-3）と独立再実行を IM-06（fm-dev-tester）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-06 / WP-4 Step 2-2 完了ゲート独立検証（E1/E3 再実行・AOT .exe 純度＋隔離 jj リポジトリ実機 E2 全 3 事象：REQ-04, REQ-05, REQ-06, REQ-08, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-tester / conversation://72ce84f6-31ee-400d-8dc8-5844ab9a9d03 / jj commit 104a949b2e1bf3479c9a0df6165a9d2a0619735d（計画版 r1）
+結果 / 証跡への参照: 完了・Step 2-2 ゲート通過（E1/E2/E3：dart analyze 0 件、141/141 pass、2-2-1 3並列Explorer・親+351 tokens統合・cached 94.00%、2-2-2 1500 tokens子 EDQUOT 局所停止・親 end_turn 完走・stdout 276/276行 100% NDJSON、2-2-3 承認要求0件・jj op_id不変、クリーンアップ済） / docs/plan_20261119_stage2_multiprocess_memory/evidence/wp4_step2_2_e2.md:"### 2.1 事象 2-2-1", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp4_step2_2_e2.md:"### 2.2 事象 2-2-2", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp4_step2_2_e2.md:"### 2.3 事象 2-2-3"
+未了・次の引き渡し: Step 2-2 完了ゲート通過。Step 2-3（WP-5: Ring 0 Web/Skill 共有抽象・Hook 拡充）を解禁し IM-07 へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-07 / WP-5（Ring 0 Web/Skill 共有抽象・/skills Read-Only VFS 境界・Pre/Post Hook 拡充：REQ-07, REQ-09）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://c8e601e2-0d13-447b-9fae-e3a601c2de9e / jj commit cb9c5b4d34037fdb4f913dcc551f9adf0264e99b（計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、全 4 パッケージ 150 テスト通過［既存 141 + 新規 9］、Ring 0 禁止依存・stdout 直接参照 0 件、LlmRouter LlmHook 配線確認） / packages/agent_kernel/test/skill_registry_and_hooks_test.dart:"SkillRegistry", packages/agent_kernel/test/syscall_gate_and_approval_test.dart:"onTxSquash"
+未了・次の引き渡し: 確定済み Ring 0 共有抽象 IF（基準版 cb9c5b4d）を WP-6（IM-08）∥ WP-7（IM-09）へ並列引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-08 / WP-6（Web 検索［Ollama Search］＆ SSRF ピン留め Fetch ドライバ：REQ-07, REQ-08、WP-7 と並列実行）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://0d66a687-7b96-429e-bb73-6ade44eb7bed / jj commit 7ce0513d9c797d13173ec0e792f5d3ee7ba1db19（基準版 cb9c5b4d、計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、ssrf_and_web_drivers_test.dart 13/13 通過［39 IP + 19 URL SSRF・302 リダイレクト・2 MiB 切断・TLS 不一致・Markdown 抽出・429/Redact・W⊕N］、DIRECT/ピン留め/バイパス不在確認） / packages/agent_drivers/test/ssrf_and_web_drivers_test.dart:"PinnedHttpWebFetchTransport enforces DIRECT proxy"
+未了・次の引き渡し: packages/agent_drivers/lib/web_drivers.dart を統合担当 WP-8（IM-10）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-09 / WP-7（外部 SKILL.md 動的マウントドライバ & --skills-dir CLI 配線：REQ-09、WP-6 と並列実行）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://fab03aea-f444-4cf7-87de-47c3c573c880 / jj commit 7ce0513d9c797d13173ec0e792f5d3ee7ba1db19（基準版 cb9c5b4d、計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、skills_and_hooks_test.dart 7 件含む 25/25 通過、daemon/cli --skills-dir 実装・SSRF 緩和フラグ不在確認） / packages/agent_acp/bin/agent_os_daemon.dart:"'skills-dir'", packages/agent_drivers/test/skills_and_hooks_test.dart:"SkillDirectoryLoader"
+未了・次の引き渡し: packages/agent_drivers/lib/skill_drivers.dart および ACP --skills-dir 設定配線を統合担当 WP-8（IM-10）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-10 / WP-8 統合・分離テスト（無菌室 WebResearcher・Skill/Hook ランタイム統合：REQ-07, REQ-08, REQ-09）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://1ae3587d-66b5-4aa1-bfc9-d6a3145c5499 / jj commit 482d1c58e8a41b0f6533e9dc2c6652c98ca94084（計画版 r1）
+結果 / 証跡への参照: 完了（E1/E3：dart analyze 0 件、全 4 パッケージ 174 テスト通過［既存 170 + 新規 4］、両 AOT .exe ビルド完了、本番 SSRF 非緩和境界維持） / packages/agent_runtime/test/web_researcher_isolation_test.dart:"enforces WebResearcher sterile 5-tool boundary", packages/agent_runtime/test/web_researcher_isolation_test.dart:"[D-205] Layer B deterministic containment"
+未了・次の引き渡し: Step 2-3 完了ゲート（レイヤ B 実 local-ollama 封じ込め＋レイヤ A 本番 .exe 実機観測）を IM-11（fm-dev-tester）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-11 / WP-8 Step 2-3 完了ゲート独立検証（E1/E3 再実行＋レイヤ B 実 Ollama 封じ込め＋レイヤ A 本番 .exe 実機観測：REQ-07, REQ-08, REQ-09）
+担当 / 実行参照 / 対象版: fm-dev-tester / conversation://abafb47b-84a3-4b86-9b20-26ddc869fbf8 / jj commit dd823f61c139fa9337e94fde0960f696e70e0481（計画版 r1）
+結果 / 証跡への参照: 完了・Step 2-3 ゲート通過（E1/E2/E3：dart analyze 0 件、174/174 pass、レイヤB実local-ollama 100%封じ込め、レイヤA Ollama Search/dart.dev 成功・127.0.0.1/192.168.0.5 0ms EACCES 遮断・異モデル WebResearcher 親+272 tokens 95.07% cached・--skills-dir 動的マウント＆Hook 遮断、秘密露出 0・クリーンアップ済、Suggest 1件 SG-WP8-01） / docs/plan_20261119_stage2_multiprocess_memory/evidence/wp8_step2_3_e2.md:"## 2. レイヤ B 封じ込め実証", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp8_step2_3_e2.md:"### 3.1", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp8_step2_3_e2.md:"### 3.2 事象 2-3-3"
+未了・次の引き渡し: Step 2-3 完了ゲート通過。SG-WP8-01 軽微調整＆最終クリーンビルド（IM-12）を経て WP-9 最終統合ゲートへ進行
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-12 / WP-9 軽微統合調整（SG-WP8-01 反映）および最終クリーン AOT .exe ビルド（REQ-02, REQ-09, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop / conversation://4a934e7e-1f49-415d-90b0-559daf4219aa / jj commit fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f（計画版 r1）
+結果 / 証跡への参照: 完了（E1：dart analyze 0 件、全 4 パッケージ 175/175 通過［SG-WP8-01 回帰テスト追加］、クリーン AOT ビルド完了［agent_os_daemon.exe SHA-256 4899640A...2E8 / acp_cli_client.exe SHA-256 61A96491...A01］） / packages/agent_runtime/test/web_researcher_isolation_test.dart:"SG-WP8-01"
+未了・次の引き渡し: 最終ソース版 fbc80b0b と両 AOT .exe を IM-13（fm-dev-tester: WP-9 最終統合ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-13 / WP-9 Stage 2 最終 AOT .exe E2E 統合ゲート（全 E3/E1/E2・Stage 1 非回帰＋Stage 2 通し E2E：REQ-01〜REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-tester / conversation://d1e0b80e-fec6-48d2-a89d-2aeb5b67f8e3 / jj commit fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f（証跡保存後 @ 75ff64dc224ddfb13f98e7d1099389ee06578a7f、計画版 r1）
+結果 / 証跡への参照: 完了・WP-9 最終統合ゲート通過（E1/E2/E3：最終構造検査5項目適合、dart analyze 0 件、32ファイル 175/175 pass、SDK除外起動＆stdout純度 pass、Stage 1非回帰［CoW/Hook/sys_exec秘密除去/承認拒否＆squash/rollback・stdout 1,246/1,246行NDJSON］＋Stage 2通しE2E［--skills-dir/SG-WP8-01 stale=0/並列Explorer+無菌WebResearcher/編集＆ページング・stdout 2,569/2,569行NDJSON］完走、.planworks/残留0・秘密露出0） / docs/plan_20261119_stage2_multiprocess_memory/evidence/wp9_final_e2.md:"## 1. 最終構造検査", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp9_final_e2.md:"### 3.1 Stage 1 非回帰", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp9_final_e2.md:"### 3.2 Stage 2 通し横断統合"
+未了・次の引き渡し: 全 WP-1〜WP-9 完了・env_manifest.md 更新済み。accepting へ移行し、独立 fm-dev-acceptance（IM-14）へ最終受け入れ判定を引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-14 / 最終独立受け入れ判定（REQ-01〜REQ-10 全 10 件 ＆ env_manifest.md read-only 独立照合）
+担当 / 実行参照 / 対象版: fm-dev-acceptance / conversation://997c2375-a7d8-4fb8-a6c8-8cc455bdad23 / jj commit fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f（@ 3d2c3450 製品差分 0 件、計画版 r1）
+結果 / 証跡への参照: 完了（全 10 件 REQ-01〜REQ-10 pass、Critical=0 / Must-fix=0 / Suggest=0。env_manifest.md 製品差分 0・32 ファイル 175/175 独立 pass・両 .exe SHA-256 完全一致・計画正本 20/20 SHA-256 完全一致・.planworks/ 0 件を確認） / docs/plan_20261119_stage2_multiprocess_memory/env_manifest.md:"照合済み（一致）", docs/plan_20261119_stage2_multiprocess_memory/evidence/wp9_final_e2.md:"## 2. 全自動テスト"
+未了・次の引き渡し: 独立受け入れ全件 pass 完了。完了処理（IM-15: fm-dev-release による README.md 等の current docs 反映）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IM-15 / 完了処理・current docs 反映（README.md 更新・cheatsheet 確認・引き渡し衛生確認）
+担当 / 実行参照 / 対象版: fm-dev-release / conversation://b618c566-cee1-468c-bef1-f7b71cf31a55 / jj commit fbc80b0ba3ad822b30c66ecc7a4e4933c9ca024f（製品コード差分 0 件、計画版 r1）
+結果 / 証跡への参照: 完了（README.md へ Stage 2 確定機能・全 24 システムコール・--skills-dir・テスト 175 件等を反映、相対リンク 11/11 実在、cheatsheet 変更不要確認、製品コード差分 0・.planworks/ 0 件・両 .exe SHA-256 維持、push/deploy 未実施） / README.md:"Stage 2"
+未了・次の引き渡し: 残件 0 件。90_status.md を state: done / complete へ更新し、docs/plan_index.md へ転記して利用者へ返却
 ```

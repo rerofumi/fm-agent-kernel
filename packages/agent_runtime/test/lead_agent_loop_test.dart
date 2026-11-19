@@ -451,5 +451,193 @@ void main() {
       expect(source, isNot(contains('OllamaDriver')));
       expect(source, isNot(contains('OpenRouterDriver')));
     });
+
+    test('continues turn on recoverable: true EDQUOT (MAILBOX_FULL / INSUFFICIENT_PARENT_TOKEN_QUOTA)', () async {
+      var llmStep = 0;
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_llm_chat',
+          requiredRight: CapRight.llmInfer,
+          kind: 'other',
+          applyIoCap: false,
+          handler: (_) async {
+            llmStep += 1;
+            if (llmStep == 1) {
+              return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+                'content': '',
+                'toolCalls': <Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'id': 'c1',
+                    'name': 'sys_read_lines',
+                    'arguments': <String, dynamic>{'path': '/workspace/a.txt'},
+                  },
+                ],
+              });
+            }
+            return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'content': 'Recovered after recoverable EDQUOT.',
+              'toolCalls': <Map<String, dynamic>>[],
+            });
+          },
+        ),
+      );
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_read_lines',
+          requiredRight: CapRight.read,
+          kind: 'read',
+          handler: (_) async => const SyscallResult<Map<String, dynamic>>.failure(
+            SyscallError(
+              code: SyscallErrorCode.edquot,
+              reason: 'MAILBOX_FULL',
+              message: 'Recipient mailbox is full.',
+              recoverable: true,
+            ),
+          ),
+        ),
+      );
+
+      final agent = LeadAgent(
+        pcb: pcb,
+        syscallGate: gate,
+        capHandle: const CapHandle('cap_workspace_rw'),
+        modelResolver: modelResolver,
+      );
+      addTearDown(agent.dispose);
+
+      final res = await agent.runTurn(userInput: 'Try sending message');
+      expect(res.ok, isTrue);
+      expect(res.steps, equals(2));
+      expect(res.finalText, equals('Recovered after recoverable EDQUOT.'));
+
+      final toolTurns = pcb.memory.historySegment.turns
+          .whereType<CanonicalToolResultTurn>()
+          .toList();
+      expect(toolTurns.length, equals(1));
+      expect(toolTurns.first.isError, isTrue);
+      expect(toolTurns.first.content, contains('MAILBOX_FULL'));
+    });
+
+    test('backfills CanonicalToolResultTurn(isError: true) for unexecuted trailing toolCalls on fatal EDQUOT or ECANCELLED', () async {
+      var toolCount = 0;
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_llm_chat',
+          requiredRight: CapRight.llmInfer,
+          kind: 'other',
+          applyIoCap: false,
+          handler: (_) async {
+            return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'content': '',
+              'toolCalls': <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'id': 'c1',
+                  'name': 'sys_read_lines',
+                  'arguments': <String, dynamic>{'path': '/workspace/1.txt'},
+                },
+                <String, dynamic>{
+                  'id': 'c2',
+                  'name': 'sys_read_lines',
+                  'arguments': <String, dynamic>{'path': '/workspace/2.txt'},
+                },
+                <String, dynamic>{
+                  'id': 'c3',
+                  'name': 'sys_read_lines',
+                  'arguments': <String, dynamic>{'path': '/workspace/3.txt'},
+                },
+              ],
+            });
+          },
+        ),
+      );
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_read_lines',
+          requiredRight: CapRight.read,
+          kind: 'read',
+          handler: (_) async {
+            toolCount += 1;
+            return const SyscallResult<Map<String, dynamic>>.failure(
+              SyscallError(
+                code: SyscallErrorCode.edquot,
+                reason: 'TOKEN_QUOTA_EXCEEDED',
+                message: 'Process token budget exhausted.',
+                recoverable: false,
+              ),
+            );
+          },
+        ),
+      );
+
+      final agent = LeadAgent(
+        pcb: pcb,
+        syscallGate: gate,
+        capHandle: const CapHandle('cap_workspace_rw'),
+        modelResolver: modelResolver,
+      );
+      addTearDown(agent.dispose);
+
+      final res = await agent.runTurn(userInput: 'Run 3 tools');
+      expect(res.ok, isFalse);
+      expect(res.error!.code, equals(SyscallErrorCode.edquot));
+      expect(res.error!.recoverable, isFalse);
+      expect(toolCount, equals(1));
+
+      final assistantTurn = pcb.memory.historySegment.turns
+          .whereType<CanonicalAssistantTurn>()
+          .single;
+      final toolResults = pcb.memory.historySegment.turns
+          .whereType<CanonicalToolResultTurn>()
+          .toList();
+
+      expect(assistantTurn.toolCalls.length, equals(3));
+      expect(toolResults.length, equals(3));
+      for (var i = 0; i < 3; i++) {
+        expect(
+          toolResults[i].canonicalCallId,
+          equals(assistantTurn.toolCalls[i].canonicalCallId),
+        );
+        expect(toolResults[i].isError, isTrue);
+        expect(toolResults[i].content, contains('TOKEN_QUOTA_EXCEEDED'));
+      }
+    });
+
+    test('awaits onTurnExitCleanup in finally on both normal completion and error exit', () async {
+      var cleanupCount = 0;
+      var cleanupCompletedBeforeReturn = false;
+
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_llm_chat',
+          requiredRight: CapRight.llmInfer,
+          kind: 'other',
+          applyIoCap: false,
+          handler: (_) async {
+            return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'content': 'Done.',
+              'toolCalls': <Map<String, dynamic>>[],
+            });
+          },
+        ),
+      );
+
+      final agent = LeadAgent(
+        pcb: pcb,
+        syscallGate: gate,
+        capHandle: const CapHandle('cap_workspace_rw'),
+        modelResolver: modelResolver,
+        onTurnExitCleanup: () async {
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+          cleanupCount += 1;
+          cleanupCompletedBeforeReturn = true;
+        },
+      );
+      addTearDown(agent.dispose);
+
+      final res = await agent.runTurn(userInput: 'Hello');
+      expect(res.ok, isTrue);
+      expect(cleanupCompletedBeforeReturn, isTrue);
+      expect(cleanupCount, equals(1));
+    });
   });
 }

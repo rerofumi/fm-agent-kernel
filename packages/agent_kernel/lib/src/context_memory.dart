@@ -1,7 +1,11 @@
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
+
+import 'context_pager.dart';
+import 'llm_driver.dart';
 
 /// Tool schema registered in Segment 0 of [VirtualContextMemory] ([D-007]).
 class SyscallToolSchema {
@@ -113,7 +117,7 @@ class CanonicalToolResultTurn extends CanonicalTurn {
   final bool isError;
 }
 
-/// Segment 1 of [VirtualContextMemory]: strictly append-only turn log ([D-007]).
+/// Segment 1 of [VirtualContextMemory]: strictly append-only turn log with in-place Clean Page stub replacement ([D-007], [D-207]).
 class AppendOnlyHistorySegment {
   final List<CanonicalTurn> _turns = <CanonicalTurn>[];
 
@@ -125,24 +129,51 @@ class AppendOnlyHistorySegment {
   void append(CanonicalTurn turn) {
     _turns.add(turn);
   }
+
+  /// Replaces only the `content` of a [CanonicalToolResultTurn] at [turnIndex] with a Page Stub
+  /// while preserving its index, `canonicalCallId`, `toolName`, and `isError` ([D-207]).
+  void replaceToolResultContentWithStub(int turnIndex, String stubContent) {
+    RangeError.checkValidIndex(turnIndex, _turns, 'turnIndex');
+    final existing = _turns[turnIndex];
+    if (existing is! CanonicalToolResultTurn) {
+      throw StateError(
+        'Cannot replace turn at index $turnIndex with Page Stub: '
+        'expected CanonicalToolResultTurn but found ${existing.runtimeType}.',
+      );
+    }
+    _turns[turnIndex] = CanonicalToolResultTurn(
+      canonicalCallId: existing.canonicalCallId,
+      toolName: existing.toolName,
+      content: stubContent,
+      isError: existing.isError,
+    );
+  }
 }
 
-/// Segment 2 of [VirtualContextMemory]: per-turn dynamic tail context ([D-007]).
+/// Segment 2 of [VirtualContextMemory]: per-turn dynamic tail context ([D-007], [D-208]).
 class EphemeralTailSegment {
   EphemeralTailSegment({
     this.dynamicContextSummary,
+    this.pageDirectorySummary,
     this.currentUserInput,
   });
 
   String? dynamicContextSummary;
+
+  /// Dynamic `[Context Page Directory]` listing evicted or stale Clean Pages ([D-208]).
+  String? pageDirectorySummary;
   String? currentUserInput;
 
-  /// Renders the dynamic context and user prompt into a single tail message, or null if empty.
+  /// Renders the dynamic context, page directory, and user prompt into a single tail message, or null if empty.
   String? renderTailContent() {
     final parts = <String>[];
     if (dynamicContextSummary != null &&
         dynamicContextSummary!.trim().isNotEmpty) {
       parts.add(dynamicContextSummary!.trim());
+    }
+    if (pageDirectorySummary != null &&
+        pageDirectorySummary!.trim().isNotEmpty) {
+      parts.add(pageDirectorySummary!.trim());
     }
     if (currentUserInput != null && currentUserInput!.isNotEmpty) {
       parts.add(currentUserInput!);
@@ -154,33 +185,137 @@ class EphemeralTailSegment {
   }
 }
 
-/// Prefix-preserving 3-segment Canonical IR context store ([D-007]).
+/// Prefix-preserving 3-segment Canonical IR context store with [PageTable] and token anchor ([D-007], [D-204], [D-206]).
 class VirtualContextMemory {
   VirtualContextMemory({
     required this.sessionId,
     required PinnedSystemInstruction systemInstruction,
+    TokenEstimator estimator = const TokenEstimator(),
   })  : systemSegment = SystemPinnedSegment(pinned: systemInstruction),
         historySegment = AppendOnlyHistorySegment(),
-        ephemeralSegment = EphemeralTailSegment();
+        ephemeralSegment = EphemeralTailSegment(),
+        pageTable = PageTable(),
+        _estimator = estimator {
+    pageTable.registerSystemPinnedPage(
+      estimatedTokens: _estimator.estimateSystemSegmentTokens(systemInstruction),
+    );
+  }
 
   final String sessionId;
   final SystemPinnedSegment systemSegment;
   final AppendOnlyHistorySegment historySegment;
   final EphemeralTailSegment ephemeralSegment;
+  final PageTable pageTable;
+  final TokenEstimator _estimator;
 
-  /// Appends a user turn to Segment 1.
+  int _currentTurnNumber = 0;
+  ModelIdentifier? _lastAnchoredModel;
+  int? _lastActualPromptTokens;
+  int? _anchorEstimatedBaselineTokens;
+
+  /// Current logical turn counter (incremented on each user turn).
+  int get currentTurnNumber => _currentTurnNumber;
+
+  /// Model for which the actual prompt token anchor was last recorded.
+  ModelIdentifier? get lastAnchoredModel => _lastAnchoredModel;
+
+  /// Last observed `usage.promptTokens` from a completed LLM inference.
+  int? get lastActualPromptTokens => _lastActualPromptTokens;
+
+  /// Heuristic token total at the moment [_lastActualPromptTokens] was recorded.
+  int? get anchorEstimatedBaselineTokens => _anchorEstimatedBaselineTokens;
+
+  /// Records an actual `usage.promptTokens` anchor after a successful `sys_llm_chat` ([D-206]).
+  void recordActualPromptTokensAnchor({
+    required ModelIdentifier model,
+    required int actualPromptTokens,
+    int? estimatedBaselineTokens,
+  }) {
+    if (actualPromptTokens <= 0) {
+      return;
+    }
+    _lastAnchoredModel = model;
+    _lastActualPromptTokens = actualPromptTokens;
+    _anchorEstimatedBaselineTokens =
+        estimatedBaselineTokens ?? _estimator.estimateMemoryHeuristicTotal(this);
+  }
+
+  /// Invalidates the actual token anchor on model switch or Clean Page eviction ([D-204]).
+  void invalidateTokenAnchor() {
+    _lastAnchoredModel = null;
+    _lastActualPromptTokens = null;
+    _anchorEstimatedBaselineTokens = null;
+  }
+
+  /// Estimates current prompt tokens using UTF-8 heuristic + actual promptTokens anchor delta ([D-206]).
+  int estimateCurrentPromptTokens(
+    ModelIdentifier targetModel, {
+    TokenEstimator? estimator,
+  }) {
+    final est = estimator ?? _estimator;
+    final currentHeuristicTotal = est.estimateMemoryHeuristicTotal(this);
+    if (_lastAnchoredModel == targetModel &&
+        _lastActualPromptTokens != null &&
+        _anchorEstimatedBaselineTokens != null) {
+      final delta = currentHeuristicTotal - _anchorEstimatedBaselineTokens!;
+      final segment0Tokens = est.estimateSystemSegmentTokens(
+        systemSegment.pinned,
+      );
+      return math.max(segment0Tokens, _lastActualPromptTokens! + delta);
+    }
+    return currentHeuristicTotal;
+  }
+
+  /// Appends a user turn to Segment 1 and registers a Dirty [ContextPage].
   void appendUserTurn(String text) {
-    historySegment.append(CanonicalUserTurn(text: text));
+    _currentTurnNumber += 1;
+    final turn = CanonicalUserTurn(text: text);
+    final turnIndex = historySegment.turns.length;
+    historySegment.append(turn);
+    pageTable.registerHistoryPage(
+      kind: PageKind.conversation,
+      historyTurnIndex: turnIndex,
+      currentTurn: _currentTurnNumber,
+      dirty: true,
+      estimatedTokens: _estimator.estimateTurnTokens(turn),
+    );
   }
 
-  /// Appends an assistant turn to Segment 1.
+  /// Appends an assistant turn to Segment 1 and registers a Dirty [ContextPage].
   void appendAssistantTurn(CanonicalAssistantTurn turn) {
+    final turnIndex = historySegment.turns.length;
     historySegment.append(turn);
+    pageTable.registerHistoryPage(
+      kind: PageKind.conversation,
+      historyTurnIndex: turnIndex,
+      currentTurn: _currentTurnNumber,
+      dirty: true,
+      estimatedTokens: _estimator.estimateTurnTokens(turn),
+    );
   }
 
-  /// Appends a tool result turn to Segment 1.
-  void appendToolResultTurn(CanonicalToolResultTurn turn) {
+  /// Appends a tool result turn to Segment 1 and registers either a Clean or Dirty [ContextPage] ([D-206]).
+  ContextPage appendToolResultTurn(
+    CanonicalToolResultTurn turn, {
+    CleanPageSourceMeta? cleanSource,
+  }) {
+    final turnIndex = historySegment.turns.length;
     historySegment.append(turn);
+    final isClean =
+        !turn.isError && cleanSource != null && cleanSource.isValidCleanMeta;
+    final kind = isClean
+        ? (cleanSource.sourceKind == CleanSourceKind.vcsSnapshot
+              ? PageKind.vcsView
+              : PageKind.fileView)
+        : PageKind.toolOutput;
+    return pageTable.registerHistoryPage(
+      kind: kind,
+      historyTurnIndex: turnIndex,
+      currentTurn: _currentTurnNumber,
+      dirty: !isClean,
+      estimatedTokens: _estimator.estimateTurnTokens(turn),
+      cleanSource: isClean ? cleanSource : null,
+    );
   }
 }
 

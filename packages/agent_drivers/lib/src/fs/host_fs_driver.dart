@@ -15,6 +15,9 @@ typedef EnsureActiveTransactionCallback =
 typedef SyncWorkingCopySnapshotCallback =
     Future<SyscallResult<Object?>> Function();
 
+/// Non-destructive provider returning the current `@` `commit_id` for VCS Clean Page metadata ([D-208]).
+typedef CurrentCommitIdProvider = Future<String?> Function();
+
 /// Host filesystem Read-Only & CAS Write driver scoped to a [VfsNamespace] ([D-011], [D-012], [D-013]).
 ///
 /// Enforces real-path symlink/junction boundary checks, bidirectional protection
@@ -26,35 +29,43 @@ class HostFsDriver {
     required this.namespace,
     EnsureActiveTransactionCallback? ensureActiveTransaction,
     SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
+    CurrentCommitIdProvider? currentCommitIdProvider,
   })  : _ensureActiveTransaction = ensureActiveTransaction,
-        _syncWorkingCopySnapshot = syncWorkingCopySnapshot;
+        _syncWorkingCopySnapshot = syncWorkingCopySnapshot,
+        _currentCommitIdProvider = currentCommitIdProvider;
 
   factory HostFsDriver.forWorkspace(
     String workspaceHostRoot, {
     EnsureActiveTransactionCallback? ensureActiveTransaction,
     SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
+    CurrentCommitIdProvider? currentCommitIdProvider,
   }) {
     return HostFsDriver(
       namespace: VfsNamespace(workspaceHostRoot: workspaceHostRoot),
       ensureActiveTransaction: ensureActiveTransaction,
       syncWorkingCopySnapshot: syncWorkingCopySnapshot,
+      currentCommitIdProvider: currentCommitIdProvider,
     );
   }
 
   final VfsNamespace namespace;
   final EnsureActiveTransactionCallback? _ensureActiveTransaction;
   final SyncWorkingCopySnapshotCallback? _syncWorkingCopySnapshot;
+  final CurrentCommitIdProvider? _currentCommitIdProvider;
 
   static final RegExp _drivePrefixPattern = RegExp(r'^[a-zA-Z]:');
   static final RegExp _sha256Pattern = RegExp(r'^[0-9a-fA-F]{64}$');
   static int _tempFileCounter = 0;
 
-  /// Reads a 1-based closed line range from a UTF-8 text file in `/workspace` ([D-012]).
+  /// Reads a 1-based closed line range from a UTF-8 text file in `/workspace` or read-only `/skills` ([D-012], [D-219]).
   Future<SyscallResult<Map<String, dynamic>>> readLines({
     required String path,
     int? startLine,
     int? endLine,
+    VfsNamespace? namespaceOverride,
+    CapabilityTable? cspace,
   }) async {
+    final effectiveNamespace = namespaceOverride ?? namespace;
     final effectiveStart = startLine ?? 1;
     final effectiveRequestedEnd = endLine ?? (effectiveStart + 199);
 
@@ -80,7 +91,7 @@ class HostFsDriver {
       );
     }
 
-    final resolvedResult = namespace.resolveVirtualPath(
+    final resolvedResult = effectiveNamespace.resolveVirtualPath(
       path,
       allowRoot: false,
       checkProtected: true,
@@ -90,6 +101,18 @@ class HostFsDriver {
       return SyscallResult<Map<String, dynamic>>.failure(resolvedResult.error!);
     }
     final resolved = resolvedResult.value!;
+
+    // Enforce SkillRegistry CSpace capability check for /skills/<name>/... reads ([D-219]).
+    if (resolved.isSkillsMount) {
+      final skillErr = _checkSkillsReadAccess(
+        resolved: resolved,
+        effectiveNamespace: effectiveNamespace,
+        cspace: cspace,
+      );
+      if (skillErr != null) {
+        return SyscallResult<Map<String, dynamic>>.failure(skillErr);
+      }
+    }
 
     final entityType = FileSystemEntity.typeSync(
       resolved.hostPath,
@@ -128,8 +151,11 @@ class HostFsDriver {
     }
 
     final List<int> bytes;
+    final FileStat stat;
     try {
-      bytes = await File(resolved.hostPath).readAsBytes();
+      final file = File(resolved.hostPath);
+      stat = await file.stat();
+      bytes = await file.readAsBytes();
     } on FileSystemException catch (e) {
       return SyscallResult<Map<String, dynamic>>.failure(
         SyscallError(
@@ -188,6 +214,8 @@ class HostFsDriver {
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
       'path': resolved.virtualPath,
       'sha256': fileSha256,
+      'modifiedUtc': stat.modified.toUtc().toIso8601String(),
+      'byteLength': bytes.length,
       'totalLines': totalLines,
       'startLine': effectiveStart,
       'endLine': clampedEnd,
@@ -199,14 +227,25 @@ class HostFsDriver {
   Future<SyscallResult<Map<String, dynamic>>> glob({
     required String pattern,
     String? subpath,
+    VfsNamespace? namespaceOverride,
   }) async {
-    final patternError = _validatePatternSafety(pattern);
+    final effectiveNamespace = namespaceOverride ?? namespace;
+    final patternError = _validatePatternSafety(
+      pattern,
+      effectiveNamespace: effectiveNamespace,
+    );
     if (patternError != null) {
       return SyscallResult<Map<String, dynamic>>.failure(patternError);
     }
 
-    final baseResult = namespace.resolveVirtualPath(
-      subpath ?? VfsNamespace.virtualRoot,
+    final effectiveSubpath = subpath ??
+        (effectiveNamespace.allowedWorkspaceSubpaths != null &&
+                effectiveNamespace.allowedWorkspaceSubpaths!.length == 1
+            ? effectiveNamespace.allowedWorkspaceSubpaths!.first
+            : VfsNamespace.virtualRoot);
+
+    final baseResult = effectiveNamespace.resolveVirtualPath(
+      effectiveSubpath,
       allowRoot: true,
       checkProtected: true,
       checkSymlinks: true,
@@ -284,7 +323,10 @@ class HostFsDriver {
       );
     }
 
-    final files = _collectWorkspaceFiles(baseRes);
+    final files = _collectWorkspaceFiles(
+      baseRes,
+      effectiveNamespace: effectiveNamespace,
+    );
     final matches = <String>[];
     for (final file in files) {
       final candidate = matchFromWorkspaceRoot
@@ -296,10 +338,13 @@ class HostFsDriver {
     }
     matches.sort();
 
+    final commitId = await _readCurrentCommitIdSafe();
+
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
       'basePath': baseRes.virtualPath,
       'matches': matches,
       'totalCount': matches.length,
+      'commitId': ?commitId,
     });
   }
 
@@ -310,7 +355,9 @@ class HostFsDriver {
     bool isRegex = false,
     bool caseSensitive = true,
     String? includeGlob,
+    VfsNamespace? namespaceOverride,
   }) async {
+    final effectiveNamespace = namespaceOverride ?? namespace;
     if (pattern.isEmpty) {
       return const SyscallResult<Map<String, dynamic>>.failure(
         SyscallError(
@@ -341,7 +388,10 @@ class HostFsDriver {
     Glob? includeMatcher;
     var includeBasenameOnly = false;
     if (includeGlob != null && includeGlob.trim().isNotEmpty) {
-      final globErr = _validatePatternSafety(includeGlob);
+      final globErr = _validatePatternSafety(
+        includeGlob,
+        effectiveNamespace: effectiveNamespace,
+      );
       if (globErr != null) {
         return SyscallResult<Map<String, dynamic>>.failure(globErr);
       }
@@ -370,8 +420,14 @@ class HostFsDriver {
       }
     }
 
-    final baseResult = namespace.resolveVirtualPath(
-      subpath ?? VfsNamespace.virtualRoot,
+    final effectiveSubpath = subpath ??
+        (effectiveNamespace.allowedWorkspaceSubpaths != null &&
+                effectiveNamespace.allowedWorkspaceSubpaths!.length == 1
+            ? effectiveNamespace.allowedWorkspaceSubpaths!.first
+            : VfsNamespace.virtualRoot);
+
+    final baseResult = effectiveNamespace.resolveVirtualPath(
+      effectiveSubpath,
       allowRoot: true,
       checkProtected: true,
       checkSymlinks: true,
@@ -408,7 +464,10 @@ class HostFsDriver {
         ),
       ];
     } else if (baseType == FileSystemEntityType.directory) {
-      candidateFiles = _collectWorkspaceFiles(baseRes);
+      candidateFiles = _collectWorkspaceFiles(
+        baseRes,
+        effectiveNamespace: effectiveNamespace,
+      );
     } else {
       return SyscallResult<Map<String, dynamic>>.failure(
         SyscallError(
@@ -474,10 +533,30 @@ class HostFsDriver {
       }
     }
 
+    final commitId = await _readCurrentCommitIdSafe();
+
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
       'matches': matches,
       'totalMatches': matches.length,
+      'commitId': ?commitId,
     });
+  }
+
+  Future<String?> _readCurrentCommitIdSafe() async {
+    final provider = _currentCommitIdProvider;
+    if (provider == null) {
+      return null;
+    }
+    try {
+      final id = await provider();
+      if (id == null) {
+        return null;
+      }
+      final trimmed = id.trim();
+      return trimmed.isEmpty ? null : trimmed;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Atomically replaces a unique [oldBlock] in an existing file after CAS SHA-256 verification ([D-013]).
@@ -489,7 +568,9 @@ class HostFsDriver {
     required String expectedSha256,
     required String oldBlock,
     required String newBlock,
+    VfsNamespace? namespaceOverride,
   }) async {
+    final effectiveNamespace = namespaceOverride ?? namespace;
     if (path.trim().isEmpty) {
       return const SyscallResult<Map<String, dynamic>>.failure(
         SyscallError(
@@ -522,7 +603,7 @@ class HostFsDriver {
       );
     }
 
-    final resolvedResult = namespace.resolveVirtualPath(
+    final resolvedResult = effectiveNamespace.resolveWriteVirtualPath(
       path,
       allowRoot: false,
       checkProtected: true,
@@ -725,7 +806,9 @@ class HostFsDriver {
     required String content,
     String? expectedSha256,
     bool createOnly = false,
+    VfsNamespace? namespaceOverride,
   }) async {
+    final effectiveNamespace = namespaceOverride ?? namespace;
     if (path.trim().isEmpty) {
       return const SyscallResult<Map<String, dynamic>>.failure(
         SyscallError(
@@ -752,7 +835,7 @@ class HostFsDriver {
       }
     }
 
-    final resolvedResult = namespace.resolveVirtualPath(
+    final resolvedResult = effectiveNamespace.resolveWriteVirtualPath(
       path,
       allowRoot: false,
       checkProtected: true,
@@ -940,14 +1023,17 @@ class HostFsDriver {
         kind: 'edit',
         applyIoCap: false,
         validateArgs: _validateEditBlockArgs,
-        checkPreconditions: (_, args) async =>
-            _checkWritePathPrecondition(args['path'] as String),
+        checkPreconditions: (pcb, args) async => _checkWritePathPrecondition(
+          args['path'] as String,
+          effectiveNamespace: pcb.namespace,
+        ),
         evaluatePolicy: (_, _) async => RingDecision.allow,
         handler: (exec) => editBlock(
           path: exec.args['path'] as String,
           expectedSha256: exec.args['expectedSha256'] as String,
           oldBlock: exec.args['oldBlock'] as String,
           newBlock: exec.args['newBlock'] as String,
+          namespaceOverride: exec.pcb.namespace,
         ),
       ),
       SyscallDefinition(
@@ -956,14 +1042,17 @@ class HostFsDriver {
         kind: 'edit',
         applyIoCap: false,
         validateArgs: _validateWriteFileArgs,
-        checkPreconditions: (_, args) async =>
-            _checkWritePathPrecondition(args['path'] as String),
+        checkPreconditions: (pcb, args) async => _checkWritePathPrecondition(
+          args['path'] as String,
+          effectiveNamespace: pcb.namespace,
+        ),
         evaluatePolicy: (_, _) async => RingDecision.allow,
         handler: (exec) => writeFile(
           path: exec.args['path'] as String,
           content: exec.args['content'] as String,
           expectedSha256: exec.args['expectedSha256'] as String?,
           createOnly: exec.args['createOnly'] as bool? ?? false,
+          namespaceOverride: exec.pcb.namespace,
         ),
       ),
     ];
@@ -1050,11 +1139,18 @@ class HostFsDriver {
         applyIoCap: true,
         cappedTextFields: const <String>['content'],
         validateArgs: _validateReadLinesArgs,
+        checkPreconditions: (pcb, args) async => _checkReadPathPrecondition(
+          args['path'] as String,
+          effectiveNamespace: pcb.namespace,
+          cspace: pcb.cspace,
+        ),
         evaluatePolicy: (_, _) async => RingDecision.allow,
         handler: (exec) => readLines(
           path: exec.args['path'] as String,
           startLine: exec.args['startLine'] as int?,
           endLine: exec.args['endLine'] as int?,
+          namespaceOverride: exec.pcb.namespace,
+          cspace: exec.pcb.cspace,
         ),
       ),
       SyscallDefinition(
@@ -1068,6 +1164,7 @@ class HostFsDriver {
         handler: (exec) => glob(
           pattern: exec.args['pattern'] as String,
           subpath: exec.args['subpath'] as String?,
+          namespaceOverride: exec.pcb.namespace,
         ),
       ),
       SyscallDefinition(
@@ -1084,6 +1181,7 @@ class HostFsDriver {
           isRegex: exec.args['isRegex'] as bool? ?? false,
           caseSensitive: exec.args['caseSensitive'] as bool? ?? true,
           includeGlob: exec.args['includeGlob'] as String?,
+          namespaceOverride: exec.pcb.namespace,
         ),
       ),
     ];
@@ -1281,7 +1379,11 @@ class HostFsDriver {
     return null;
   }
 
-  SyscallError? _validatePatternSafety(String rawPattern) {
+  SyscallError? _validatePatternSafety(
+    String rawPattern, {
+    VfsNamespace? effectiveNamespace,
+  }) {
+    final activeNs = effectiveNamespace ?? namespace;
     if (rawPattern.contains('\x00')) {
       return const SyscallError(
         code: SyscallErrorCode.eacces,
@@ -1343,7 +1445,7 @@ class HostFsDriver {
       }
     }
 
-    if (namespace.isProtectedPattern(rawPattern)) {
+    if (activeNs.isProtectedPattern(rawPattern)) {
       return SyscallError(
         code: SyscallErrorCode.eacces,
         reason: 'PROTECTED_INTERNAL_PATH',
@@ -1355,7 +1457,11 @@ class HostFsDriver {
     return null;
   }
 
-  List<_CollectedFile> _collectWorkspaceFiles(VfsPathResolution baseRes) {
+  List<_CollectedFile> _collectWorkspaceFiles(
+    VfsPathResolution baseRes, {
+    VfsNamespace? effectiveNamespace,
+  }) {
+    final activeNs = effectiveNamespace ?? namespace;
     final results = <_CollectedFile>[];
     final visitedCanonicalDirs = <String>{};
     final queue = <({String hostDir, String relFromBase})>[
@@ -1382,14 +1488,14 @@ class HostFsDriver {
         final name = p.basename(entity.path);
         final relFromBase =
             current.relFromBase.isEmpty ? name : '${current.relFromBase}/$name';
-        final virtualPath = namespace.toVirtualPath(entity.path);
+        final virtualPath = activeNs.toVirtualPath(entity.path);
 
-        if (namespace.shouldSkipEntry(virtualPath)) {
+        if (activeNs.shouldSkipEntry(virtualPath)) {
           continue;
         }
 
         // Verify real-path boundary to block symlinks/junctions escaping /workspace or pointing into protected dirs.
-        final verified = namespace.resolveVirtualPath(
+        final verified = activeNs.resolveVirtualPath(
           virtualPath,
           allowRoot: false,
           checkProtected: true,
@@ -1483,8 +1589,67 @@ class HostFsDriver {
     return spans;
   }
 
-  SyscallError? _checkWritePathPrecondition(String rawPath) {
-    final resolved = namespace.resolveVirtualPath(
+  SyscallError? _checkReadPathPrecondition(
+    String rawPath, {
+    VfsNamespace? effectiveNamespace,
+    CapabilityTable? cspace,
+  }) {
+    final activeNs = effectiveNamespace ?? namespace;
+    final resolved = activeNs.resolveVirtualPath(
+      rawPath,
+      allowRoot: false,
+      checkProtected: true,
+      checkSymlinks: true,
+    );
+    if (!resolved.ok) {
+      return resolved.error;
+    }
+    if (resolved.value!.isSkillsMount) {
+      return _checkSkillsReadAccess(
+        resolved: resolved.value!,
+        effectiveNamespace: activeNs,
+        cspace: cspace,
+      );
+    }
+    return null;
+  }
+
+  SyscallError? _checkSkillsReadAccess({
+    required VfsPathResolution resolved,
+    required VfsNamespace effectiveNamespace,
+    CapabilityTable? cspace,
+  }) {
+    final registry = effectiveNamespace.skillsMount;
+    final skillName = resolved.skillName;
+    if (registry == null || skillName == null) {
+      return const SyscallError(
+        code: SyscallErrorCode.eacces,
+        reason: 'SKILLS_NOT_MOUNTED',
+        message: '/skills is not mounted in this namespace.',
+        recoverable: false,
+      );
+    }
+    final manifest = registry.lookup(skillName);
+    if (manifest == null) {
+      return SyscallError(
+        code: SyscallErrorCode.enoent,
+        reason: 'SKILL_NOT_FOUND',
+        message: 'Skill "$skillName" is not mounted under /skills.',
+        recoverable: true,
+      );
+    }
+    if (cspace != null) {
+      return registry.checkAccess(cspace, effectiveNamespace, manifest);
+    }
+    return null;
+  }
+
+  SyscallError? _checkWritePathPrecondition(
+    String rawPath, {
+    VfsNamespace? effectiveNamespace,
+  }) {
+    final activeNs = effectiveNamespace ?? namespace;
+    final resolved = activeNs.resolveWriteVirtualPath(
       rawPath,
       allowRoot: false,
       checkProtected: true,

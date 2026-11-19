@@ -3,3 +3,4 @@ library;
 
 export 'src/fs/host_fs_driver.dart';
 export 'src/jj/jj_driver.dart';
+export 'src/memory/workspace_page_freshness_checker.dart';

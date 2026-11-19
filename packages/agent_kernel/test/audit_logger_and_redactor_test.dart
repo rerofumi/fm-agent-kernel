@@ -133,6 +133,85 @@ void main() {
       final parsedLlm = jsonDecode(llmLines.first) as Map<String, dynamic>;
       expect(parsedLlm['cachedTokens'], isNull);
       expect(parsedLlm['errorCode'], equals('EPROVIDER'));
+      expect(parsedLlm['pid'], equals(1));
+      expect(parsedLlm['ring'], equals('ring2'));
+      expect(parsedLlm['evictedPagesInStep'], equals(0));
+    });
+
+    test('writes Stage 2 process attribution and paging telemetry fields ([D-207], [D-215])', () async {
+      final logger = AuditLogger(
+        workspaceHostRoot: workspaceDir.path,
+        sessionId: 'sess_audit_stage2',
+      );
+
+      await logger.logSyscall(
+        SyscallAuditRecord(
+          seq: 2,
+          timestamp: DateTime.utc(2026, 11, 20, 0, 0, 0),
+          sessionId: 'sess_audit_stage2',
+          pid: 2,
+          parentPid: 1,
+          processName: 'explorer-2',
+          ring: ProtectionRing.ring3,
+          syscallName: 'sys_read_lines',
+          argsSummary: const <String, dynamic>{'path': '/workspace/lib/a.dart'},
+          approvalRequired: false,
+          decision: AuditDecision.allowed,
+          ok: true,
+          truncated: false,
+          durationMs: 5,
+        ),
+      );
+
+      await logger.logLlmIo(
+        LlmIoAuditRecord(
+          seq: 2,
+          turnIndex: 3,
+          timestamp: DateTime.utc(2026, 11, 20, 0, 0, 1),
+          sessionId: 'sess_audit_stage2',
+          pid: 2,
+          parentPid: 1,
+          processName: 'explorer-2',
+          ring: ProtectionRing.ring3,
+          provider: 'local-ollama',
+          model: 'gemma4:12b',
+          ok: true,
+          promptTokens: 4200,
+          completionTokens: 180,
+          totalTokens: 4380,
+          cachedTokens: 3100,
+          cacheHitRate: 0.7381,
+          durationMs: 420,
+          toolCallsCount: 1,
+          effectiveWindowTokens: 32768,
+          evictedPagesInStep: 2,
+          residentCleanPages: 3,
+          evictedCleanPages: 2,
+          stalePagesCount: 1,
+        ),
+      );
+      await logger.flush();
+
+      final parsedSyscall = jsonDecode(
+        File(logger.syscallsLogPath).readAsLinesSync().single,
+      ) as Map<String, dynamic>;
+      expect(parsedSyscall['pid'], equals(2));
+      expect(parsedSyscall['parentPid'], equals(1));
+      expect(parsedSyscall['processName'], equals('explorer-2'));
+      expect(parsedSyscall['ring'], equals('ring3'));
+
+      final parsedLlm = jsonDecode(
+        File(logger.llmIoLogPath).readAsLinesSync().single,
+      ) as Map<String, dynamic>;
+      expect(parsedLlm['pid'], equals(2));
+      expect(parsedLlm['parentPid'], equals(1));
+      expect(parsedLlm['processName'], equals('explorer-2'));
+      expect(parsedLlm['ring'], equals('ring3'));
+      expect(parsedLlm['effectiveWindowTokens'], equals(32768));
+      expect(parsedLlm['evictedPagesInStep'], equals(2));
+      expect(parsedLlm['residentCleanPages'], equals(3));
+      expect(parsedLlm['evictedCleanPages'], equals(2));
+      expect(parsedLlm['stalePagesCount'], equals(1));
     });
   });
 }

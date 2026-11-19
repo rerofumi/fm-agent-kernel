@@ -129,13 +129,15 @@ enum AuditDecision {
   final String wireValue;
 }
 
-/// Structured audit record written to `syscalls.jsonl` ([D-010]).
+/// Structured audit record written to `syscalls.jsonl` ([D-010], [D-215]).
 class SyscallAuditRecord {
   const SyscallAuditRecord({
     required this.seq,
     required this.timestamp,
     required this.sessionId,
     required this.pid,
+    this.parentPid,
+    this.processName,
     required this.ring,
     required this.syscallName,
     required this.argsSummary,
@@ -154,6 +156,8 @@ class SyscallAuditRecord {
   final DateTime timestamp;
   final String sessionId;
   final Pid pid;
+  final Pid? parentPid;
+  final String? processName;
   final ProtectionRing ring;
   final String syscallName;
   final Map<String, dynamic> argsSummary;
@@ -173,6 +177,8 @@ class SyscallAuditRecord {
       'timestamp': timestamp.toUtc().toIso8601String(),
       'sessionId': sessionId,
       'pid': pid,
+      'parentPid': parentPid,
+      'processName': processName,
       'ring': ring.name,
       'syscallName': syscallName,
       'argsSummary': argsSummary,
@@ -189,13 +195,17 @@ class SyscallAuditRecord {
   }
 }
 
-/// Structured telemetry record written to `llm_io.jsonl` ([D-010]).
+/// Structured telemetry record written to `llm_io.jsonl` ([D-010], [D-207], [D-215]).
 class LlmIoAuditRecord {
   const LlmIoAuditRecord({
     required this.seq,
     required this.turnIndex,
     required this.timestamp,
     required this.sessionId,
+    this.pid = 1,
+    this.parentPid,
+    this.processName,
+    this.ring = ProtectionRing.ring2,
     required this.provider,
     required this.model,
     this.endpoint,
@@ -211,6 +221,11 @@ class LlmIoAuditRecord {
     this.ttftMs,
     required this.durationMs,
     required this.toolCallsCount,
+    this.effectiveWindowTokens,
+    this.evictedPagesInStep = 0,
+    this.residentCleanPages = 0,
+    this.evictedCleanPages = 0,
+    this.stalePagesCount = 0,
     this.requestDebug,
     this.responseDebug,
   });
@@ -219,6 +234,10 @@ class LlmIoAuditRecord {
   final int turnIndex;
   final DateTime timestamp;
   final String sessionId;
+  final Pid pid;
+  final Pid? parentPid;
+  final String? processName;
+  final ProtectionRing ring;
   final String provider;
   final String model;
   final String? endpoint;
@@ -234,6 +253,11 @@ class LlmIoAuditRecord {
   final int? ttftMs;
   final int durationMs;
   final int toolCallsCount;
+  final int? effectiveWindowTokens;
+  final int evictedPagesInStep;
+  final int residentCleanPages;
+  final int evictedCleanPages;
+  final int stalePagesCount;
   final Map<String, dynamic>? requestDebug;
   final Map<String, dynamic>? responseDebug;
 
@@ -243,6 +267,10 @@ class LlmIoAuditRecord {
       'turnIndex': turnIndex,
       'timestamp': timestamp.toUtc().toIso8601String(),
       'sessionId': sessionId,
+      'pid': pid,
+      'parentPid': parentPid,
+      'processName': processName,
+      'ring': ring.name,
       'provider': provider,
       'model': model,
       'endpoint': endpoint,
@@ -258,6 +286,11 @@ class LlmIoAuditRecord {
       'ttftMs': ttftMs,
       'durationMs': durationMs,
       'toolCallsCount': toolCallsCount,
+      'effectiveWindowTokens': effectiveWindowTokens,
+      'evictedPagesInStep': evictedPagesInStep,
+      'residentCleanPages': residentCleanPages,
+      'evictedCleanPages': evictedCleanPages,
+      'stalePagesCount': stalePagesCount,
       if (requestDebug != null) 'requestDebug': requestDebug,
       if (responseDebug != null) 'responseDebug': responseDebug,
     };

@@ -500,6 +500,8 @@ void main() {
         'dart:ffi',
         'package:win32/',
         'dart:mirrors',
+        'package:yaml/',
+        'package:html/',
         'package:agent_drivers/',
         'package:agent_runtime/',
         'package:agent_acp/',
@@ -517,10 +519,460 @@ void main() {
           expect(
             content.contains(forbidden),
             isFalse,
-            reason: '${file.path} must not depend on $forbidden ([D-001])',
+            reason: '${file.path} must not depend on $forbidden ([D-001], [D-201])',
           );
         }
       }
     });
+
+    test('Stage 4 TTY monopoly denies Ring 3 askUser with EPERM and 0 ApprovalHandler calls [D-202], [D-213]', () async {
+      final stage2Table = KernelProcessTable.stage2();
+      final stage2Parent = ProcessControlBlock(
+        pid: 1,
+        name: 'lead-agent',
+        ring: ProtectionRing.ring2,
+        state: ProcessState.running,
+        cspace: CapabilityTable.stage2LeadAgent(),
+        quota: ResourceQuota.stage2Default,
+        namespace: VfsNamespace(workspaceHostRoot: workspaceDir.path),
+        memory: VirtualContextMemory(
+          sessionId: 'sess_tty',
+          systemInstruction: PinnedSystemInstruction(
+            instruction: 'Parent',
+            tools: const <SyscallToolSchema>[],
+          ),
+        ),
+      );
+      expect(stage2Table.registerProcess(stage2Parent).ok, isTrue);
+
+      final childPcb = ProcessControlBlock(
+        pid: 2,
+        parentPid: 1,
+        name: 'explorer-2',
+        ring: ProtectionRing.ring3,
+        state: ProcessState.running,
+        cspace: CapabilityTable(
+          initialEntries: <CapabilityEntry>[
+            CapabilityEntry(
+              handle: const CapHandle('cap_explorer'),
+              resourceScope: '/workspace',
+              rights: const <CapRight>{CapRight.read, CapRight.exec},
+            ),
+          ],
+        ),
+        quota: const ResourceQuota(maxChildProcesses: 0),
+        namespace: VfsNamespace(workspaceHostRoot: workspaceDir.path),
+        memory: VirtualContextMemory(
+          sessionId: 'sess_tty',
+          systemInstruction: PinnedSystemInstruction(
+            instruction: 'Child',
+            tools: const <SyscallToolSchema>[],
+          ),
+        ),
+        profile: ProcessProfileId.explorer,
+      );
+      expect(stage2Table.registerProcess(childPcb).ok, isTrue);
+
+      var approvalCalls = 0;
+      var driverCalls = 0;
+      final approvalHandler = PolicyApprovalHandler((req, _) async {
+        approvalCalls += 1;
+        return const ApprovalDecision.allowOnce();
+      });
+
+      final stage2Audit = AuditLogger(
+        workspaceHostRoot: workspaceDir.path,
+        sessionId: 'sess_tty',
+        redactor: redactor,
+      );
+      final gate = SyscallGate(
+        processTable: stage2Table,
+        approvalGate: ApprovalGate(handler: approvalHandler),
+        ioCapper: IoPayloadCapper(workspaceHostRoot: workspaceDir.path),
+        auditLogger: stage2Audit,
+        redactor: redactor,
+      );
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_exec',
+          requiredRight: CapRight.exec,
+          kind: 'execute',
+          evaluatePolicy: (_, _) async => RingDecision.askUser,
+          handler: (_) async {
+            driverCalls += 1;
+            return const SyscallResult<Map<String, dynamic>>.success(
+              <String, dynamic>{'exitCode': 0},
+            );
+          },
+        ),
+      );
+
+      final res = await gate.invoke(
+        const SyscallContext(
+          pid: 2,
+          capHandle: CapHandle('cap_explorer'),
+          sessionId: 'sess_tty',
+        ),
+        SyscallRequest(
+          name: 'sys_exec',
+          args: const <String, dynamic>{'command': 'echo danger'},
+        ),
+      );
+
+      expect(res.ok, isFalse);
+      expect(res.error!.code, equals(SyscallErrorCode.eperm));
+      expect(res.error!.reason, equals('TTY_MONOPOLY_DENIED'));
+      expect(res.error!.recoverable, isFalse);
+      expect(approvalCalls, equals(0));
+      expect(approvalHandler.recordedRequests, isEmpty);
+      expect(driverCalls, equals(0));
+
+      final records = File(stage2Audit.syscallsLogPath)
+          .readAsLinesSync()
+          .map((l) => jsonDecode(l) as Map<String, dynamic>)
+          .toList();
+      expect(records, hasLength(1));
+      expect(records.first['pid'], equals(2));
+      expect(records.first['parentPid'], equals(1));
+      expect(records.first['processName'], equals('explorer-2'));
+      expect(records.first['ring'], equals('ring3'));
+      expect(records.first['decision'], equals('DENIED_BY_POLICY'));
+      expect(records.first['approvalRequired'], isFalse);
+      expect(records.first['errorReason'], equals('TTY_MONOPOLY_DENIED'));
+    });
+
+    test('Stage 2 gate resolves multi-entry CSpace rights and audits spawn EDQUOT as QUOTA_EXCEEDED [D-202], [D-211]', () async {
+      final stage2Table = KernelProcessTable.stage2(maxActiveProcesses: 4);
+      final stage2Parent = ProcessControlBlock(
+        pid: 1,
+        name: 'lead-agent',
+        ring: ProtectionRing.ring2,
+        state: ProcessState.running,
+        cspace: CapabilityTable.stage2LeadAgent(),
+        quota: const ResourceQuota(maxChildProcesses: 1),
+        namespace: VfsNamespace(workspaceHostRoot: workspaceDir.path),
+        memory: VirtualContextMemory(
+          sessionId: 'sess_stage2_gate',
+          systemInstruction: PinnedSystemInstruction(
+            instruction: 'Parent',
+            tools: const <SyscallToolSchema>[],
+          ),
+        ),
+      );
+      expect(stage2Table.registerProcess(stage2Parent).ok, isTrue);
+
+      final stage2Audit = AuditLogger(
+        workspaceHostRoot: workspaceDir.path,
+        sessionId: 'sess_stage2_gate',
+        redactor: redactor,
+      );
+      final gate = SyscallGate(
+        processTable: stage2Table,
+        approvalGate: ApprovalGate(handler: PolicyApprovalHandler.alwaysAllow()),
+        ioCapper: IoPayloadCapper(workspaceHostRoot: workspaceDir.path),
+        auditLogger: stage2Audit,
+        redactor: redactor,
+      );
+
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_net_probe',
+          requiredRight: CapRight.netRead,
+          kind: 'read',
+          handler: (_) async => const SyscallResult<Map<String, dynamic>>.success(
+            <String, dynamic>{'ok': true},
+          ),
+        ),
+      );
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_spawn',
+          requiredRight: CapRight.procSpawn,
+          kind: 'process',
+          handler: (_) async => const SyscallResult<Map<String, dynamic>>.success(
+            <String, dynamic>{'childPid': 2},
+          ),
+        ),
+      );
+
+      const parentCtx = SyscallContext(
+        pid: 1,
+        capHandle: CapHandle('cap_workspace_rw'),
+        sessionId: 'sess_stage2_gate',
+      );
+
+      // Multi-entry CSpace lookup: netRead resides on cap_net_public while context passes cap_workspace_rw.
+      final netRes = await gate.invoke(
+        parentCtx,
+        SyscallRequest(name: 'sys_net_probe'),
+      );
+      expect(netRes.ok, isTrue);
+
+      // Reach concurrent child quota limit -> sys_spawn returns recoverable EDQUOT audited as QUOTA_EXCEEDED.
+      stage2Parent.quotaUsage.activeChildProcesses = 1;
+      final spawnQuotaRes = await gate.invoke(
+        parentCtx,
+        SyscallRequest(name: 'sys_spawn'),
+      );
+      expect(spawnQuotaRes.ok, isFalse);
+      expect(spawnQuotaRes.error!.code, equals(SyscallErrorCode.edquot));
+      expect(spawnQuotaRes.error!.reason, equals('CHILD_PROCESS_QUOTA_EXCEEDED'));
+      expect(spawnQuotaRes.error!.recoverable, isTrue);
+
+      final records = File(stage2Audit.syscallsLogPath)
+          .readAsLinesSync()
+          .map((l) => jsonDecode(l) as Map<String, dynamic>)
+          .toList();
+      expect(records, hasLength(2));
+      expect(records[1]['decision'], equals('QUOTA_EXCEEDED'));
+      expect(records[1]['errorCode'], equals('EDQUOT'));
+    });
+
+    test('Stage 3.5 TxHook.onTxSquash blocks sys_tx_squash before Stage 4 ApprovalGate (0 approval calls) [D-202], [D-220]', () async {
+      final events = <String>[];
+      final approvalHandler = PolicyApprovalHandler((req, _) async {
+        events.add('approval');
+        return const ApprovalDecision.allowOnce();
+      });
+
+      final gate = SyscallGate(
+        processTable: processTable,
+        approvalGate: ApprovalGate(handler: approvalHandler),
+        ioCapper: IoPayloadCapper(workspaceHostRoot: workspaceDir.path),
+        auditLogger: auditLogger,
+        redactor: redactor,
+        hooks: <SyscallHook>[
+          _RecordingSyscallHook(
+            hookName: 'before_observer',
+            events: events,
+          ),
+        ],
+        txHooks: <TxHook>[
+          _CallbackTxHook(
+            hookName: 'tx_policy_guard',
+            onSquash: (hookCtx) async {
+              events.add('tx_hook:${hookCtx.syscallName}');
+              return const HookBlock(
+                reason: 'COMMIT_MESSAGE_REQUIRED',
+                message: 'Squash blocked by commit policy.',
+                hint: 'Call sys_tx_describe before squashing.',
+              );
+            },
+          ),
+        ],
+      );
+
+      var driverExecuted = false;
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_tx_squash',
+          requiredRight: CapRight.vcsTx,
+          kind: 'edit',
+          evaluatePolicy: (_, _) async => RingDecision.askUser,
+          handler: (_) async {
+            driverExecuted = true;
+            return const SyscallResult<Map<String, dynamic>>.success(
+              <String, dynamic>{'squashed': true},
+            );
+          },
+        ),
+      );
+
+      final res = await gate.invoke(ctx, SyscallRequest(name: 'sys_tx_squash'));
+      expect(res.ok, isFalse);
+      expect(res.error!.code, equals(SyscallErrorCode.eperm));
+      expect(res.error!.reason, equals('HOOK_BLOCKED'));
+      expect(res.error!.details!['hookPoint'], equals('onTxSquash'));
+      expect(events, equals(<String>['before:before_observer', 'tx_hook:sys_tx_squash']));
+      expect(approvalHandler.recordedRequests, isEmpty);
+      expect(driverExecuted, isFalse);
+    });
+
+    test('Stage 3 HookModifyArgs re-validates Stage 1/2 and Stage 6 transformAfterSyscall enforces Capper, Redactor, and no failure falsification [D-202], [D-220]', () async {
+      final gate = createGate(
+        approvalHandler: PolicyApprovalHandler.alwaysAllow(),
+        ioCapConfig: const IoCapConfig(maxLines: 4, maxUtf8Bytes: 256),
+        hooks: <SyscallHook>[
+          _TransformAndModifyHook(
+            modifyArgs: (args) {
+              if (args['triggerInvalid'] == true) {
+                return const <String, dynamic>{'path': ''};
+              }
+              if (args['rewrite'] == true) {
+                return const <String, dynamic>{'path': '/workspace/rewritten.txt'};
+              }
+              return null;
+            },
+            transformAfter: (hookCtx, result) {
+              if (hookCtx.args['tryFalsify'] == true) {
+                return HookAfterReplace(const <String, dynamic>{
+                  'forged': true,
+                });
+              }
+              if (result.ok) {
+                final lines = List<String>.generate(
+                  12,
+                  (i) => 'line_$i top-secret-token',
+                ).join('\n');
+                return HookAfterReplace(<String, dynamic>{
+                  ...result.value!,
+                  'content': lines,
+                  'annotatedByHook': true,
+                });
+              }
+              return const HookAfterKeep();
+            },
+          ),
+        ],
+      );
+
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_read_lines',
+          requiredRight: CapRight.read,
+          kind: 'read',
+          applyIoCap: true,
+          cappedTextFields: const <String>['content'],
+          validateArgs: (args) {
+            final path = args['path'];
+            if (path is! String || path.trim().isEmpty) {
+              return const SyscallError(
+                code: SyscallErrorCode.einval,
+                reason: 'INVALID_PATH',
+                message: 'path must be non-empty',
+              );
+            }
+            return null;
+          },
+          handler: (execCtx) async {
+            if (execCtx.args['tryFalsify'] == true) {
+              return const SyscallResult<Map<String, dynamic>>.failure(
+                SyscallError(
+                  code: SyscallErrorCode.enoent,
+                  reason: 'NOT_FOUND',
+                  message: 'missing file',
+                ),
+              );
+            }
+            return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'resolvedPath': execCtx.args['path'],
+              'content': 'short',
+            });
+          },
+        ),
+      );
+
+      // 1. HookModifyArgs producing invalid args is caught by Stage 1 re-validation.
+      final invalidModified = await gate.invoke(
+        ctx,
+        SyscallRequest(
+          name: 'sys_read_lines',
+          args: const <String, dynamic>{
+            'path': '/workspace/a.txt',
+            'triggerInvalid': true,
+          },
+        ),
+      );
+      expect(invalidModified.ok, isFalse);
+      expect(invalidModified.error!.code, equals(SyscallErrorCode.einval));
+      expect(invalidModified.error!.reason, equals('INVALID_PATH'));
+
+      // 2. HookAfterReplace output is capped by Stage 7 and redacted by SecretRedactor.
+      final transformed = await gate.invoke(
+        ctx,
+        SyscallRequest(
+          name: 'sys_read_lines',
+          args: const <String, dynamic>{
+            'path': '/workspace/orig.txt',
+            'rewrite': true,
+          },
+        ),
+      );
+      expect(transformed.ok, isTrue);
+      expect(transformed.value!['resolvedPath'], equals('/workspace/rewritten.txt'));
+      expect(transformed.value!['annotatedByHook'], isTrue);
+      expect(transformed.value!['truncated'], isTrue);
+      final content = transformed.value!['content'] as String;
+      expect(content, isNot(contains('top-secret-token')));
+      expect(content, contains('<REDACTED>'));
+
+      // 3. Failed Stage 5 result cannot be falsified into success by HookAfterReplace.
+      final failedNotFalsified = await gate.invoke(
+        ctx,
+        SyscallRequest(
+          name: 'sys_read_lines',
+          args: const <String, dynamic>{
+            'path': '/workspace/missing.txt',
+            'tryFalsify': true,
+          },
+        ),
+      );
+      expect(failedNotFalsified.ok, isFalse);
+      expect(failedNotFalsified.error!.code, equals(SyscallErrorCode.enoent));
+      expect(failedNotFalsified.error!.reason, equals('NOT_FOUND'));
+    });
   });
+}
+
+class _RecordingSyscallHook extends BaseSyscallHook {
+  _RecordingSyscallHook({required this.hookName, required this.events});
+
+  final String hookName;
+  final List<String> events;
+
+  @override
+  String get name => hookName;
+
+  @override
+  Future<HookBeforeResult> beforeSyscall(SyscallHookContext context) async {
+    events.add('before:$hookName');
+    return const HookAllow();
+  }
+}
+
+class _CallbackTxHook implements TxHook {
+  _CallbackTxHook({required this.hookName, required this.onSquash});
+
+  final String hookName;
+  final Future<HookBeforeResult> Function(SyscallHookContext context) onSquash;
+
+  @override
+  String get name => hookName;
+
+  @override
+  Future<HookBeforeResult> onTxSquash(SyscallHookContext context) =>
+      onSquash(context);
+}
+
+class _TransformAndModifyHook extends BaseSyscallHook {
+  _TransformAndModifyHook({
+    required this.modifyArgs,
+    required this.transformAfter,
+  });
+
+  final Map<String, dynamic>? Function(Map<String, dynamic> args) modifyArgs;
+  final HookAfterResult Function(
+    SyscallHookContext context,
+    SyscallResult<Map<String, dynamic>> result,
+  ) transformAfter;
+
+  @override
+  String get name => 'transform_and_modify';
+
+  @override
+  Future<HookBeforeResult> beforeSyscall(SyscallHookContext context) async {
+    final modified = modifyArgs(context.args);
+    if (modified != null) {
+      return HookModifyArgs(modified);
+    }
+    return const HookAllow();
+  }
+
+  @override
+  Future<HookAfterResult> transformAfterSyscall(
+    SyscallHookContext context,
+    SyscallResult<Map<String, dynamic>> result,
+  ) async {
+    return transformAfter(context, result);
+  }
 }

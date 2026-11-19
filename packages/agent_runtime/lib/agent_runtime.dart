@@ -4,8 +4,12 @@ library;
 import 'package:agent_drivers/agent_drivers.dart';
 import 'package:agent_kernel/agent_kernel.dart';
 
+export 'src/child_isolate_bootstrap.dart';
+export 'src/isolate_worker_host.dart';
 export 'src/kernel_bootstrap.dart';
 export 'src/process_runner.dart';
+export 'src/process_syscalls.dart';
+export 'src/sub_agent_worker.dart';
 
 /// Placeholder marker confirming workspace linkage to kernel and drivers.
 String agentRuntimeWorkspaceBanner() =>
