@@ -1,6 +1,6 @@
 # Cheatsheet Links — 外部一次資料・出典台帳
 
-すべての URL は `2026-11-19` 時点で最終到達先（HTTP `200 OK`）を実確認済みの正規 URL である。ローカル実測のみの項目には架空 URL を付与せず、各トピック本文にコマンドと観測結果を記録している。
+すべての URL は記載の確認日（`2026-11-19`〜`2026-11-20`）時点で最終到達先（HTTP `200 OK`）を実確認済みの正規 URL である。ローカル実測のみの項目には架空 URL を付与せず、各トピック本文にコマンドと観測結果を記録している。
 
 ## 1. Dart SDK・Pub Workspaces・Windows FFI
 
@@ -65,3 +65,15 @@
 | https://pub.dev/packages/yaml | 公式パッケージ仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | `SKILL.md` フロントマター解析用 pure-Dart `package:yaml` の仕様確認 |
 | https://pub.dev/packages/html | 公式パッケージ仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | HTML5 DOM 解析・ノイズ要素除去用 pure-Dart `package:html` の仕様確認 |
 | https://pub.dev/packages/html2md | パッケージ仕様 | `2026-11-19` | [web_research_ssrf_and_skills.md](./web_research_ssrf_and_skills.md) | pure-Dart HTML→Markdown 変換ライブラリの仕様・オプション確認 |
+
+## 6. Stage 3：Jujutsu (`jj`) 複数ワークスペース・競合解消・MCP (Model Context Protocol)
+
+| 出典 URL | 出典種別 | 確認日 | 関連ローカル資料 | 参照理由 |
+| --- | --- | :---: | --- | --- |
+| https://docs.jj-vcs.dev/latest/working-copy/ | 公式ドキュメント | `2026-11-20` | [jj_workspace_merge_and_stacked.md](./jj_workspace_merge_and_stacked.md) | `jj workspace` の複数ワーキングコピー構造および `stale working copy` / `update-stale` 仕様の確認 |
+| https://docs.jj-vcs.dev/latest/conflicts/ | 公式ドキュメント | `2026-11-20` | [jj_workspace_merge_and_stacked.md](./jj_workspace_merge_and_stacked.md) | First-Class Conflicts の木構造保持・コンフリクトマーカー形式・競合解消フロー仕様の確認 |
+| https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | MCP ハンドシェイク（`initialize` → `notifications/initialized`）・バージョン交渉・終了規則の確認 |
+| https://modelcontextprotocol.io/specification/2025-11-25/basic/transports | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | MCP `stdio`（UTF-8 NDJSON）および `Streamable HTTP`（`MCP-Protocol-Version` / `Mcp-Session-Id` / SSE）仕様の確認 |
+| https://modelcontextprotocol.io/specification/2025-11-25/server/tools | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | MCP `tools/list`（`cursor` ページネーション）および `tools/call`（`CallToolResult` / `isError`）スキーマの確認 |
+| https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | MCP Modern (`2026-07-28`) と Legacy (`2025-11-25` 以前) の Dual-era 互換性マトリクス確認 |
+| https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | Windows での `stdio` MCP サーバー終了手順（`stdin` EOF + Win32 Job Objects / `TerminateProcess`）の確認 |
