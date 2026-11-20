@@ -18,6 +18,18 @@ typedef SyncWorkingCopySnapshotCallback =
 /// Non-destructive provider returning the current `@` `commit_id` for VCS Clean Page metadata ([D-208]).
 typedef CurrentCommitIdProvider = Future<String?> Function();
 
+/// PCB-aware transaction isolation callback ([D-308]).
+typedef EnsureActiveTransactionForPcbCallback =
+    Future<SyscallResult<Object?>> Function(ProcessControlBlock pcb);
+
+/// PCB-aware working-copy snapshot callback ([D-308]).
+typedef SyncWorkingCopySnapshotForPcbCallback =
+    Future<SyscallResult<Object?>> Function(ProcessControlBlock pcb);
+
+/// PCB-aware non-destructive `@` `commit_id` provider ([D-308]).
+typedef CurrentCommitIdForPcbProvider =
+    Future<String?> Function(ProcessControlBlock pcb);
+
 /// Host filesystem Read-Only & CAS Write driver scoped to a [VfsNamespace] ([D-011], [D-012], [D-013]).
 ///
 /// Enforces real-path symlink/junction boundary checks, bidirectional protection
@@ -30,21 +42,33 @@ class HostFsDriver {
     EnsureActiveTransactionCallback? ensureActiveTransaction,
     SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
     CurrentCommitIdProvider? currentCommitIdProvider,
+    EnsureActiveTransactionForPcbCallback? ensureActiveTransactionForPcb,
+    SyncWorkingCopySnapshotForPcbCallback? syncWorkingCopySnapshotForPcb,
+    CurrentCommitIdForPcbProvider? currentCommitIdForPcbProvider,
   })  : _ensureActiveTransaction = ensureActiveTransaction,
         _syncWorkingCopySnapshot = syncWorkingCopySnapshot,
-        _currentCommitIdProvider = currentCommitIdProvider;
+        _currentCommitIdProvider = currentCommitIdProvider,
+        _ensureActiveTransactionForPcb = ensureActiveTransactionForPcb,
+        _syncWorkingCopySnapshotForPcb = syncWorkingCopySnapshotForPcb,
+        _currentCommitIdForPcbProvider = currentCommitIdForPcbProvider;
 
   factory HostFsDriver.forWorkspace(
     String workspaceHostRoot, {
     EnsureActiveTransactionCallback? ensureActiveTransaction,
     SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
     CurrentCommitIdProvider? currentCommitIdProvider,
+    EnsureActiveTransactionForPcbCallback? ensureActiveTransactionForPcb,
+    SyncWorkingCopySnapshotForPcbCallback? syncWorkingCopySnapshotForPcb,
+    CurrentCommitIdForPcbProvider? currentCommitIdForPcbProvider,
   }) {
     return HostFsDriver(
       namespace: VfsNamespace(workspaceHostRoot: workspaceHostRoot),
       ensureActiveTransaction: ensureActiveTransaction,
       syncWorkingCopySnapshot: syncWorkingCopySnapshot,
       currentCommitIdProvider: currentCommitIdProvider,
+      ensureActiveTransactionForPcb: ensureActiveTransactionForPcb,
+      syncWorkingCopySnapshotForPcb: syncWorkingCopySnapshotForPcb,
+      currentCommitIdForPcbProvider: currentCommitIdForPcbProvider,
     );
   }
 
@@ -52,6 +76,9 @@ class HostFsDriver {
   final EnsureActiveTransactionCallback? _ensureActiveTransaction;
   final SyncWorkingCopySnapshotCallback? _syncWorkingCopySnapshot;
   final CurrentCommitIdProvider? _currentCommitIdProvider;
+  final EnsureActiveTransactionForPcbCallback? _ensureActiveTransactionForPcb;
+  final SyncWorkingCopySnapshotForPcbCallback? _syncWorkingCopySnapshotForPcb;
+  final CurrentCommitIdForPcbProvider? _currentCommitIdForPcbProvider;
 
   static final RegExp _drivePrefixPattern = RegExp(r'^[a-zA-Z]:');
   static final RegExp _sha256Pattern = RegExp(r'^[0-9a-fA-F]{64}$');
@@ -228,6 +255,7 @@ class HostFsDriver {
     required String pattern,
     String? subpath,
     VfsNamespace? namespaceOverride,
+    ProcessControlBlock? callerPcb,
   }) async {
     final effectiveNamespace = namespaceOverride ?? namespace;
     final patternError = _validatePatternSafety(
@@ -338,7 +366,7 @@ class HostFsDriver {
     }
     matches.sort();
 
-    final commitId = await _readCurrentCommitIdSafe();
+    final commitId = await _readCurrentCommitIdSafe(callerPcb: callerPcb);
 
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
       'basePath': baseRes.virtualPath,
@@ -356,6 +384,7 @@ class HostFsDriver {
     bool caseSensitive = true,
     String? includeGlob,
     VfsNamespace? namespaceOverride,
+    ProcessControlBlock? callerPcb,
   }) async {
     final effectiveNamespace = namespaceOverride ?? namespace;
     if (pattern.isEmpty) {
@@ -533,7 +562,7 @@ class HostFsDriver {
       }
     }
 
-    final commitId = await _readCurrentCommitIdSafe();
+    final commitId = await _readCurrentCommitIdSafe(callerPcb: callerPcb);
 
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
       'matches': matches,
@@ -542,13 +571,18 @@ class HostFsDriver {
     });
   }
 
-  Future<String?> _readCurrentCommitIdSafe() async {
-    final provider = _currentCommitIdProvider;
-    if (provider == null) {
-      return null;
-    }
+  Future<String?> _readCurrentCommitIdSafe({
+    ProcessControlBlock? callerPcb,
+  }) async {
     try {
-      final id = await provider();
+      final String? id;
+      if (callerPcb != null && _currentCommitIdForPcbProvider != null) {
+        id = await _currentCommitIdForPcbProvider(callerPcb);
+      } else if (_currentCommitIdProvider != null) {
+        id = await _currentCommitIdProvider();
+      } else {
+        return null;
+      }
       if (id == null) {
         return null;
       }
@@ -557,6 +591,30 @@ class HostFsDriver {
     } catch (_) {
       return null;
     }
+  }
+
+  Future<SyscallResult<Object?>?> _ensureTxForCaller(
+    ProcessControlBlock? callerPcb,
+  ) async {
+    if (callerPcb != null && _ensureActiveTransactionForPcb != null) {
+      return _ensureActiveTransactionForPcb(callerPcb);
+    }
+    if (_ensureActiveTransaction != null) {
+      return _ensureActiveTransaction();
+    }
+    return null;
+  }
+
+  Future<SyscallResult<Object?>?> _syncSnapshotForCaller(
+    ProcessControlBlock? callerPcb,
+  ) async {
+    if (callerPcb != null && _syncWorkingCopySnapshotForPcb != null) {
+      return _syncWorkingCopySnapshotForPcb(callerPcb);
+    }
+    if (_syncWorkingCopySnapshot != null) {
+      return _syncWorkingCopySnapshot();
+    }
+    return null;
   }
 
   /// Atomically replaces a unique [oldBlock] in an existing file after CAS SHA-256 verification ([D-013]).
@@ -569,6 +627,7 @@ class HostFsDriver {
     required String oldBlock,
     required String newBlock,
     VfsNamespace? namespaceOverride,
+    ProcessControlBlock? callerPcb,
   }) async {
     final effectiveNamespace = namespaceOverride ?? namespace;
     if (path.trim().isEmpty) {
@@ -758,11 +817,9 @@ class HostFsDriver {
     }
 
     // All preconditions passed: ensure CoW transaction isolation before touching disk.
-    if (_ensureActiveTransaction != null) {
-      final txRes = await _ensureActiveTransaction();
-      if (!txRes.ok) {
-        return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
-      }
+    final txRes = await _ensureTxForCaller(callerPcb);
+    if (txRes != null && !txRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
     }
 
     final matchStart = matchOffsets.first;
@@ -780,11 +837,9 @@ class HostFsDriver {
 
     final newSha256 = sha256.convert(newBytes).toString();
 
-    if (_syncWorkingCopySnapshot != null) {
-      final syncRes = await _syncWorkingCopySnapshot();
-      if (!syncRes.ok) {
-        return SyscallResult<Map<String, dynamic>>.failure(syncRes.error!);
-      }
+    final syncRes = await _syncSnapshotForCaller(callerPcb);
+    if (syncRes != null && !syncRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(syncRes.error!);
     }
 
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
@@ -807,6 +862,7 @@ class HostFsDriver {
     String? expectedSha256,
     bool createOnly = false,
     VfsNamespace? namespaceOverride,
+    ProcessControlBlock? callerPcb,
   }) async {
     final effectiveNamespace = namespaceOverride ?? namespace;
     if (path.trim().isEmpty) {
@@ -938,11 +994,9 @@ class HostFsDriver {
     }
 
     // All preconditions passed: ensure CoW transaction isolation before touching disk.
-    if (_ensureActiveTransaction != null) {
-      final txRes = await _ensureActiveTransaction();
-      if (!txRes.ok) {
-        return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
-      }
+    final txRes = await _ensureTxForCaller(callerPcb);
+    if (txRes != null && !txRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
     }
 
     try {
@@ -970,11 +1024,9 @@ class HostFsDriver {
 
     final newSha256 = sha256.convert(newBytes).toString();
 
-    if (_syncWorkingCopySnapshot != null) {
-      final syncRes = await _syncWorkingCopySnapshot();
-      if (!syncRes.ok) {
-        return SyscallResult<Map<String, dynamic>>.failure(syncRes.error!);
-      }
+    final syncRes = await _syncSnapshotForCaller(callerPcb);
+    if (syncRes != null && !syncRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(syncRes.error!);
     }
 
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
@@ -1034,6 +1086,7 @@ class HostFsDriver {
           oldBlock: exec.args['oldBlock'] as String,
           newBlock: exec.args['newBlock'] as String,
           namespaceOverride: exec.pcb.namespace,
+          callerPcb: exec.pcb,
         ),
       ),
       SyscallDefinition(
@@ -1053,6 +1106,7 @@ class HostFsDriver {
           expectedSha256: exec.args['expectedSha256'] as String?,
           createOnly: exec.args['createOnly'] as bool? ?? false,
           namespaceOverride: exec.pcb.namespace,
+          callerPcb: exec.pcb,
         ),
       ),
     ];
@@ -1165,6 +1219,7 @@ class HostFsDriver {
           pattern: exec.args['pattern'] as String,
           subpath: exec.args['subpath'] as String?,
           namespaceOverride: exec.pcb.namespace,
+          callerPcb: exec.pcb,
         ),
       ),
       SyscallDefinition(
@@ -1182,6 +1237,7 @@ class HostFsDriver {
           caseSensitive: exec.args['caseSensitive'] as bool? ?? true,
           includeGlob: exec.args['includeGlob'] as String?,
           namespaceOverride: exec.pcb.namespace,
+          callerPcb: exec.pcb,
         ),
       ),
     ];

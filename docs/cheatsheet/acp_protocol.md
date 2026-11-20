@@ -111,3 +111,15 @@ ACP 公式の Extensibility 仕様（`https://agentclientprotocol.com/protocol/v
 | **プロンプト毎のプロバイダ／モデル切替** | **`session/new` の `configOptions`（標準予約カテゴリ `category: "model"`, `id: "model"`）＋ `session/set_config_option`** で、Zed 等の一般 ACP クライアント UI 上のモデルドロップダウンからそのまま切り替え可能！（簡易 CLI の `/model <provider/model>` コマンドも内部で `session/set_config_option` を呼べば 100% 標準準拠になる） | もし 1 回の `session/prompt` 単位で一時的にモデルを上書き指定したい場合のみ、`session/prompt` の `params._meta["fm_agent_os/modelOverride"]` を補助的に受け付ける（標準クライアントとも完全互換）。 |
 | **コンテキスト使用量・コスト表示** | **`session/update` の `sessionUpdate: "usage_update"`**（`used`, `size`, `cost`）で標準クライアントのコンテキストバーに表示可能。 | **ターン毎の `cachedTokens`, `cacheWriteTokens`, `cacheHitRate`, `ttftMs`, `provider`, `model`** といった詳細 KV キャッシュ統計は、`usage_update._meta["fm_agent_os/llmTelemetry"]`（および `session/prompt` 応答の `result._meta`）に格納する。`acp_cli_client` はここを読んでリッチ表示し、一般 ACP エディタは無視して壊れない。 |
 | **`jj` トランザクション状態（`changeId`, `opId`）と手動 `undo`** | 各 `tool_call` / `tool_call_update` の表示タイトルや `diff` ブロックは標準フィールドで表現。 | 現在の `jjChangeId` / `jjOpId` は `tool_call_update._meta["fm_agent_os/jj"]` に添付。また CLI から人間が直接トランザクションロールバックを指示したい場合は、カスタムメソッド **`_fm_agent_os/tx_rollback`**（またはプロンプトのスラッシュコマンド）として切り分ける。 |
+
+---
+
+## 4. `stdio` ACP クライアントにおける子デーモン終了順の知見（Stage 3 実測）
+
+- **対象版 / 確認日**: Dart SDK `3.14.1` / Windows 11 / `2026-11-21`（`packages/agent_acp/lib/src/kanban/kanban_acp_bridge.dart` `KanbanAcpBridge.dispose()`）
+- **現象と回避策**: `acp_kanban_app.exe` のように上位 ACP クライアントが `Process.start()` で `agent_os_daemon.exe` の `stdin`/`stdout` に `WireJsonRpcPeer` を接続して終了するとき、先に `peer.close()` で出力ストリームを閉じると子プロセスの `exitCode` 待機と競合する場合がある。
+- **推奨終了順**:
+  1. 実行中ターンがあれば `session/cancel` 通知を送る。
+  2. `await proc.stdin.close()` で EOF を通知し、デーモン自身のクリーン終了ループを終了させる。
+  3. `await proc.exitCode.timeout(const Duration(seconds: 5))` で正常終了を待つ（タイムアウト時のみ `proc.kill(ProcessSignal.sigkill)`）。
+  4. 最後に `await _peer.close(closeOutput: false)` で `stdin` 二重クローズを避けつつ読み取り購読とペンダータスクを閉じる。

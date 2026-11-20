@@ -5,6 +5,7 @@ import 'context_memory.dart';
 import 'mailbox.dart';
 import 'process_profile.dart';
 import 'quota.dart';
+import 'supervision.dart';
 import 'syscall_error.dart';
 import 'vfs_namespace.dart';
 
@@ -43,14 +44,19 @@ class JjTxContext {
     this.parentChangeId,
     this.workingChangeId,
     this.currentOpId,
+    this.anchorWorkingChangeId,
+    Iterable<String> pendingWorkerChangeIds = const <String>[],
     Iterable<String> allowedCheckpointOpIds = const <String>[],
-  }) : _allowedCheckpointOpIds = Set<String>.from(allowedCheckpointOpIds);
+  })  : pendingWorkerChangeIds = Set<String>.from(pendingWorkerChangeIds),
+        _allowedCheckpointOpIds = Set<String>.from(allowedCheckpointOpIds);
 
   TxState state;
   String? baseOpId;
   String? parentChangeId;
   String? workingChangeId;
   String? currentOpId;
+  String? anchorWorkingChangeId;
+  final Set<String> pendingWorkerChangeIds;
   final Set<String> _allowedCheckpointOpIds;
 
   /// Unmodifiable set of operation IDs recorded during this session for safe rollback validation.
@@ -118,9 +124,14 @@ class ProcessControlBlock {
     required this.memory,
     BoundedMailbox? mailbox,
     this.profile,
+    this.jjWorkspaceName,
+    this.jjWorkspaceRoot,
+    this.logicalTaskId,
+    ProcessSuspendController? suspendController,
   })  : quotaUsage = quotaUsage ?? QuotaConsumption(),
         jjContext = jjContext ?? JjTxContext(),
-        mailbox = mailbox ?? BoundedMailbox();
+        mailbox = mailbox ?? BoundedMailbox(),
+        suspendController = suspendController ?? ProcessSuspendController();
 
   final Pid pid;
   final Pid? parentPid;
@@ -130,11 +141,19 @@ class ProcessControlBlock {
   final CapabilityTable cspace;
   final ResourceQuota quota;
   final QuotaConsumption quotaUsage;
-  final VfsNamespace namespace;
+  VfsNamespace namespace;
   final JjTxContext jjContext;
   final VirtualContextMemory memory;
   final BoundedMailbox mailbox;
   final ProcessProfileId? profile;
+  String? jjWorkspaceName;
+  String? jjWorkspaceRoot;
+  final String? logicalTaskId;
+  final ProcessSuspendController suspendController;
+
+  /// Whether this process is backed by an isolated `.agent_os/ws/<pid>` Jujutsu workspace ([D-306]).
+  bool get hasIsolatedJjWorkspace =>
+      jjWorkspaceRoot != null && jjWorkspaceName != null;
 
   /// Alias matching audit log attribution naming ([D-215]).
   String get processName => name;

@@ -5,6 +5,7 @@ import 'package:agent_kernel/agent_kernel.dart';
 
 export 'fs_jj_drivers.dart';
 export 'llm_drivers.dart';
+export 'mcp_drivers.dart';
 export 'skill_drivers.dart';
 export 'src/exec/sys_exec_classifier.dart';
 export 'src/exec/win32_job_exec_driver.dart';

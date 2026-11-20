@@ -59,7 +59,12 @@
    - **対象範囲**:
      - 起点: `e:/programming/AI_generative/fm-agent-kernel`
      - 計画時点の基準製品範囲: `pubspec.yaml`, `pubspec.lock`, `analysis_options.yaml`, `mise.toml`, `packages/{agent_kernel,agent_drivers,agent_runtime,agent_acp}/{pubspec.yaml,lib/**,bin/**}`（commit `a5e8e5d383c85f764bceb7f302d96735b025e813` との差分 `0` 件）。
-     - 実装完了・受け入れ時（`WP-9` / `complete` 更新時）の対象範囲: 上記パッケージソース一式の最終不変 `jj` `commit_id`、および当該ソースからクリーン AOT ビルドされた全 3 実行ファイル（`build/agent_os_daemon.exe`, `build/acp_cli_client.exe`, `build/acp_kanban_app.exe`）の実バイトサイズ・SHA-256 ハッシュ。
+     - 実装完了・受け入れ時（`WP-9` 完了 / 2026-11-21 確定）の対象範囲:
+       - 実装完了ソース snapshot（`jj` change `yntvutmvkxkxukqswsttzosonkqrkrnm`, `WP-9` 完了時点 `commit_id`: `3d0ba22eeebf761757c55cf5764d898879e7029e`、製品ソース変更は `packages/{agent_kernel,agent_drivers,agent_runtime,agent_acp}/**` のみ、`pubspec.yaml` / `pubspec.lock` / `analysis_options.yaml` / `mise.toml` 変更 0 件）
+       - 当該ソースからクリーン AOT ビルドされた全 3 実行ファイルの実バイトサイズ・SHA-256 ハッシュ:
+         - `build/agent_os_daemon.exe` (`10085888` bytes): `a49b00bf3fc94d081f8bba05d4bd227e49c1216d918b4afe1928ced632eb60d4`
+         - `build/acp_cli_client.exe` (`6837248` bytes): `ceacde62d5f0874d0eea00836531ae2d3b2fd8cf53b2e8371d9233d9ba8a6de5`
+         - `build/acp_kanban_app.exe` (`7175168` bytes): `e69dcc3ce534933d75bee05bf504960f9bf88639c164d2ec5272c0ae050e6612`
    - **特定・照合方法**:
      - 可変な `change_id` 単独ではなく、不変の **`jj` `commit_id`（40 文字 hex）＋ `jj diff --from <baseline_or_target_commit_id> --to @` による製品ツリー未コミット差分 `0` 件確認 ＋ 上記計画正本 23 ファイルの実バイトサイズ・SHA-256 ハッシュ突合**（および受け入れ時は生成 `.exe` 全 3 本の SHA-256 突合）により read-only で独立照合する。
 
@@ -67,7 +72,7 @@
    - **対象範囲**: `packages/{agent_kernel,agent_drivers,agent_runtime,agent_acp}/test/**/*_test.dart`（および `WP-4` で追加する `packages/agent_drivers/test/fixtures/mock_stdio_mcp_server.dart` 等の検証用 pure-Dart Fixture）
    - **期待件数・出所 / 確認件数**:
      - 計画時点（Stage 2 完了版ベースライン）: 期待 `32` テストファイル（計 `175` テストケース：Stage 1 `101` 件 ＋ Stage 2 `74` 件） / 実測確認 `32` ファイル。
-     - Stage 3 実装完了・受け入れ時点（`WP-9` 完了時に更新）: Stage 2 既存 `175` 件の全件維持に加え、`WP-1`〜`WP-9` で追加された全 Stage 3 自動テストファイル数・総テスト件数・独立実行 pass 件数を記録する。
+     - Stage 3 実装完了・受け入れ時点（`WP-9` 完了 / 2026-11-21 確定）: **41 テストファイル**（`agent_kernel`: 11, `agent_drivers`: 13, `agent_runtime`: 9, `agent_acp`: 8）、**計 237 テストケース全件 pass**（Stage 1+2 既存 32 ファイル 175 件無修正維持 ＋ Stage 3 新規 9 ファイル 62 件、`0 fail / 0 skip`）。Fixture: `packages/agent_drivers/test/fixtures/mock_stdio_mcp_server.dart`。
    - **対象参照**: 計画基準版 `jj` `commit_id`: `a5e8e5d383c85f764bceb7f302d96735b025e813` 上の `packages/*/test/**`（受け入れ時は最終実装 `commit_id` 上の `packages/*/test/**` へ更新）。
    - **特記事項**:
      - 自動テストおよび実機 `E2` で生成するテスト用 `jj` リポジトリ・一時子ワークスペース・Swap ファイル・検証用 MCP サーバービルド物はすべて OS 一時ディレクトリまたは `.planworks/` 配下に隔離生成・削除し、本リポジトリを汚染しない（現在 `.planworks/` 残留 `0` 件を確認済み）。
@@ -84,3 +89,4 @@
 
 5. **変更履歴（ready以降）**:
    - `2026-11-20` / 初版 `r1` 策定（Lv.2 `fm-dev-plan`） / Stage 3 初回計画（Full tier）作成に伴い基準ソース版 `a5e8e5d383c85f764bceb7f302d96735b025e813`・既存テスト資産 32 ファイル（175 ケース）・計画および Cheatsheet 正本 23 ファイルの SHA-256 を記録 / 実装最終ゲート `WP-9` 完了・`acceptance` 引き渡し時に最終 `commit_id`・テスト総数・全 3 `.exe`（`agent_os_daemon.exe`, `acp_cli_client.exe`, `acp_kanban_app.exe`）の SHA-256 を本節へ追記すること / 影響を受ける試験結果: なし（Stage 3 実装未着手、Stage 1+2 175 件維持）
+   - `2026-11-21` / `WP-9` 完了・独立 `fm-dev-acceptance` 引き渡し（Lv.2 `fm-dev-implement`） / 実装完了 snapshot `3d0ba22eeebf761757c55cf5764d898879e7029e`、テスト資産 41 ファイル 237 件（既存 175 件無修正＋Stage 3 新規 62 件全 pass）、Fixture `packages/agent_drivers/test/fixtures/mock_stdio_mcp_server.dart`、およびクリーン AOT ビルド済み全 3 `.exe` の実バイトサイズ・SHA-256 を確定記録 / 影響を受ける試験結果: なし（全 237 件 pass 後に製品ソース変更 0 件）

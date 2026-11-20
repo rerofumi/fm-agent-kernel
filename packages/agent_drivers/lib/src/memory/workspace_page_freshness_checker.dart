@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:agent_kernel/agent_kernel.dart';
@@ -13,7 +14,8 @@ import '../jj/jj_driver.dart';
 /// - Never triggers a `jj` working-copy snapshot or advances `jj op log`.
 /// - Detects unsnapshotted external edits via `FileStat` + `SHA-256` (zero false negatives).
 /// - Keeps unaffected files `fresh` even when an unrelated file changes `@` `commit_id` (zero false positives).
-class WorkspacePageFreshnessChecker implements PageFreshnessChecker {
+class WorkspacePageFreshnessChecker
+    implements ProcessAwarePageFreshnessChecker {
   WorkspacePageFreshnessChecker({
     required this.namespace,
     this.jjDriver,
@@ -29,19 +31,27 @@ class WorkspacePageFreshnessChecker implements PageFreshnessChecker {
   @override
   Future<Map<String, PageFreshnessStatus>> checkFreshness(
     Iterable<ContextPage> cleanPages,
-  ) async {
+  ) =>
+      checkFreshnessForProcess(cleanPages);
+
+  @override
+  Future<Map<String, PageFreshnessStatus>> checkFreshnessForProcess(
+    Iterable<ContextPage> cleanPages, {
+    ProcessControlBlock? pcb,
+  }) async {
     final pages = cleanPages.where((p) => p.isClean).toList(growable: false);
     if (pages.isEmpty) {
       return const <String, PageFreshnessStatus>{};
     }
 
+    final effectiveNamespace = pcb?.namespace ?? namespace;
     String? cachedCommitId;
     var queriedCommitId = false;
 
     Future<String?> getCurrentCommitIdOnce() async {
       if (!queriedCommitId) {
         queriedCommitId = true;
-        cachedCommitId = await _resolveCurrentCommitIdNonDestructive();
+        cachedCommitId = await _resolveCurrentCommitIdNonDestructive(pcb: pcb);
       }
       return cachedCommitId;
     }
@@ -52,7 +62,10 @@ class WorkspacePageFreshnessChecker implements PageFreshnessChecker {
       switch (meta.sourceKind) {
         case CleanSourceKind.workspaceFile:
         case CleanSourceKind.skillFile:
-          result[page.pageId] = await _checkFileFreshness(meta);
+          result[page.pageId] = await _checkFileFreshness(
+            meta,
+            effectiveNamespace: effectiveNamespace,
+          );
         case CleanSourceKind.vcsSnapshot:
           final currentCommitId = await getCurrentCommitIdOnce();
           if (currentCommitId == null ||
@@ -70,14 +83,16 @@ class WorkspacePageFreshnessChecker implements PageFreshnessChecker {
   }
 
   Future<PageFreshnessStatus> _checkFileFreshness(
-    CleanPageSourceMeta meta,
-  ) async {
+    CleanPageSourceMeta meta, {
+    VfsNamespace? effectiveNamespace,
+  }) async {
     final virtualPath = meta.virtualPath;
     if (virtualPath == null || virtualPath.trim().isEmpty) {
       return PageFreshnessStatus.stale;
     }
 
-    final resolvedRes = namespace.resolveVirtualPath(
+    final ns = effectiveNamespace ?? namespace;
+    final resolvedRes = ns.resolveVirtualPath(
       virtualPath,
       allowRoot: false,
       checkProtected: true,
@@ -115,7 +130,41 @@ class WorkspacePageFreshnessChecker implements PageFreshnessChecker {
     }
   }
 
-  Future<String?> _resolveCurrentCommitIdNonDestructive() async {
+  Future<String?> _resolveCurrentCommitIdNonDestructive({
+    ProcessControlBlock? pcb,
+  }) async {
+    if (pcb != null && pcb.hasIsolatedJjWorkspace) {
+      if (jjDriver != null) {
+        return jjDriver!.getCurrentCommitIdForPcb(pcb);
+      }
+      try {
+        final result = await Process.run(
+          jjExecutable,
+          <String>[
+            '--no-pager',
+            '-R',
+            pcb.jjWorkspaceRoot!,
+            'log',
+            '--no-graph',
+            '-r',
+            '@',
+            '--ignore-working-copy',
+            '-T',
+            'commit_id',
+          ],
+          workingDirectory: namespace.workspaceHostRoot,
+          runInShell: false,
+          environment: JjDriver.buildNonInteractiveEnvironment(),
+        );
+        if (result.exitCode != 0) {
+          return null;
+        }
+        final commitId = (result.stdout as String).trim();
+        return commitId.isEmpty ? null : commitId;
+      } catch (_) {
+        return null;
+      }
+    }
     if (_currentCommitIdProvider != null) {
       try {
         final id = await _currentCommitIdProvider();
@@ -180,11 +229,13 @@ SyscallToolSchema buildMemPageinToolSchema() {
 
 final RegExp _pageIdPattern = RegExp(r'^pg_[0-9]+$');
 
-/// Builds the kernel `sys_mem_pagein` [SyscallDefinition] ([D-202], [D-208]).
+/// Builds the kernel `sys_mem_pagein` [SyscallDefinition] ([D-202], [D-208], [D-317]).
 SyscallDefinition buildMemPageinSyscallDefinition({
   required HostFsDriver hostFsDriver,
   JjDriver? jjDriver,
   PageFreshnessChecker? freshnessChecker,
+  DirtySwapBackend? dirtySwapBackend,
+  SecretRedactor? redactor,
 }) {
   return SyscallDefinition(
     name: 'sys_mem_pagein',
@@ -206,6 +257,17 @@ SyscallDefinition buildMemPageinSyscallDefinition({
       return null;
     },
     evaluatePolicy: (_, _) async => RingDecision.allow,
+    resultSummaryBuilder: (args, result) {
+      if (!result.ok || result.value == null) {
+        return null;
+      }
+      final val = result.value!;
+      return <String, dynamic>{
+        'pageId': val['pageId'],
+        'source': val['source'],
+        'wasStale': val['wasStale'] ?? false,
+      };
+    },
     handler: (execContext) async {
       final pageId = (execContext.args['pageId'] as String).trim();
       final memory = execContext.pcb.memory;
@@ -219,6 +281,44 @@ SyscallDefinition buildMemPageinSyscallDefinition({
             recoverable: true,
           ),
         );
+      }
+
+      final swapMeta = page.swapMeta;
+      if (swapMeta != null) {
+        if (dirtySwapBackend == null) {
+          return SyscallResult<Map<String, dynamic>>.failure(
+            SyscallError(
+              code: SyscallErrorCode.eio,
+              reason: 'DIRTY_SWAP_BACKEND_UNAVAILABLE',
+              message:
+                  'DirtySwapBackend is not configured to restore swapped page "$pageId".',
+              recoverable: false,
+            ),
+          );
+        }
+        final isSummary = pageId == swapMeta.summaryPageId;
+        final readRes = await dirtySwapBackend.readSwappedPages(
+          sessionId: execContext.context.sessionId,
+          pid: execContext.pcb.pid,
+          pcb: execContext.pcb,
+          pageId: isSummary ? null : pageId,
+          swapBatchId: isSummary ? swapMeta.swapBatchId : null,
+        );
+        if (!readRes.ok) {
+          return SyscallResult<Map<String, dynamic>>.failure(readRes.error!);
+        }
+        final records = readRes.value!;
+        final formatted = _formatSwappedRecords(records, redactor: redactor);
+        return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+          'pageId': pageId,
+          'source': 'dirty_swap',
+          'swapBatchId': swapMeta.swapBatchId,
+          'summaryPageId': swapMeta.summaryPageId,
+          'restoredPageIds':
+              records.map((r) => r.pageId).toList(growable: false),
+          'wasStale': false,
+          'content': formatted,
+        });
       }
 
       final meta = page.cleanSource;
@@ -278,9 +378,12 @@ SyscallDefinition buildMemPageinSyscallDefinition({
       // Determine whether the page was stale prior to reloading.
       var wasStale = page.freshness != PageFreshnessStatus.fresh;
       if (freshnessChecker != null) {
-        final freshMap = await freshnessChecker.checkFreshness(
-          <ContextPage>[page],
-        );
+        final freshMap = freshnessChecker is ProcessAwarePageFreshnessChecker
+            ? await freshnessChecker.checkFreshnessForProcess(
+                <ContextPage>[page],
+                pcb: execContext.pcb,
+              )
+            : await freshnessChecker.checkFreshness(<ContextPage>[page]);
         final latestStatus = freshMap[pageId];
         if (latestStatus != null) {
           wasStale = latestStatus != PageFreshnessStatus.fresh;
@@ -296,6 +399,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
                 meta.startLine ?? (meta.replayArgs['startLine'] as num?)?.toInt(),
             endLine:
                 meta.endLine ?? (meta.replayArgs['endLine'] as num?)?.toInt(),
+            namespaceOverride: execContext.pcb.namespace,
+            cspace: execContext.pcb.cspace,
           );
           if (!readRes.ok) {
             final err = readRes.error!;
@@ -334,7 +439,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
 
           return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
             'pageId': pageId,
-            'source': meta.virtualPath ?? meta.syscallName,
+            'source': 'clean_workspace',
+            'sourceTarget': meta.virtualPath ?? meta.syscallName,
             'syscallName': meta.syscallName,
             'wasStale': wasStale,
             'previousSha256': meta.readSha256,
@@ -349,6 +455,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
           final globRes = await hostFsDriver.glob(
             pattern: (meta.replayArgs['pattern'] as String?) ?? '*',
             subpath: meta.replayArgs['subpath'] as String?,
+            namespaceOverride: execContext.pcb.namespace,
+            callerPcb: execContext.pcb,
           );
           if (!globRes.ok) {
             return SyscallResult<Map<String, dynamic>>.failure(globRes.error!);
@@ -368,7 +476,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
 
           return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
             'pageId': pageId,
-            'source': meta.syscallName,
+            'source': 'clean_vcs',
+            'sourceTarget': meta.syscallName,
             'syscallName': meta.syscallName,
             'wasStale': wasStale,
             'previousCommitId': meta.readCommitId,
@@ -384,6 +493,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
             isRegex: (meta.replayArgs['isRegex'] as bool?) ?? false,
             caseSensitive: (meta.replayArgs['caseSensitive'] as bool?) ?? true,
             includeGlob: meta.replayArgs['includeGlob'] as String?,
+            namespaceOverride: execContext.pcb.namespace,
+            callerPcb: execContext.pcb,
           );
           if (!grepRes.ok) {
             return SyscallResult<Map<String, dynamic>>.failure(grepRes.error!);
@@ -403,7 +514,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
 
           return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
             'pageId': pageId,
-            'source': meta.syscallName,
+            'source': 'clean_vcs',
+            'sourceTarget': meta.syscallName,
             'syscallName': meta.syscallName,
             'wasStale': wasStale,
             'previousCommitId': meta.readCommitId,
@@ -415,6 +527,7 @@ SyscallDefinition buildMemPageinSyscallDefinition({
         case 'sys_jj_status':
         case 'sys_jj_log':
         case 'sys_jj_diff':
+        case 'sys_jj_conflicts':
           if (jjDriver == null) {
             return const SyscallResult<Map<String, dynamic>>.failure(
               SyscallError(
@@ -430,6 +543,7 @@ SyscallDefinition buildMemPageinSyscallDefinition({
             vcsRes = await jjDriver.status(
               atOp: meta.replayArgs['atOp'] as String?,
               forceIgnoreWorkingCopy: true,
+              repositoryPath: execContext.pcb.jjWorkspaceRoot,
             );
           } else if (meta.syscallName == 'sys_jj_log') {
             vcsRes = await jjDriver.log(
@@ -437,6 +551,13 @@ SyscallDefinition buildMemPageinSyscallDefinition({
               limit: (meta.replayArgs['limit'] as num?)?.toInt() ?? 20,
               atOp: meta.replayArgs['atOp'] as String?,
               forceIgnoreWorkingCopy: true,
+              repositoryPath: execContext.pcb.jjWorkspaceRoot,
+            );
+          } else if (meta.syscallName == 'sys_jj_conflicts') {
+            vcsRes = await jjDriver.inspectConflictsNonDestructive(
+              rev: (meta.replayArgs['rev'] as String?) ?? '@',
+              namespaceOverride: execContext.pcb.namespace,
+              repositoryPath: execContext.pcb.jjWorkspaceRoot,
             );
           } else {
             final rawPaths = meta.replayArgs['paths'];
@@ -448,6 +569,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
               paths: paths,
               atOp: meta.replayArgs['atOp'] as String?,
               forceIgnoreWorkingCopy: true,
+              namespaceOverride: execContext.pcb.namespace,
+              repositoryPath: execContext.pcb.jjWorkspaceRoot,
             );
           }
           if (!vcsRes.ok) {
@@ -469,7 +592,8 @@ SyscallDefinition buildMemPageinSyscallDefinition({
 
           return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
             'pageId': pageId,
-            'source': meta.syscallName,
+            'source': 'clean_vcs',
+            'sourceTarget': meta.syscallName,
             'syscallName': meta.syscallName,
             'wasStale': wasStale,
             'previousCommitId': meta.readCommitId,
@@ -503,4 +627,42 @@ CapRight _requiredRightForSource(CleanPageSourceMeta meta) {
       }
       return CapRight.vcsRead;
   }
+}
+
+String _formatSwappedRecords(
+  List<DirtySwapRecord> records, {
+  SecretRedactor? redactor,
+}) {
+  String redact(String s) => redactor == null ? s : redactor.redactString(s);
+  final buf = StringBuffer();
+  for (var i = 0; i < records.length; i++) {
+    final r = records[i];
+    if (i > 0) {
+      buf.writeln();
+    }
+    buf.write('[${r.pageId} | role=${r.turnType}');
+    if (r.toolName != null) {
+      buf.write(' | tool=${r.toolName}');
+    }
+    if (r.canonicalCallId != null) {
+      buf.write(' | callId=${r.canonicalCallId}');
+    }
+    if (r.isError) {
+      buf.write(' | isError=true');
+    }
+    buf.writeln(']');
+    if (r.thoughtText != null && r.thoughtText!.trim().isNotEmpty) {
+      buf.writeln('thought: ${redact(r.thoughtText!)}');
+    }
+    if (r.toolCalls.isNotEmpty) {
+      final redactedCalls = redactor == null
+          ? r.toolCalls
+          : redactor.redactJson(r.toolCalls);
+      buf.writeln('toolCalls: ${jsonEncode(redactedCalls)}');
+    }
+    if (r.content.isNotEmpty) {
+      buf.writeln(redact(r.content));
+    }
+  }
+  return buf.toString().trimRight();
 }

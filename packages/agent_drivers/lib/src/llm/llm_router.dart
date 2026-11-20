@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:agent_kernel/agent_kernel.dart';
 import 'package:http/http.dart' as http;
 
+import 'context_window_resolver.dart';
 import 'llm_env_loader.dart';
 import 'ollama_driver.dart';
 import 'openrouter_driver.dart';
@@ -117,10 +118,20 @@ SyscallDefinition buildLlmChatSyscallDefinition({
   ContextWindowSource? contextWindowSource,
   PageFreshnessChecker? freshnessChecker,
   ContextPager contextPager = const ContextPager(),
+  DirtySwapBackend? dirtySwapBackend,
   PagingReportObserver? onPagingReport,
   List<LlmHook> llmHooks = const <LlmHook>[],
 }) {
   final effectiveLlmHooks = List<LlmHook>.unmodifiable(llmHooks);
+  final effectivePager =
+      (dirtySwapBackend != null && contextPager.dirtySwapBackend == null)
+          ? ContextPager(
+              config: contextPager.config,
+              estimator: contextPager.estimator,
+              dirtySwapBackend: dirtySwapBackend,
+              dirtyPageSummarizer: contextPager.dirtyPageSummarizer,
+            )
+          : contextPager;
   var llmSeqCounter = 0;
   final lastModelByPid = <Pid, ModelIdentifier>{};
   final lastWindowSpecByPid = <Pid, ContextWindowSpec>{};
@@ -176,7 +187,19 @@ SyscallDefinition buildLlmChatSyscallDefinition({
       final isModelSwitch = prevModel != null && prevModel != model;
       final prevWindowSpec = lastWindowSpecByPid[pid];
 
-      // 1. Resolve effective context window ([D-203] §3.1(2), [D-204], [D-209]).
+      // 1. Resolve effective context window ([D-203] §3.1(2), [D-204], [D-209], [D-316]).
+      if (contextWindowSource is ContextWindowResolver &&
+          contextWindowSource.config.maxContextTokens != null) {
+        final capErr = contextWindowSource.validateMaxContextTokens(
+          systemInstruction: pcb.memory.systemSegment.pinned,
+          estimator: effectivePager.estimator,
+          reservedOutputTokens: maxTokens ?? 512,
+        );
+        if (capErr != null) {
+          return SyscallResult<Map<String, dynamic>>.failure(capErr);
+        }
+      }
+
       ContextWindowSpec? windowSpec;
       if (contextWindowSource != null) {
         final forceRefreshPs =
@@ -189,16 +212,19 @@ SyscallDefinition buildLlmChatSyscallDefinition({
         lastWindowSpecByPid[pid] = windowSpec;
       }
 
-      // 2. Refresh Clean Page freshness & perform Dynamic Frame Resizing ([D-207], [D-208], [D-209]).
+      // 2. Refresh Clean Page freshness & perform Dynamic Frame Resizing + Dirty Swap ([D-207]..[D-209], [D-316]).
       ContextPagingReport? pagingReport;
       if (windowSpec != null) {
-        final pagingRes = await contextPager.refreshAndPrepareFrame(
+        final pagingRes = await effectivePager.refreshAndPrepareFrame(
           memory: pcb.memory,
           targetModel: model,
           windowSpec: windowSpec,
           freshnessChecker: freshnessChecker,
           requestedMaxTokens: maxTokens,
           isModelSwitch: isModelSwitch,
+          pcb: pcb,
+          pid: pid,
+          sessionId: execContext.context.sessionId,
         );
         if (!pagingRes.ok) {
           final err = pagingRes.error!;
@@ -227,6 +253,10 @@ SyscallDefinition buildLlmChatSyscallDefinition({
               residentCleanPages: pcb.memory.pageTable.residentCleanPagesCount,
               evictedCleanPages: pcb.memory.pageTable.evictedCleanPagesCount,
               stalePagesCount: pcb.memory.pageTable.stalePagesCount,
+              swappedDirtyPagesInStep: 0,
+              swappedDirtyPagesTotal:
+                  pcb.memory.pageTable.swappedDirtyPagesTotal,
+              swappedTurnGroupsInStep: 0,
             ),
           );
           return SyscallResult<Map<String, dynamic>>.failure(err);
@@ -234,14 +264,15 @@ SyscallDefinition buildLlmChatSyscallDefinition({
         pagingReport = pagingRes.value!;
         onPagingReport?.call(pagingReport, pid: pid);
       } else if (freshnessChecker != null) {
-        await contextPager.refreshFreshness(
+        await effectivePager.refreshFreshness(
           pcb.memory,
           freshnessChecker: freshnessChecker,
+          pcb: pcb,
         );
       }
 
       final baselineEstimatedTokens =
-          contextPager.estimator.estimateMemoryHeuristicTotal(pcb.memory);
+          effectivePager.estimator.estimateMemoryHeuristicTotal(pcb.memory);
 
       var projected = projector.project(
         pcb.memory,
@@ -259,6 +290,12 @@ SyscallDefinition buildLlmChatSyscallDefinition({
           pcb.memory.pageTable.evictedCleanPagesCount;
       final stalePagesCount =
           pagingReport?.stalePagesCount ?? pcb.memory.pageTable.stalePagesCount;
+      final swappedDirtyPagesInStep =
+          pagingReport?.swappedDirtyPagesInStep ?? 0;
+      final swappedDirtyPagesTotal = pagingReport?.swappedDirtyPagesTotal ??
+          pcb.memory.pageTable.swappedDirtyPagesTotal;
+      final swappedTurnGroupsInStep =
+          pagingReport?.swappedTurnGroupsInStep ?? 0;
 
       // 3. Execute beforeLlmRequest hooks in FIFO registration order ([D-203] §3.1(4), [D-220]).
       // TCB invariant: Segment 0 and Segment 1 messages are strictly immutable; only ephemeral Segment 2 tail notes are allowed.
@@ -317,6 +354,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
                   residentCleanPages: residentCleanPages,
                   evictedCleanPages: evictedCleanPages,
                   stalePagesCount: stalePagesCount,
+                  swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+                  swappedDirtyPagesTotal: swappedDirtyPagesTotal,
+                  swappedTurnGroupsInStep: swappedTurnGroupsInStep,
                   requestDebug: <String, dynamic>{
                     'messageCount': projected.messages.length,
                     'toolsCount': projected.tools.length,
@@ -391,6 +431,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
             residentCleanPages: residentCleanPages,
             evictedCleanPages: evictedCleanPages,
             stalePagesCount: stalePagesCount,
+            swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+            swappedDirtyPagesTotal: swappedDirtyPagesTotal,
+            swappedTurnGroupsInStep: swappedTurnGroupsInStep,
             requestDebug: <String, dynamic>{
               'messageCount': projected.messages.length,
               'toolsCount': projected.tools.length,
@@ -430,6 +473,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
             residentCleanPages: residentCleanPages,
             evictedCleanPages: evictedCleanPages,
             stalePagesCount: stalePagesCount,
+            swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+            swappedDirtyPagesTotal: swappedDirtyPagesTotal,
+            swappedTurnGroupsInStep: swappedTurnGroupsInStep,
             requestDebug: <String, dynamic>{
               'messageCount': projected.messages.length,
               'toolsCount': projected.tools.length,
@@ -471,6 +517,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
             residentCleanPages: residentCleanPages,
             evictedCleanPages: evictedCleanPages,
             stalePagesCount: stalePagesCount,
+            swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+            swappedDirtyPagesTotal: swappedDirtyPagesTotal,
+            swappedTurnGroupsInStep: swappedTurnGroupsInStep,
           ),
         );
         return const SyscallResult<Map<String, dynamic>>.failure(err);
@@ -564,6 +613,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
                   residentCleanPages: residentCleanPages,
                   evictedCleanPages: evictedCleanPages,
                   stalePagesCount: stalePagesCount,
+                  swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+                  swappedDirtyPagesTotal: swappedDirtyPagesTotal,
+                  swappedTurnGroupsInStep: swappedTurnGroupsInStep,
                   requestDebug: <String, dynamic>{
                     'messageCount': projected.messages.length,
                     'toolsCount': projected.tools.length,
@@ -640,6 +692,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
           residentCleanPages: residentCleanPages,
           evictedCleanPages: evictedCleanPages,
           stalePagesCount: stalePagesCount,
+          swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+          swappedDirtyPagesTotal: swappedDirtyPagesTotal,
+          swappedTurnGroupsInStep: swappedTurnGroupsInStep,
           requestDebug: <String, dynamic>{
             'messageCount': projected.messages.length,
             'toolsCount': projected.tools.length,
@@ -690,6 +745,9 @@ SyscallDefinition buildLlmChatSyscallDefinition({
             'residentCleanPages': pagingReport.residentCleanPages,
             'evictedCleanPages': pagingReport.evictedCleanPages,
             'stalePagesCount': pagingReport.stalePagesCount,
+            'swappedDirtyPagesInStep': pagingReport.swappedDirtyPagesInStep,
+            'swappedDirtyPagesTotal': pagingReport.swappedDirtyPagesTotal,
+            'swappedTurnGroupsInStep': pagingReport.swappedTurnGroupsInStep,
           },
       });
     },

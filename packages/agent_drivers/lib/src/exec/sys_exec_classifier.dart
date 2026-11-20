@@ -208,7 +208,16 @@ class SysExecClassifier {
     required List<String> args,
     String? workingDir,
     int timeoutMs = 60000,
+    VfsNamespace? namespaceOverride,
   }) {
+    if (namespaceOverride != null && !identical(namespaceOverride, namespace)) {
+      return SysExecClassifier(namespace: namespaceOverride).classify(
+        command: command,
+        args: args,
+        workingDir: workingDir,
+        timeoutMs: timeoutMs,
+      );
+    }
     // Condition 5: Timeout within 120,000 ms.
     if (timeoutMs > maxAutoAllowTimeoutMs) {
       return const SysExecClassification(

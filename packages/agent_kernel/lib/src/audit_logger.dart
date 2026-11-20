@@ -150,6 +150,7 @@ class SyscallAuditRecord {
     required this.durationMs,
     this.jjChangeId,
     this.jjOpId,
+    this.resultSummary,
   });
 
   final int seq;
@@ -170,6 +171,7 @@ class SyscallAuditRecord {
   final int durationMs;
   final String? jjChangeId;
   final String? jjOpId;
+  final Map<String, dynamic>? resultSummary;
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
@@ -191,6 +193,7 @@ class SyscallAuditRecord {
       'durationMs': durationMs,
       'jjChangeId': jjChangeId,
       'jjOpId': jjOpId,
+      if (resultSummary != null) 'resultSummary': resultSummary,
     };
   }
 }
@@ -226,6 +229,9 @@ class LlmIoAuditRecord {
     this.residentCleanPages = 0,
     this.evictedCleanPages = 0,
     this.stalePagesCount = 0,
+    this.swappedDirtyPagesInStep = 0,
+    this.swappedDirtyPagesTotal = 0,
+    this.swappedTurnGroupsInStep = 0,
     this.requestDebug,
     this.responseDebug,
   });
@@ -258,6 +264,9 @@ class LlmIoAuditRecord {
   final int residentCleanPages;
   final int evictedCleanPages;
   final int stalePagesCount;
+  final int swappedDirtyPagesInStep;
+  final int swappedDirtyPagesTotal;
+  final int swappedTurnGroupsInStep;
   final Map<String, dynamic>? requestDebug;
   final Map<String, dynamic>? responseDebug;
 
@@ -291,6 +300,9 @@ class LlmIoAuditRecord {
       'residentCleanPages': residentCleanPages,
       'evictedCleanPages': evictedCleanPages,
       'stalePagesCount': stalePagesCount,
+      'swappedDirtyPagesInStep': swappedDirtyPagesInStep,
+      'swappedDirtyPagesTotal': swappedDirtyPagesTotal,
+      'swappedTurnGroupsInStep': swappedTurnGroupsInStep,
       if (requestDebug != null) 'requestDebug': requestDebug,
       if (responseDebug != null) 'responseDebug': responseDebug,
     };

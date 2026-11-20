@@ -49,6 +49,8 @@ class AcpServerConfig {
     this.jjExecutable = 'jj',
     this.skillsDirs = const <String>[],
     this.skillsDirEnv,
+    this.maxContextTokens,
+    this.mcpServers = const <McpServerSpec>[],
     this.bootstrapFactory,
   });
 
@@ -65,6 +67,12 @@ class AcpServerConfig {
 
   /// Captured `AGENT_OS_SKILLS_DIR` environment value for session skill loading ([D-203], [D-219]).
   final String? skillsDirEnv;
+
+  /// Optional session-wide effective context window cap (`--max-context-tokens`) ([D-316], [D-320]).
+  final int? maxContextTokens;
+
+  /// CLI `--mcp-server` specifications merged with `session/new` `mcpServers` ([D-303], [D-320]).
+  final List<McpServerSpec> mcpServers;
 
   final AcpBootstrapFactory? bootstrapFactory;
 }
@@ -156,6 +164,15 @@ class AcpServer {
       'session/prompt' => _onSessionPrompt(params),
       '_fm_agent_os/tx_rollback' => _onTxRollback(params),
       '_fm_agent_os/status' => _onStatus(params),
+      '_fm_agent_os/signal' => _onSignal(params),
+      '_fm_agent_os/processes' => _onProcesses(params),
+      '_fm_agent_os/stack_list' => _onStackList(params),
+      '_fm_agent_os/stack_create' => _onStackCreate(params),
+      '_fm_agent_os/stack_update' => _onStackUpdate(params),
+      '_fm_agent_os/stack_edit' => _onStackEdit(params),
+      '_fm_agent_os/stack_sync' => _onStackSync(params),
+      '_fm_agent_os/jj_diff' => _onJjDiff(params),
+      '_fm_agent_os/tx_squash' => _onTxSquash(params),
       _ => throw JsonRpcException(
           JsonRpcErrorCodes.methodNotFound,
           'Method not found: $method',
@@ -223,6 +240,34 @@ class AcpServer {
         'Invalid params: mcpServers must be a list.',
       );
     }
+    final sessionMcpSpecs = _parseSessionMcpServers(rawMcpServers as List?);
+    final mergedMcpServers = _mergeMcpServers(
+      cliSpecs: config.mcpServers,
+      sessionSpecs: sessionMcpSpecs,
+    );
+
+    int? sessionMaxContextTokens;
+    final rawNewMeta = params['_meta'];
+    if (rawNewMeta != null) {
+      if (rawNewMeta is! Map) {
+        throw const JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: _meta must be an object.',
+        );
+      }
+      final rawCap = rawNewMeta['fm_agent_os/maxContextTokens'];
+      if (rawCap != null) {
+        if (rawCap is! int || rawCap <= 0) {
+          throw const JsonRpcException(
+            JsonRpcErrorCodes.invalidParams,
+            'Invalid params: _meta["fm_agent_os/maxContextTokens"] must be a positive integer.',
+          );
+        }
+        sessionMaxContextTokens = rawCap;
+      }
+    }
+    final effectiveMaxContextTokens =
+        sessionMaxContextTokens ?? config.maxContextTokens;
 
     final trimmedCwd = rawCwd.trim();
     if (!p.isAbsolute(trimmedCwd)) {
@@ -272,6 +317,9 @@ class AcpServer {
       openRouterBaseUrl: config.openRouterBaseUrl,
       quota: ResourceQuota.stage2Default,
       enableStage2Multiprocess: true,
+      enableStage3Team: true,
+      maxContextTokens: effectiveMaxContextTokens,
+      mcpServers: mergedMcpServers,
       maxStepsPerTurn: config.maxStepsPerTurn,
       jjExecutable: config.jjExecutable,
       skillsDirs: config.skillsDirs,
@@ -286,9 +334,36 @@ class AcpServer {
       },
     );
 
-    bootstrap = config.bootstrapFactory != null
-        ? config.bootstrapFactory!(bootstrapConfig)
-        : KernelBootstrap.create(bootstrapConfig);
+    try {
+      bootstrap = config.bootstrapFactory != null
+          ? config.bootstrapFactory!(bootstrapConfig)
+          : KernelBootstrap.create(bootstrapConfig);
+    } on ArgumentError catch (e) {
+      throw JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        e.message?.toString() ?? 'Invalid session configuration.',
+        data: <String, dynamic>{
+          'code': 'EINVAL',
+          'reason': 'MAX_CONTEXT_TOKENS_TOO_SMALL',
+        },
+      );
+    }
+
+    if (mergedMcpServers.isNotEmpty) {
+      final mcpConnRes = await bootstrap.connectMcpServers(mergedMcpServers);
+      if (!mcpConnRes.ok) {
+        await bootstrap.dispose();
+        final err = mcpConnRes.error!;
+        final rpcCode = err.code == SyscallErrorCode.einval
+            ? JsonRpcErrorCodes.invalidParams
+            : JsonRpcErrorCodes.serverError;
+        throw JsonRpcException(
+          rpcCode,
+          bootstrap.redactor.redactString(err.message),
+          data: bootstrap.redactor.redactJson(err.toJson()),
+        );
+      }
+    }
 
     mapper = AcpEventMapper(
       sessionId: sessionId,
@@ -296,7 +371,9 @@ class AcpServer {
       namespace: bootstrap.namespace,
       jjContext: bootstrap.pcb.jjContext,
       redactor: bootstrap.redactor,
-      contextWindowSize: bootstrap.pcb.quota.maxTotalTokens ?? 32768,
+      contextWindowSize: effectiveMaxContextTokens ??
+          bootstrap.pcb.quota.maxTotalTokens ??
+          32768,
     );
 
     final eventSubscription =
@@ -400,6 +477,8 @@ class AcpServer {
     }
 
     String? modelOverride;
+    String? taskId;
+    var executionMode = 'single';
     final rawMeta = params['_meta'];
     if (rawMeta != null) {
       if (rawMeta is! Map) {
@@ -425,17 +504,130 @@ class AcpServer {
         }
         modelOverride = check.value!.canonicalId;
       }
+
+      final rawTaskId = rawMeta['fm_agent_os/taskId'];
+      if (rawTaskId != null) {
+        if (rawTaskId is! String || rawTaskId.trim().isEmpty) {
+          throw const JsonRpcException(
+            JsonRpcErrorCodes.invalidParams,
+            'Invalid params: _meta["fm_agent_os/taskId"] must be a non-empty string.',
+          );
+        }
+        taskId = rawTaskId.trim();
+      }
+
+      final rawExecMode = rawMeta['fm_agent_os/executionMode'];
+      if (rawExecMode != null) {
+        if (rawExecMode is! String ||
+            (rawExecMode != 'single' && rawExecMode != 'parallel_team')) {
+          throw const JsonRpcException(
+            JsonRpcErrorCodes.invalidParams,
+            'Invalid params: _meta["fm_agent_os/executionMode"] must be "single" or "parallel_team".',
+          );
+        }
+        executionMode = rawExecMode;
+      }
+    }
+
+    StackedTaskNode? boundTask;
+    if (taskId != null) {
+      final stackMgr = session.bootstrap.stackedTaskManager;
+      boundTask = stackMgr?.registry.getByTaskId(taskId);
+      if (boundTask == null) {
+        throw JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'ENOENT: TASK_NOT_FOUND: Task "$taskId" was not found.',
+          data: const <String, dynamic>{
+            'code': 'ENOENT',
+            'reason': 'TASK_NOT_FOUND',
+          },
+        );
+      }
+    }
+
+    final dynamicContextParts = <String>[];
+    final mcpSummary = session.bootstrap.renderDynamicContextSummary();
+    if (mcpSummary.isNotEmpty) {
+      dynamicContextParts.add(mcpSummary);
+    }
+    if (boundTask != null) {
+      dynamicContextParts.add(
+        '[StackedTask Context] Bound to task "${boundTask.taskId}" '
+        '(workspace="${boundTask.workspaceName}", workingChangeId="${boundTask.workingChangeId}"). '
+        'Direct file edits apply inside this task workspace. '
+        'If you spawn WorkspaceWorker children, integrate their completed Change IDs into this task '
+        'using sys_task_stack(action: "integrate_worker", taskId: "${boundTask.taskId}", workerChangeIds: [...]).',
+      );
+    }
+    if (executionMode == 'parallel_team') {
+      dynamicContextParts.add(
+        '[Execution Mode: parallel_team] Decompose the request into independent subtasks, '
+        'spawn multiple WorkspaceWorker children via sys_spawn, await them with sys_wait, '
+        '${boundTask != null ? 'integrate their changes with sys_task_stack(action: "integrate_worker", taskId: "${boundTask.taskId}", workerChangeIds: [...])' : 'merge and integrate their changes with sys_jj_merge + sys_jj_integrate'}, '
+        'and verify tests pass.',
+      );
+    }
+    final dynamicContextSummary = dynamicContextParts.isEmpty
+        ? null
+        : dynamicContextParts.join('\n');
+
+    final origNamespace = session.bootstrap.pcb.namespace;
+    final origWsName = session.bootstrap.pcb.jjWorkspaceName;
+    final origWsRoot = session.bootstrap.pcb.jjWorkspaceRoot;
+    final origWorkingChangeId =
+        session.bootstrap.pcb.jjContext.workingChangeId;
+
+    if (boundTask != null) {
+      boundTask.state = StackedTaskState.running;
+      boundTask.activePid = 1;
+      session.bootstrap.pcb.namespace = VfsNamespace(
+        workspaceHostRoot: boundTask.workspaceRoot,
+        skillsMount: origNamespace.skillsMount,
+      );
+      session.bootstrap.pcb.jjWorkspaceName = boundTask.workspaceName;
+      session.bootstrap.pcb.jjWorkspaceRoot = boundTask.workspaceRoot;
+      session.bootstrap.pcb.jjContext.workingChangeId =
+          boundTask.workingChangeId;
+      session.mapper.emitTeamEvent(<String, dynamic>{
+        'kind': 'task_started',
+        'task': boundTask.toJson(),
+      });
     }
 
     session.isPromptActive = true;
-    final AgentTurnResult result;
+    AgentTurnResult? result;
     try {
       result = await session.bootstrap.processRunner.submitPrompt(
         userInput: userInput,
+        dynamicContextSummary: dynamicContextSummary,
         modelOverride: modelOverride,
       );
     } finally {
       session.isPromptActive = false;
+      if (boundTask != null) {
+        session.bootstrap.pcb.namespace = origNamespace;
+        session.bootstrap.pcb.jjWorkspaceName = origWsName;
+        session.bootstrap.pcb.jjWorkspaceRoot = origWsRoot;
+        session.bootstrap.pcb.jjContext.workingChangeId = origWorkingChangeId;
+
+        final stackMgr = session.bootstrap.stackedTaskManager!;
+        final syncRes = await stackMgr.syncTasks(taskId: boundTask.taskId);
+        boundTask.activePid = null;
+        if (session.bootstrap.pcb.state != ProcessState.stopped) {
+          if (result == null || !result.ok) {
+            boundTask.state = StackedTaskState.failed;
+          } else if (boundTask.hasConflicts) {
+            boundTask.state = StackedTaskState.conflict;
+          } else {
+            boundTask.state = StackedTaskState.review;
+          }
+        }
+        session.mapper.emitTeamEvent(<String, dynamic>{
+          'kind': 'task_completed',
+          'task': boundTask.toJson(),
+          if (syncRes.ok) 'cascadedTasks': syncRes.value!['cascadedTasks'],
+        });
+      }
     }
 
     final jjInfo = await session.bootstrap.jjDriver.getAuditInfo();
@@ -594,6 +786,632 @@ class AcpServer {
         session.bootstrap.pcb.memory,
       ),
     };
+  }
+
+  Future<Map<String, dynamic>> _onSignal(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final rawSignal = params['signal'];
+    if (rawSignal is! String || rawSignal.trim().isEmpty) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: signal must be "SIGSTOP", "SIGCONT", or "SIGKILL".',
+      );
+    }
+    final signalKind = ProcessSignalKind.tryParse(rawSignal.trim());
+    if (signalKind == null) {
+      throw JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: unsupported signal "$rawSignal".',
+      );
+    }
+
+    final rawPid = params['pid'];
+    if (rawPid != null && (rawPid is! int || rawPid < 1)) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: pid must be a positive integer.',
+      );
+    }
+
+    final rawTaskId = params['taskId'];
+    final taskId = (rawTaskId is String && rawTaskId.trim().isNotEmpty)
+        ? rawTaskId.trim()
+        : null;
+    final rawConstraint = params['constraintMessage'];
+    if (rawConstraint != null && rawConstraint is! String) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: constraintMessage must be a string.',
+      );
+    }
+    final constraintMessage = (rawConstraint as String?)?.trim();
+    final cascadeChildren = (params['cascadeChildren'] as bool?) ?? true;
+
+    StackedTaskNode? taskNode;
+    if (taskId != null) {
+      taskNode = session.bootstrap.stackedTaskManager?.registry.getByTaskId(
+        taskId,
+      );
+    }
+    final targetPid = rawPid as int? ?? taskNode?.activePid ?? 1;
+
+    final workerHost = session.bootstrap.workerHost;
+    final affectedPids = <int>[targetPid];
+
+    if (targetPid == 1) {
+      final rootPcb = session.bootstrap.pcb;
+      switch (signalKind) {
+        case ProcessSignalKind.sigstop:
+          rootPcb.suspendController.requestStop(reason: 'ACP SIGSTOP');
+          if (rootPcb.state == ProcessState.running ||
+              rootPcb.state == ProcessState.waitingSyscall ||
+              rootPcb.state == ProcessState.waitingApproval) {
+            rootPcb.state = ProcessState.stopped;
+          }
+          if (taskNode != null) {
+            taskNode.state = StackedTaskState.paused;
+          }
+        case ProcessSignalKind.sigcont:
+          rootPcb.suspendController.requestContinue(
+            constraintMessage:
+                (constraintMessage != null && constraintMessage.isNotEmpty)
+                    ? constraintMessage
+                    : null,
+          );
+          if (rootPcb.state == ProcessState.stopped) {
+            rootPcb.state = ProcessState.running;
+          }
+          if (taskNode != null && taskNode.state == StackedTaskState.paused) {
+            taskNode.state = StackedTaskState.running;
+          }
+        case ProcessSignalKind.sigkill:
+          await session.bootstrap.processRunner
+              .killActiveTurnAndTree('ACP SIGKILL');
+          if (taskNode != null) {
+            taskNode.state = StackedTaskState.failed;
+            taskNode.activePid = null;
+          }
+      }
+      if (workerHost != null) {
+        if (cascadeChildren && signalKind != ProcessSignalKind.sigkill) {
+          for (final proc in workerHost.snapshotProcesses()) {
+            final cPid = proc['pid'] as int?;
+            final cState = proc['state'] as String?;
+            if (cPid != null &&
+                cState != 'terminated' &&
+                cState != 'failed') {
+              affectedPids.add(cPid);
+            }
+          }
+        }
+        await workerHost.sendSignal(
+          targetPid: 1,
+          signal: signalKind,
+          constraintMessage:
+              (constraintMessage != null && constraintMessage.isNotEmpty)
+                  ? constraintMessage
+                  : null,
+          reason: 'ACP ${signalKind.wireValue}',
+          cascadeChildren: cascadeChildren,
+        );
+      }
+      if (signalKind == ProcessSignalKind.sigstop &&
+          rootPcb.suspendController.isSuspended) {
+        rootPcb.state = ProcessState.stopped;
+      } else if (signalKind == ProcessSignalKind.sigcont &&
+          rootPcb.state == ProcessState.stopped) {
+        rootPcb.state = ProcessState.running;
+      }
+    } else {
+      if (workerHost == null) {
+        throw const JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'No child worker host available for target pid.',
+        );
+      }
+      await workerHost.sendSignal(
+        targetPid: targetPid,
+        signal: signalKind,
+        constraintMessage:
+            (constraintMessage != null && constraintMessage.isNotEmpty)
+                ? constraintMessage
+                : null,
+        reason: 'ACP ${signalKind.wireValue}',
+        cascadeChildren: cascadeChildren,
+      );
+    }
+
+    session.mapper.emitTeamEvent(<String, dynamic>{
+      'kind': 'signal',
+      'signal': signalKind.wireValue,
+      'targetPid': targetPid,
+      'affectedPids': affectedPids,
+      'leadState': session.bootstrap.pcb.state.name,
+      'taskId': ?taskId,
+    });
+
+    return <String, dynamic>{
+      'ok': true,
+      'signal': signalKind.wireValue,
+      'affectedPids': affectedPids,
+      'leadState': session.bootstrap.pcb.state.name,
+    };
+  }
+
+  Future<Map<String, dynamic>> _onProcesses(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final jjInfo = await session.bootstrap.jjDriver.getAuditInfo();
+    final rootPcb = session.bootstrap.pcb;
+    final children =
+        session.bootstrap.workerHost?.snapshotProcesses() ?? const <Map<String, dynamic>>[];
+
+    return <String, dynamic>{
+      'lead': <String, dynamic>{
+        'pid': rootPcb.pid,
+        'state': rootPcb.state.name,
+        'isSuspended': rootPcb.suspendController.isSuspended,
+        'jjChangeId': jjInfo.jjChangeId,
+        'jjOpId': jjInfo.jjOpId,
+      },
+      'processes': children,
+    };
+  }
+
+  Future<Map<String, dynamic>> _onStackList(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final stackMgr = _requireStackedTaskManager(session);
+    final res = await stackMgr.listTasks();
+    if (!res.ok) {
+      _throwSyscallRpcError(session, res.error!);
+    }
+    return res.value!;
+  }
+
+  Future<Map<String, dynamic>> _onStackCreate(
+    Map<String, dynamic> params,
+  ) async {
+    final session = _requireSession(params);
+    final stackMgr = _requireStackedTaskManager(session);
+    final title = params['title'];
+    if (title is! String || title.trim().isEmpty) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: title must be a non-empty string.',
+      );
+    }
+    final res = await stackMgr.createTask(
+      taskId: params['taskId'] as String?,
+      title: title,
+      description: (params['description'] as String?) ?? '',
+      parentTaskId: params['parentTaskId'] as String?,
+      baseChangeId: params['baseChangeId'] as String?,
+      model: params['model'] as String?,
+    );
+    if (!res.ok) {
+      _throwSyscallRpcError(session, res.error!);
+    }
+    session.mapper.emitTeamEvent(<String, dynamic>{
+      'kind': 'stack_created',
+      'task': res.value!['task'],
+    });
+    return res.value!;
+  }
+
+  Future<Map<String, dynamic>> _onStackUpdate(
+    Map<String, dynamic> params,
+  ) async {
+    final session = _requireSession(params);
+    final stackMgr = _requireStackedTaskManager(session);
+    final rawTaskId = params['taskId'];
+    if (rawTaskId is! String || rawTaskId.trim().isEmpty) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: taskId must be a non-empty string.',
+      );
+    }
+    final node = stackMgr.registry.getByTaskId(rawTaskId.trim());
+    if (node == null) {
+      _throwSyscallRpcError(
+        session,
+        SyscallError(
+          code: SyscallErrorCode.enoent,
+          reason: 'TASK_NOT_FOUND',
+          message: 'Task "${rawTaskId.trim()}" was not found.',
+        ),
+      );
+    }
+
+    final rawModel = params['model'];
+    if (rawModel != null) {
+      if (rawModel is! String || rawModel.trim().isEmpty) {
+        throw const JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: model must be a non-empty string.',
+        );
+      }
+      final check = ModelIdentifier.parse(rawModel.trim());
+      if (!check.ok) {
+        throw JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          check.error!.message,
+        );
+      }
+      node.assignedModel = check.value!.canonicalId;
+    }
+
+    final rawState = params['state'];
+    if (rawState != null) {
+      if (rawState is! String || rawState.trim().isEmpty) {
+        throw const JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: state must be a non-empty string.',
+        );
+      }
+      final parsedState = StackedTaskState.tryParse(rawState);
+      if (parsedState == null) {
+        throw JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: unknown StackedTaskState "$rawState".',
+        );
+      }
+      node.state = parsedState;
+    }
+
+    final rawTitle = params['title'];
+    if (rawTitle is String && rawTitle.trim().isNotEmpty) {
+      node.title = rawTitle.trim();
+    }
+    final rawDesc = params['description'];
+    if (rawDesc is String) {
+      node.description = rawDesc;
+    }
+
+    session.mapper.emitTeamEvent(<String, dynamic>{
+      'kind': 'stack_updated',
+      'task': node.toJson(),
+    });
+    return <String, dynamic>{'task': node.toJson()};
+  }
+
+  Future<Map<String, dynamic>> _onStackEdit(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final stackMgr = _requireStackedTaskManager(session);
+    final taskId = params['taskId'];
+    final relativePath = params['relativePath'];
+    final content = params['content'];
+    if (taskId is! String ||
+        taskId.trim().isEmpty ||
+        relativePath is! String ||
+        relativePath.trim().isEmpty ||
+        content is! String) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: taskId, relativePath, and content are required.',
+      );
+    }
+
+    var expectedSha256 = params['expectedSha256'] as String?;
+    if (expectedSha256 == null) {
+      final node = stackMgr.registry.getByTaskId(taskId.trim());
+      if (node != null) {
+        final cleanRel = relativePath.replaceAll('\\', '/').trim();
+        final virtualPath =
+            cleanRel.startsWith('/workspace/') ? cleanRel : '/workspace/$cleanRel';
+        final taskNs = VfsNamespace(workspaceHostRoot: node.workspaceRoot);
+        final readRes = await session.bootstrap.hostFsDriver.readLines(
+          path: virtualPath,
+          startLine: 1,
+          endLine: 1,
+          namespaceOverride: taskNs,
+        );
+        if (readRes.ok && readRes.value != null) {
+          expectedSha256 = readRes.value!['sha256'] as String?;
+        }
+      }
+    }
+
+    final res = await stackMgr.editTaskFile(
+      taskId: taskId.trim(),
+      relativePath: relativePath.trim(),
+      content: content,
+      expectedSha256: expectedSha256,
+    );
+    if (!res.ok) {
+      _throwSyscallRpcError(session, res.error!);
+    }
+
+    session.mapper.emitTeamEvent(<String, dynamic>{
+      'kind': 'stack_edited',
+      'task': res.value!['task'],
+      'cascadedTasks': res.value!['cascadedTasks'],
+    });
+    return <String, dynamic>{
+      'task': res.value!['task'],
+      'cascadedTasks': res.value!['cascadedTasks'],
+      'jjOpId': res.value!['jjOpId'],
+    };
+  }
+
+  Future<Map<String, dynamic>> _onStackSync(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final stackMgr = _requireStackedTaskManager(session);
+    final rawTaskId = params['taskId'];
+    if (rawTaskId != null && rawTaskId is! String) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: taskId must be a string.',
+      );
+    }
+    final res = await stackMgr.syncTasks(taskId: rawTaskId as String?);
+    if (!res.ok) {
+      _throwSyscallRpcError(session, res.error!);
+    }
+    session.mapper.emitTeamEvent(<String, dynamic>{
+      'kind': 'stack_synced',
+      'cascadedTasks': res.value!['cascadedTasks'],
+    });
+    return res.value!;
+  }
+
+  Future<Map<String, dynamic>> _onJjDiff(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final rawTaskId = params['taskId'];
+    final rawRev = params['rev'];
+    if (rawTaskId is String && rawTaskId.trim().isNotEmpty) {
+      final stackMgr = _requireStackedTaskManager(session);
+      final node = stackMgr.registry.getByTaskId(rawTaskId.trim());
+      if (node == null) {
+        _throwSyscallRpcError(
+          session,
+          SyscallError(
+            code: SyscallErrorCode.enoent,
+            reason: 'TASK_NOT_FOUND',
+            message: 'Task "${rawTaskId.trim()}" was not found.',
+          ),
+        );
+      }
+      final diffRes = await session.bootstrap.jjDriver.diffForTask(
+        taskNode: node,
+      );
+      if (!diffRes.ok) {
+        _throwSyscallRpcError(session, diffRes.error!);
+      }
+      return <String, dynamic>{
+        'rev': node.workingChangeId,
+        'diff': diffRes.value!,
+        'hasConflicts': node.hasConflicts,
+        'conflictedFiles': List<String>.from(node.conflictedFiles),
+      };
+    }
+
+    final rev =
+        (rawRev is String && rawRev.trim().isNotEmpty) ? rawRev.trim() : '@';
+    final diffRes = await session.bootstrap.jjDriver.diff(rev: rev);
+    if (!diffRes.ok) {
+      _throwSyscallRpcError(session, diffRes.error!);
+    }
+    final confRes =
+        await session.bootstrap.jjDriver.inspectConflictsNonDestructive(
+      rev: rev,
+    );
+    final confMap = confRes.ok ? confRes.value! : const <String, dynamic>{};
+    return <String, dynamic>{
+      ...diffRes.value!,
+      'hasConflicts': confMap['hasConflicts'] ?? false,
+      'conflictedFiles': confMap['files'] ?? const <String>[],
+    };
+  }
+
+  Future<Map<String, dynamic>> _onTxSquash(Map<String, dynamic> params) async {
+    final session = _requireSession(params);
+    final rawTaskId = params['taskId'];
+    final rawMessage = params['message'];
+    if (rawMessage != null && rawMessage is! String) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        'Invalid params: message must be a string.',
+      );
+    }
+
+    StackedTaskNode? taskNode;
+    if (rawTaskId is String && rawTaskId.trim().isNotEmpty) {
+      final stackMgr = _requireStackedTaskManager(session);
+      taskNode = stackMgr.registry.getByTaskId(rawTaskId.trim());
+      if (taskNode == null) {
+        _throwSyscallRpcError(
+          session,
+          SyscallError(
+            code: SyscallErrorCode.enoent,
+            reason: 'TASK_NOT_FOUND',
+            message: 'Task "${rawTaskId.trim()}" was not found.',
+          ),
+        );
+      }
+      if (taskNode.hasConflicts) {
+        _throwSyscallRpcError(
+          session,
+          SyscallError(
+            code: SyscallErrorCode.econflict,
+            reason: 'UNRESOLVED_CONFLICTS',
+            message:
+                'Task "${taskNode.taskId}" still has unresolved conflicts: ${taskNode.conflictedFiles.join(', ')}.',
+          ),
+        );
+      }
+    }
+
+    final res = await session.bootstrap.syscallGate.invoke(
+      SyscallContext(
+        pid: session.bootstrap.pcb.pid,
+        capHandle: session.bootstrap.capHandle,
+        sessionId: session.sessionId,
+      ),
+      SyscallRequest(
+        name: 'sys_tx_squash',
+        args: <String, dynamic>{
+          if (rawMessage is String && rawMessage.trim().isNotEmpty)
+            'message': rawMessage.trim(),
+        },
+      ),
+    );
+    if (!res.ok) {
+      _throwSyscallRpcError(session, res.error!);
+    }
+    if (taskNode != null) {
+      taskNode.state = StackedTaskState.done;
+      session.mapper.emitTeamEvent(<String, dynamic>{
+        'kind': 'stack_squashed',
+        'task': taskNode.toJson(),
+      });
+    }
+    return <String, dynamic>{
+      ...res.value!,
+      if (taskNode != null) 'task': taskNode.toJson(),
+    };
+  }
+
+  StackedTaskManager _requireStackedTaskManager(_AcpSession session) {
+    final mgr = session.bootstrap.stackedTaskManager;
+    if (mgr == null) {
+      throw const JsonRpcException(
+        JsonRpcErrorCodes.serverError,
+        'StackedTaskManager is not enabled on this session.',
+      );
+    }
+    return mgr;
+  }
+
+  Never _throwSyscallRpcError(_AcpSession session, SyscallError err) {
+    final rpcCode = err.code == SyscallErrorCode.einval
+        ? JsonRpcErrorCodes.invalidParams
+        : JsonRpcErrorCodes.serverError;
+    throw JsonRpcException(
+      rpcCode,
+      session.bootstrap.redactor.redactString(err.message),
+      data: session.bootstrap.redactor.redactJson(err.toJson()),
+    );
+  }
+
+  static List<McpServerSpec> _parseSessionMcpServers(List<dynamic>? rawList) {
+    if (rawList == null || rawList.isEmpty) {
+      return const <McpServerSpec>[];
+    }
+    final seenNames = <String>{};
+    final specs = <McpServerSpec>[];
+    for (final item in rawList) {
+      if (item is! Map) {
+        throw const JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: each mcpServers entry must be an object.',
+        );
+      }
+      final map = Map<String, dynamic>.from(item);
+      final rawType = map['type'];
+      final transportType = rawType == null
+          ? 'stdio'
+          : (rawType is String ? rawType.trim().toLowerCase() : '');
+      if (transportType != 'stdio') {
+        throw JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: unsupported MCP transport "$rawType"; only "stdio" is supported.',
+          data: const <String, dynamic>{
+            'code': 'EINVAL',
+            'reason': 'UNSUPPORTED_MCP_TRANSPORT',
+          },
+        );
+      }
+      final rawName = map['name'];
+      final rawCommand = map['command'];
+      if (rawName is! String ||
+          rawName.trim().isEmpty ||
+          rawCommand is! String ||
+          rawCommand.trim().isEmpty) {
+        throw const JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'Invalid params: mcpServers entries require non-empty "name" and "command".',
+        );
+      }
+      final name = rawName.trim();
+      if (!seenNames.add(name)) {
+        throw JsonRpcException(
+          JsonRpcErrorCodes.invalidParams,
+          'EINVAL: DUPLICATE_MCP_SERVER_NAME: Duplicate MCP server name "$name".',
+          data: const <String, dynamic>{
+            'code': 'EINVAL',
+            'reason': 'DUPLICATE_MCP_SERVER_NAME',
+          },
+        );
+      }
+      final args = <String>[];
+      final rawArgs = map['args'];
+      if (rawArgs != null) {
+        if (rawArgs is! List) {
+          throw const JsonRpcException(
+            JsonRpcErrorCodes.invalidParams,
+            'Invalid params: mcpServers[].args must be a list of strings.',
+          );
+        }
+        for (final arg in rawArgs) {
+          if (arg is! String) {
+            throw const JsonRpcException(
+              JsonRpcErrorCodes.invalidParams,
+              'Invalid params: mcpServers[].args entries must be strings.',
+            );
+          }
+          args.add(arg);
+        }
+      }
+      final env = <McpEnvVar>[];
+      final rawEnv = map['env'];
+      if (rawEnv != null) {
+        if (rawEnv is! List) {
+          throw const JsonRpcException(
+            JsonRpcErrorCodes.invalidParams,
+            'Invalid params: mcpServers[].env must be a list.',
+          );
+        }
+        for (final entry in rawEnv) {
+          if (entry is! Map) {
+            throw const JsonRpcException(
+              JsonRpcErrorCodes.invalidParams,
+              'Invalid params: mcpServers[].env entries must be objects.',
+            );
+          }
+          final eName = entry['name'];
+          final eVal = entry['value'];
+          if (eName is! String || eName.trim().isEmpty || eVal is! String) {
+            throw const JsonRpcException(
+              JsonRpcErrorCodes.invalidParams,
+              'Invalid params: mcpServers[].env entries require non-empty "name" and string "value".',
+            );
+          }
+          env.add(McpEnvVar(name: eName.trim(), value: eVal));
+        }
+      }
+      specs.add(
+        McpServerSpec(
+          name: name,
+          command: rawCommand.trim(),
+          args: args,
+          env: env,
+        ),
+      );
+    }
+    return specs;
+  }
+
+  static List<McpServerSpec> _mergeMcpServers({
+    required List<McpServerSpec> cliSpecs,
+    required List<McpServerSpec> sessionSpecs,
+  }) {
+    final byName = <String, McpServerSpec>{};
+    for (final spec in cliSpecs) {
+      byName[spec.name.trim()] = spec;
+    }
+    for (final spec in sessionSpecs) {
+      byName[spec.name.trim()] = spec;
+    }
+    return byName.values.toList(growable: false);
   }
 
   _AcpSession _requireSession(Map<String, dynamic> params) {

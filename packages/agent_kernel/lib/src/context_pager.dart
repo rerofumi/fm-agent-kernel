@@ -2,8 +2,11 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'audit_logger.dart';
 import 'context_memory.dart';
+import 'dirty_swap.dart';
 import 'llm_driver.dart';
+import 'pcb.dart';
 import 'syscall_error.dart';
 
 /// Classification of a page tracked in [PageTable] ([D-206]).
@@ -132,6 +135,7 @@ class ContextPage {
     this.originalTokens,
     this.cleanSource,
     this.freshness = PageFreshnessStatus.fresh,
+    this.swapMeta,
   });
 
   /// Deterministic page identifier: `"pg_0000"` for Segment 0, `"pg_0001"`+ for Segment 1.
@@ -142,19 +146,20 @@ class ContextPage {
   final int segmentIndex;
 
   /// Zero-based index inside [AppendOnlyHistorySegment.turns] when [segmentIndex] == 1.
-  final int? historyTurnIndex;
+  int? historyTurnIndex;
   final int createdAtTurn;
   int lastReferencedTurn;
   int referenceCount = 1;
   final bool dirty;
   bool pinned;
 
-  /// `true` when full payload is resident; `false` after mechanical stub eviction.
+  /// `true` when full payload is resident; `false` after mechanical stub eviction or Dirty Swap.
   bool resident;
   int estimatedTokens;
   final int? originalTokens;
   CleanPageSourceMeta? cleanSource;
   PageFreshnessStatus freshness;
+  DirtySwapMeta? swapMeta;
 
   /// Returns true if this page is a valid Clean Page backed by reproducible source metadata.
   bool get isClean => !dirty && cleanSource != null;
@@ -175,6 +180,25 @@ class PageTable {
   final Map<String, ContextPage> _byId = <String, ContextPage>{};
   final Map<int, ContextPage> _byHistoryIndex = <int, ContextPage>{};
   int _nextHistorySeq = 1;
+  int _nextSwapSeq = 1;
+  int _swappedDirtyPagesTotal = 0;
+
+  /// Cumulative count of Dirty Pages evicted to Swap Store in this session ([D-305]).
+  int get swappedDirtyPagesTotal => _swappedDirtyPagesTotal;
+
+  /// Allocates the next monotonically increasing history page ID (`pg_XXXX`).
+  String allocateNextPageId() {
+    final pageId = 'pg_${_nextHistorySeq.toString().padLeft(4, '0')}';
+    _nextHistorySeq += 1;
+    return pageId;
+  }
+
+  /// Allocates the next monotonically increasing Dirty Swap batch ID (`swap_XXXX`).
+  String allocateNextSwapBatchId() {
+    final batchId = 'swap_${_nextSwapSeq.toString().padLeft(4, '0')}';
+    _nextSwapSeq += 1;
+    return batchId;
+  }
 
   /// Unmodifiable chronological list of all tracked pages.
   UnmodifiableListView<ContextPage> get pages =>
@@ -305,6 +329,72 @@ class PageTable {
     });
     return candidates;
   }
+
+  /// Synchronizes [PageTable] after collapsing `[startTurnIndex .. endTurnIndexInclusive]`
+  /// into a single `SummaryPage` ([D-317]).
+  ContextPage applyDirtySwapSummary({
+    required int startTurnIndex,
+    required int endTurnIndexInclusive,
+    required int currentTurn,
+    required String swapBatchId,
+    required String summaryPageId,
+    required Pid pid,
+    required int summaryEstimatedTokens,
+  }) {
+    final removedCount = endTurnIndexInclusive - startTurnIndex;
+    final swapMeta = DirtySwapMeta(
+      swapBatchId: swapBatchId,
+      summaryPageId: summaryPageId,
+      pid: pid,
+    );
+    var swappedInBatch = 0;
+
+    for (final page in _pages) {
+      final idx = page.historyTurnIndex;
+      if (page.segmentIndex != 1 || idx == null) {
+        continue;
+      }
+      if (idx >= startTurnIndex && idx <= endTurnIndexInclusive) {
+        page.resident = false;
+        page.estimatedTokens = 0;
+        page.historyTurnIndex = null;
+        page.swapMeta = swapMeta;
+        swappedInBatch += 1;
+      } else if (idx > endTurnIndexInclusive) {
+        page.historyTurnIndex = idx - removedCount;
+      }
+    }
+
+    _swappedDirtyPagesTotal += swappedInBatch;
+
+    final summaryPage = ContextPage(
+      pageId: summaryPageId,
+      kind: PageKind.conversation,
+      segmentIndex: 1,
+      historyTurnIndex: startTurnIndex,
+      createdAtTurn: currentTurn,
+      lastReferencedTurn: currentTurn,
+      dirty: true,
+      pinned: false,
+      resident: true,
+      estimatedTokens: summaryEstimatedTokens,
+      originalTokens: summaryEstimatedTokens,
+      cleanSource: null,
+      freshness: PageFreshnessStatus.fresh,
+      swapMeta: swapMeta,
+    );
+    _pages.add(summaryPage);
+    _byId[summaryPageId] = summaryPage;
+
+    _byHistoryIndex.clear();
+    for (final page in _pages) {
+      final idx = page.historyTurnIndex;
+      if (page.segmentIndex == 1 && idx != null) {
+        _byHistoryIndex[idx] = page;
+      }
+    }
+    return summaryPage;
+  }
 }
 
 /// UTF-8 byte-based token estimator avoiding CJK/JSON underestimation ([D-206], `OM-202`).
@@ -357,6 +447,8 @@ class TokenEstimator {
         return estimateTextTokens(turn.content) +
             estimateTextTokens(turn.toolName) +
             messageOverheadTokens;
+      case CanonicalSummaryTurn(:final text):
+        return estimateTextTokens(text) + messageOverheadTokens;
     }
   }
 
@@ -461,7 +553,17 @@ abstract interface class PageFreshnessChecker {
   );
 }
 
-/// Result summary emitted by [ContextPager] before an LLM inference step ([D-207], [D-215]).
+/// Process-aware Clean Page freshness checker supporting isolated child workspaces ([D-308], [D-316]).
+abstract interface class ProcessAwarePageFreshnessChecker
+    implements PageFreshnessChecker {
+  /// Returns updated [PageFreshnessStatus] keyed by `pageId` for the given [pcb] workspace.
+  Future<Map<String, PageFreshnessStatus>> checkFreshnessForProcess(
+    Iterable<ContextPage> cleanPages, {
+    ProcessControlBlock? pcb,
+  });
+}
+
+/// Result summary emitted by [ContextPager] before an LLM inference step ([D-207], [D-215], [D-305]).
 class ContextPagingReport {
   ContextPagingReport({
     required this.effectiveWindowTokens,
@@ -473,6 +575,9 @@ class ContextPagingReport {
     required this.residentCleanPages,
     required this.evictedCleanPages,
     required this.stalePagesCount,
+    this.swappedDirtyPagesInStep = 0,
+    this.swappedDirtyPagesTotal = 0,
+    this.swappedTurnGroupsInStep = 0,
   }) : evictedPageIds = List<String>.unmodifiable(evictedPageIds);
 
   final int effectiveWindowTokens;
@@ -484,19 +589,97 @@ class ContextPagingReport {
   final int residentCleanPages;
   final int evictedCleanPages;
   final int stalePagesCount;
+  final int swappedDirtyPagesInStep;
+  final int swappedDirtyPagesTotal;
+  final int swappedTurnGroupsInStep;
 
   bool get didEvict => evictedPagesInStep > 0;
+  bool get didSwapDirty => swappedDirtyPagesInStep > 0;
 }
 
-/// Batch Clean Page eviction engine and Segment 2 directory renderer ([D-207], [D-208], [D-209]).
+/// Batch Clean Page eviction and Dirty Page Turn Group Swap engine ([D-207], [D-208], [D-209], [D-316], [D-317]).
 class ContextPager {
   const ContextPager({
     this.config = const PagerWatermarkConfig(),
     this.estimator = const TokenEstimator(),
+    this.dirtySwapBackend,
+    this.dirtyPageSummarizer = const DeterministicDirtyPageSummarizer(),
   });
 
   final PagerWatermarkConfig config;
   final TokenEstimator estimator;
+  final DirtySwapBackend? dirtySwapBackend;
+  final DirtyPageSummarizer dirtyPageSummarizer;
+
+  /// Minimum working headroom above Segment 0 + output reservation for `--max-context-tokens` ([D-303], [D-316]).
+  static const int minWorkingHeadroomTokens = 512;
+
+  /// Validates a `--max-context-tokens` cap against Segment 0 + output reservation + 512 headroom ([D-316]).
+  static SyscallError? validateMaxContextTokens({
+    required int? maxContextTokens,
+    required PinnedSystemInstruction systemInstruction,
+    TokenEstimator estimator = const TokenEstimator(),
+    int reservedOutputTokens = 512,
+    int minWorkingHeadroom = minWorkingHeadroomTokens,
+  }) {
+    if (maxContextTokens == null) {
+      return null;
+    }
+    final segment0Tokens = estimator.estimateSystemSegmentTokens(
+      systemInstruction,
+    );
+    final minRequiredWindow =
+        segment0Tokens + reservedOutputTokens + minWorkingHeadroom;
+    if (maxContextTokens <= 0 || maxContextTokens < minRequiredWindow) {
+      return SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'MAX_CONTEXT_TOKENS_TOO_SMALL',
+        message:
+            'maxContextTokens ($maxContextTokens) is smaller than minimum required window ($minRequiredWindow = segment0:$segment0Tokens + reservedOut:$reservedOutputTokens + headroom:$minWorkingHeadroom).',
+        recoverable: false,
+        details: <String, dynamic>{
+          'maxContextTokens': maxContextTokens,
+          'minRequiredWindow': minRequiredWindow,
+          'segment0Tokens': segment0Tokens,
+        },
+      );
+    }
+    return null;
+  }
+
+  /// Splits Segment 1 [turns] into atomic [TurnGroupRange]s preserving `assistant(toolCalls) + tool*` pairing ([D-316]).
+  static List<TurnGroupRange> splitIntoTurnGroups(List<CanonicalTurn> turns) {
+    final groups = <TurnGroupRange>[];
+    var i = 0;
+    while (i < turns.length) {
+      final turn = turns[i];
+      if (turn is CanonicalAssistantTurn && turn.toolCalls.isNotEmpty) {
+        var end = i;
+        while (end + 1 < turns.length &&
+            turns[end + 1] is CanonicalToolResultTurn) {
+          end += 1;
+        }
+        groups.add(
+          TurnGroupRange(
+            startTurnIndex: i,
+            endTurnIndexInclusive: end,
+            isToolStep: true,
+          ),
+        );
+        i = end + 1;
+      } else {
+        groups.add(
+          TurnGroupRange(
+            startTurnIndex: i,
+            endTurnIndexInclusive: i,
+            isToolStep: false,
+          ),
+        );
+        i += 1;
+      }
+    }
+    return groups;
+  }
 
   /// Builds the immutable 1-line mechanical Page Stub replacing an evicted Clean Page ([D-207]).
   String buildPageStub(ContextPage page) {
@@ -544,15 +727,18 @@ class ContextPager {
     return lines.join('\n');
   }
 
-  /// Refreshes Clean Page freshness via [freshnessChecker] (if provided) and updates Segment 2 summary ([D-208]).
+  /// Refreshes Clean Page freshness via [freshnessChecker] (if provided) and updates Segment 2 summary ([D-208], [D-316]).
   Future<void> refreshFreshness(
     VirtualContextMemory memory, {
     PageFreshnessChecker? freshnessChecker,
+    ProcessControlBlock? pcb,
   }) async {
     if (freshnessChecker != null) {
       final clean = memory.pageTable.cleanPages.toList(growable: false);
       if (clean.isNotEmpty) {
-        final updates = await freshnessChecker.checkFreshness(clean);
+        final updates = freshnessChecker is ProcessAwarePageFreshnessChecker
+            ? await freshnessChecker.checkFreshnessForProcess(clean, pcb: pcb)
+            : await freshnessChecker.checkFreshness(clean);
         for (final entry in updates.entries) {
           final page = memory.pageTable.lookup(entry.key);
           if (page != null && page.isClean) {
@@ -735,7 +921,332 @@ class ContextPager {
     );
   }
 
-  /// Convenience helper combining freshness refresh and frame preparation before `sys_llm_chat`.
+  /// Asynchronous frame preparation with 3-pass intervention:
+  /// Pass 1 Clean Page eviction -> Pass 2 Dirty Page Turn Group Swap -> Pass 3 budget check ([D-316], [D-317]).
+  Future<SyscallResult<ContextPagingReport>> prepareFrameForModelAsync({
+    required VirtualContextMemory memory,
+    required ModelIdentifier targetModel,
+    required ContextWindowSpec windowSpec,
+    int? requestedMaxTokens,
+    bool isModelSwitch = false,
+    ProcessControlBlock? pcb,
+    Pid pid = 1,
+    String? sessionId,
+    SecretRedactor? redactor,
+  }) async {
+    final effectiveInputBudget = windowSpec.effectiveInputBudget(
+      requestedMaxTokens: requestedMaxTokens,
+    );
+    final highWatermark = config.highWatermarkTokens(effectiveInputBudget);
+    final lowWatermark = config.lowWatermarkTokens(effectiveInputBudget);
+
+    final modelChanged =
+        isModelSwitch ||
+        (memory.lastAnchoredModel != null &&
+            memory.lastAnchoredModel != targetModel);
+    if (modelChanged) {
+      memory.invalidateTokenAnchor();
+    }
+
+    final estimatedBefore = memory.estimateCurrentPromptTokens(
+      targetModel,
+      estimator: estimator,
+    );
+
+    final needsIntervention =
+        estimatedBefore > highWatermark ||
+        estimatedBefore > effectiveInputBudget;
+
+    if (!needsIntervention) {
+      return SyscallResult<ContextPagingReport>.success(
+        ContextPagingReport(
+          effectiveWindowTokens: windowSpec.contextWindowTokens,
+          effectiveInputBudget: effectiveInputBudget,
+          estimatedTokensBefore: estimatedBefore,
+          estimatedTokensAfter: estimatedBefore,
+          evictedPagesInStep: 0,
+          evictedPageIds: const <String>[],
+          residentCleanPages: memory.pageTable.residentCleanPagesCount,
+          evictedCleanPages: memory.pageTable.evictedCleanPagesCount,
+          stalePagesCount: memory.pageTable.stalePagesCount,
+          swappedDirtyPagesInStep: 0,
+          swappedDirtyPagesTotal: memory.pageTable.swappedDirtyPagesTotal,
+          swappedTurnGroupsInStep: 0,
+        ),
+      );
+    }
+
+    // Pass 1: Clean Page batch eviction (zero degradation).
+    final evictedIds = <String>[];
+    var currentTokens = estimatedBefore;
+
+    void evictCleanCandidates(List<ContextPage> candidates, int targetTokens) {
+      for (final page in candidates) {
+        if (currentTokens <= targetTokens) {
+          break;
+        }
+        final turnIdx = page.historyTurnIndex;
+        if (turnIdx == null || !page.isEvictable) {
+          continue;
+        }
+        final stubText = buildPageStub(page);
+        memory.historySegment.replaceToolResultContentWithStub(
+          turnIdx,
+          stubText,
+        );
+        final updatedTurn = memory.historySegment.turns[turnIdx];
+        final stubTokens = estimator.estimateTurnTokens(updatedTurn);
+        final saved = page.estimatedTokens - stubTokens;
+        page.resident = false;
+        page.estimatedTokens = stubTokens;
+        evictedIds.add(page.pageId);
+        if (saved > 0) {
+          currentTokens -= saved;
+        }
+      }
+    }
+
+    final totalTurns = memory.historySegment.turns.length;
+    final protectTailInFirstPass =
+        !modelChanged &&
+        estimatedBefore <= effectiveInputBudget &&
+        config.minKeepRecentTurns > 0;
+
+    if (protectTailInFirstPass) {
+      final maxIdxExclusive = math.max(
+        0,
+        totalTurns - config.minKeepRecentTurns,
+      );
+      final firstPassCandidates = memory.pageTable.sortedEvictableCleanPages(
+        maxHistoryTurnIndexExclusive: maxIdxExclusive,
+      );
+      evictCleanCandidates(firstPassCandidates, lowWatermark);
+    } else {
+      final allCandidates = memory.pageTable.sortedEvictableCleanPages();
+      evictCleanCandidates(allCandidates, lowWatermark);
+    }
+
+    if (evictedIds.isNotEmpty) {
+      memory.invalidateTokenAnchor();
+      memory.ephemeralSegment.pageDirectorySummary = renderPageDirectorySummary(
+        memory.pageTable,
+      );
+    }
+
+    var estimatedAfter = memory.estimateCurrentPromptTokens(
+      targetModel,
+      estimator: estimator,
+    );
+
+    // Pass 1b: Evict remaining tail Clean Pages if still over effectiveInputBudget.
+    if (estimatedAfter > effectiveInputBudget) {
+      final remaining = memory.pageTable.sortedEvictableCleanPages();
+      if (remaining.isNotEmpty) {
+        currentTokens = estimatedAfter;
+        evictCleanCandidates(remaining, lowWatermark);
+        if (evictedIds.isNotEmpty) {
+          memory.invalidateTokenAnchor();
+          memory.ephemeralSegment.pageDirectorySummary =
+              renderPageDirectorySummary(memory.pageTable);
+        }
+        estimatedAfter = memory.estimateCurrentPromptTokens(
+          targetModel,
+          estimator: estimator,
+        );
+      }
+    }
+
+    var swappedDirtyPagesInStep = 0;
+    var swappedTurnGroupsInStep = 0;
+
+    // Pass 2: Dirty Page Turn Group Swap (only if still exceeding watermark/budget after Pass 1).
+    if (dirtySwapBackend != null &&
+        (estimatedAfter > highWatermark ||
+            estimatedAfter > effectiveInputBudget)) {
+      final turns = memory.historySegment.turns;
+      final groups = splitIntoTurnGroups(turns);
+      if (groups.length > 1) {
+        final lastUserIdx = turns.lastIndexWhere(
+          (t) => t is CanonicalUserTurn,
+        );
+        final protectedGroupCount = groups.length > 2
+            ? math.max(2, config.minKeepRecentTurns)
+            : 1;
+        final maxEligibleGroupIndex = groups.length - protectedGroupCount;
+
+        final eligibleGroups = <TurnGroupRange>[];
+        for (var gIdx = 0; gIdx < maxEligibleGroupIndex; gIdx++) {
+          final group = groups[gIdx];
+          if (lastUserIdx >= 0 && group.endTurnIndexInclusive >= lastUserIdx) {
+            break;
+          }
+          if (group.length == 1 &&
+              turns[group.startTurnIndex] is CanonicalSummaryTurn) {
+            continue;
+          }
+          eligibleGroups.add(group);
+        }
+
+        if (eligibleGroups.isNotEmpty) {
+          var projectedTokens = estimatedAfter;
+          final selectedGroups = <TurnGroupRange>[];
+          for (final group in eligibleGroups) {
+            if (projectedTokens <= lowWatermark && selectedGroups.isNotEmpty) {
+              break;
+            }
+            selectedGroups.add(group);
+            var groupTokens = 0;
+            for (
+              var tIdx = group.startTurnIndex;
+              tIdx <= group.endTurnIndexInclusive;
+              tIdx++
+            ) {
+              groupTokens += estimator.estimateTurnTokens(turns[tIdx]);
+            }
+            projectedTokens -= math.max(0, groupTokens - 120);
+          }
+
+          if (selectedGroups.isNotEmpty) {
+            final startTurnIdx = selectedGroups.first.startTurnIndex;
+            final endTurnIdx = selectedGroups.last.endTurnIndexInclusive;
+            final swapBatchId = memory.pageTable.allocateNextSwapBatchId();
+            final summaryPageId = memory.pageTable.allocateNextPageId();
+            final effectivePid = pcb?.pid ?? pid;
+            final effectiveSessionId = sessionId ?? memory.sessionId;
+            final nowUtc = DateTime.now().toUtc();
+
+            final swappedTurns = <CanonicalTurn>[];
+            final evictedPageIds = <String>[];
+            final records = <DirtySwapRecord>[];
+            var totalOriginalTokens = 0;
+
+            for (var tIdx = startTurnIdx; tIdx <= endTurnIdx; tIdx++) {
+              final turn = turns[tIdx];
+              swappedTurns.add(turn);
+              final page = memory.pageTable.findByHistoryTurnIndex(tIdx);
+              final pageId = page?.pageId ?? 'pg_turn_$tIdx';
+              evictedPageIds.add(pageId);
+              final origTokens =
+                  page?.originalTokens ??
+                  page?.estimatedTokens ??
+                  estimator.estimateTurnTokens(turn);
+              totalOriginalTokens += origTokens;
+
+              records.add(
+                _buildDirtySwapRecord(
+                  turn: turn,
+                  swapBatchId: swapBatchId,
+                  summaryPageId: summaryPageId,
+                  pageId: pageId,
+                  sessionId: effectiveSessionId,
+                  pid: effectivePid,
+                  createdAtTurn: page?.createdAtTurn ?? 0,
+                  originalTokens: origTokens,
+                  swappedAtUtc: nowUtc,
+                ),
+              );
+            }
+
+            final summaryText = await dirtyPageSummarizer.summarize(
+              summaryPageId: summaryPageId,
+              swapBatchId: swapBatchId,
+              evictedPageIds: evictedPageIds,
+              originalTokens: totalOriginalTokens,
+              turns: swappedTurns,
+              redactor: redactor,
+            );
+
+            final writeResult = await dirtySwapBackend!.writeBackTurnGroups(
+              sessionId: effectiveSessionId,
+              pid: effectivePid,
+              pcb: pcb,
+              swapBatchId: swapBatchId,
+              summaryPageId: summaryPageId,
+              records: records,
+            );
+
+            if (!writeResult.ok) {
+              return SyscallResult<ContextPagingReport>.failure(
+                writeResult.error!,
+              );
+            }
+
+            final summaryTurn = CanonicalSummaryTurn(
+              summaryPageId: summaryPageId,
+              swapBatchId: swapBatchId,
+              text: summaryText,
+            );
+            memory.historySegment.replaceTurnRangeWithSummary(
+              startTurnIdx,
+              endTurnIdx,
+              summaryTurn,
+            );
+            memory.pageTable.applyDirtySwapSummary(
+              startTurnIndex: startTurnIdx,
+              endTurnIndexInclusive: endTurnIdx,
+              currentTurn: memory.currentTurnNumber,
+              swapBatchId: swapBatchId,
+              summaryPageId: summaryPageId,
+              pid: effectivePid,
+              summaryEstimatedTokens: estimator.estimateTurnTokens(summaryTurn),
+            );
+            memory.invalidateTokenAnchor();
+            swappedDirtyPagesInStep = records.length;
+            swappedTurnGroupsInStep = selectedGroups.length;
+            estimatedAfter = memory.estimateCurrentPromptTokens(
+              targetModel,
+              estimator: estimator,
+            );
+          }
+        }
+      }
+    }
+
+    // Pass 3: Final frame boundary check.
+    if (estimatedAfter > effectiveInputBudget) {
+      return SyscallResult<ContextPagingReport>.failure(
+        SyscallError(
+          code: SyscallErrorCode.edquot,
+          reason: 'CONTEXT_FRAME_EXCEEDED',
+          message:
+              'Non-evictable context ($estimatedAfter tokens) exceeds effective input budget '
+              '($effectiveInputBudget tokens) for ${targetModel.canonicalId}.',
+          recoverable: true,
+          hint:
+              'Target model input budget ($effectiveInputBudget tokens) is smaller than '
+              'non-evictable conversation history ($estimatedAfter tokens). '
+              'Switch to a larger-context model via /model or start a new session.',
+          details: <String, dynamic>{
+            'model': targetModel.canonicalId,
+            'contextWindow': windowSpec.contextWindowTokens,
+            'effectiveInputBudget': effectiveInputBudget,
+            'estimatedTokens': estimatedAfter,
+            'evictedCleanPages': memory.pageTable.evictedCleanPagesCount,
+            'swappedDirtyPagesTotal': memory.pageTable.swappedDirtyPagesTotal,
+          },
+        ),
+      );
+    }
+
+    return SyscallResult<ContextPagingReport>.success(
+      ContextPagingReport(
+        effectiveWindowTokens: windowSpec.contextWindowTokens,
+        effectiveInputBudget: effectiveInputBudget,
+        estimatedTokensBefore: estimatedBefore,
+        estimatedTokensAfter: estimatedAfter,
+        evictedPagesInStep: evictedIds.length,
+        evictedPageIds: evictedIds,
+        residentCleanPages: memory.pageTable.residentCleanPagesCount,
+        evictedCleanPages: memory.pageTable.evictedCleanPagesCount,
+        stalePagesCount: memory.pageTable.stalePagesCount,
+        swappedDirtyPagesInStep: swappedDirtyPagesInStep,
+        swappedDirtyPagesTotal: memory.pageTable.swappedDirtyPagesTotal,
+        swappedTurnGroupsInStep: swappedTurnGroupsInStep,
+      ),
+    );
+  }
+
+  /// Convenience helper combining freshness refresh and frame preparation before `sys_llm_chat` ([D-316]).
   Future<SyscallResult<ContextPagingReport>> refreshAndPrepareFrame({
     required VirtualContextMemory memory,
     required ModelIdentifier targetModel,
@@ -743,15 +1254,109 @@ class ContextPager {
     PageFreshnessChecker? freshnessChecker,
     int? requestedMaxTokens,
     bool isModelSwitch = false,
+    ProcessControlBlock? pcb,
+    Pid pid = 1,
+    String? sessionId,
+    SecretRedactor? redactor,
   }) async {
-    await refreshFreshness(memory, freshnessChecker: freshnessChecker);
-    return prepareFrameForModel(
+    await refreshFreshness(
+      memory,
+      freshnessChecker: freshnessChecker,
+      pcb: pcb,
+    );
+    return prepareFrameForModelAsync(
       memory: memory,
       targetModel: targetModel,
       windowSpec: windowSpec,
       requestedMaxTokens: requestedMaxTokens,
       isModelSwitch: isModelSwitch,
+      pcb: pcb,
+      pid: pid,
+      sessionId: sessionId,
+      redactor: redactor,
     );
+  }
+
+  static DirtySwapRecord _buildDirtySwapRecord({
+    required CanonicalTurn turn,
+    required String swapBatchId,
+    required String summaryPageId,
+    required String pageId,
+    required String sessionId,
+    required Pid pid,
+    required int createdAtTurn,
+    required int originalTokens,
+    required DateTime swappedAtUtc,
+  }) {
+    switch (turn) {
+      case CanonicalUserTurn(:final text):
+        return DirtySwapRecord(
+          swapBatchId: swapBatchId,
+          summaryPageId: summaryPageId,
+          pageId: pageId,
+          sessionId: sessionId,
+          pid: pid,
+          createdAtTurn: createdAtTurn,
+          turnType: 'user',
+          content: text,
+          originalTokens: originalTokens,
+          swappedAtUtc: swappedAtUtc,
+        );
+      case CanonicalAssistantTurn():
+        return DirtySwapRecord(
+          swapBatchId: swapBatchId,
+          summaryPageId: summaryPageId,
+          pageId: pageId,
+          sessionId: sessionId,
+          pid: pid,
+          createdAtTurn: createdAtTurn,
+          turnType: 'assistant',
+          originProvider: turn.originProvider,
+          originModel: turn.originModel,
+          content: turn.content,
+          thoughtText: turn.thoughtText,
+          toolCalls: turn.toolCalls
+              .map(
+                (tc) => <String, dynamic>{
+                  'canonicalCallId': tc.canonicalCallId,
+                  'name': tc.name,
+                  'arguments': tc.arguments,
+                },
+              )
+              .toList(growable: false),
+          originalTokens: originalTokens,
+          swappedAtUtc: swappedAtUtc,
+        );
+      case CanonicalToolResultTurn():
+        return DirtySwapRecord(
+          swapBatchId: swapBatchId,
+          summaryPageId: summaryPageId,
+          pageId: pageId,
+          sessionId: sessionId,
+          pid: pid,
+          createdAtTurn: createdAtTurn,
+          turnType: 'tool',
+          content: turn.content,
+          canonicalCallId: turn.canonicalCallId,
+          toolName: turn.toolName,
+          isError: turn.isError,
+          originalTokens: originalTokens,
+          swappedAtUtc: swappedAtUtc,
+        );
+      case CanonicalSummaryTurn(:final text):
+        return DirtySwapRecord(
+          swapBatchId: swapBatchId,
+          summaryPageId: summaryPageId,
+          pageId: pageId,
+          sessionId: sessionId,
+          pid: pid,
+          createdAtTurn: createdAtTurn,
+          turnType: 'summary',
+          content: text,
+          originalTokens: originalTokens,
+          swappedAtUtc: swappedAtUtc,
+        );
+    }
   }
 
   static String _shortHash(String? hash) {

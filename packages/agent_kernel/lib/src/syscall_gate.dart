@@ -21,6 +21,11 @@ class JjAuditInfo {
 /// Callback reading the current `jj` change/op IDs for audit logging without coupling `agent_kernel` to `JjDriver`.
 typedef JjAuditInfoProvider = Future<JjAuditInfo> Function();
 
+/// Process-aware callback reading `jj` change/op IDs for a specific [ProcessControlBlock] ([D-305]).
+typedef JjProcessAuditInfoProvider = Future<JjAuditInfo> Function(
+  ProcessControlBlock? pcb,
+);
+
 /// Caller context passed to [SyscallGate.invoke] ([D-002], [D-005]).
 class SyscallContext {
   const SyscallContext({
@@ -79,6 +84,10 @@ typedef SyscallPolicyEvaluator = Future<RingDecision> Function(
 typedef SyscallHandler = Future<SyscallResult<Map<String, dynamic>>> Function(
   SyscallExecutionContext execContext,
 );
+typedef SyscallResultSummaryBuilder = Map<String, dynamic>? Function(
+  Map<String, dynamic> args,
+  SyscallResult<Map<String, dynamic>> result,
+);
 
 /// Declarative kernel registration entry for a syscall ([D-002], [D-005], [D-020]).
 class SyscallDefinition {
@@ -94,6 +103,7 @@ class SyscallDefinition {
     this.evaluatePolicy,
     this.approvalPreviewBuilder,
     this.approvalSignatureBuilder,
+    this.resultSummaryBuilder,
     required this.handler,
   });
 
@@ -108,6 +118,7 @@ class SyscallDefinition {
   final SyscallPolicyEvaluator? evaluatePolicy;
   final ApprovalPreviewBuilder? approvalPreviewBuilder;
   final String Function(Map<String, dynamic> args)? approvalSignatureBuilder;
+  final SyscallResultSummaryBuilder? resultSummaryBuilder;
   final SyscallHandler handler;
 }
 
@@ -122,6 +133,7 @@ class SyscallGate {
     List<SyscallHook> hooks = const <SyscallHook>[],
     List<TxHook> txHooks = const <TxHook>[],
     this.jjAuditInfoProvider,
+    this.jjProcessAuditInfoProvider,
   })  : redactor = redactor ?? auditLogger.redactor,
         _hooks = List<SyscallHook>.from(hooks),
         _txHooks = List<TxHook>.from(txHooks);
@@ -132,6 +144,7 @@ class SyscallGate {
   final AuditLogger auditLogger;
   final SecretRedactor redactor;
   final JjAuditInfoProvider? jjAuditInfoProvider;
+  final JjProcessAuditInfoProvider? jjProcessAuditInfoProvider;
 
   final List<SyscallHook> _hooks;
   final List<TxHook> _txHooks;
@@ -164,6 +177,7 @@ class SyscallGate {
     final stopwatch = Stopwatch()..start();
 
     final pcb = processTable.getProcess(context.pid);
+    SyscallDefinition? definition;
     var currentArgs = Map<String, dynamic>.from(request.args);
     var approvalRequired = false;
     var decision = AuditDecision.deniedByPolicy;
@@ -189,8 +203,28 @@ class SyscallGate {
         return result;
       }
 
+      // Stage 0.5: Cooperative suspend gate (SIGSTOP); sys_exit is excluded to prevent exit deadlock ([D-312]).
+      if (request.name != 'sys_exit' && pcb.suspendController.isSuspended) {
+        await pcb.suspendController.waitIfSuspended(
+          pcb: pcb,
+          cancelToken: context.cancelToken,
+        );
+        if (context.cancelToken?.isCancelled ?? false) {
+          decision = AuditDecision.deniedByPolicy;
+          result = const SyscallResult<Map<String, dynamic>>.failure(
+            SyscallError(
+              code: SyscallErrorCode.ecancelled,
+              reason: 'CANCELLED',
+              message: 'Syscall cancelled while process was suspended.',
+              recoverable: true,
+            ),
+          );
+          return result;
+        }
+      }
+
       // Stage 1: Definition lookup, schema/arg validation, and arg normalization.
-      final definition = _definitions[request.name];
+      definition = _definitions[request.name];
       if (definition == null) {
         if (request.name == 'sys_spawn' && pcb.quota.maxChildProcesses == 0) {
           decision = AuditDecision.deniedByPolicy;
@@ -640,7 +674,13 @@ class SyscallGate {
       // Stage 8: Mandatory audit logging on every exit path.
       stopwatch.stop();
       JjAuditInfo? jjInfo;
-      if (jjAuditInfoProvider != null) {
+      if (jjProcessAuditInfoProvider != null) {
+        try {
+          jjInfo = await jjProcessAuditInfoProvider!(pcb);
+        } catch (_) {
+          jjInfo = null;
+        }
+      } else if (jjAuditInfoProvider != null) {
         try {
           jjInfo = await jjAuditInfoProvider!();
         } catch (_) {
@@ -649,6 +689,10 @@ class SyscallGate {
       }
       final jjChangeId = jjInfo?.jjChangeId ?? pcb?.jjContext.workingChangeId;
       final jjOpId = jjInfo?.jjOpId ?? pcb?.jjContext.currentOpId;
+      final rawSummary = definition?.resultSummaryBuilder?.call(
+        currentArgs,
+        result,
+      );
 
       await auditLogger.logSyscall(
         SyscallAuditRecord(
@@ -670,6 +714,9 @@ class SyscallGate {
           durationMs: stopwatch.elapsedMilliseconds,
           jjChangeId: jjChangeId,
           jjOpId: jjOpId,
+          resultSummary: rawSummary == null
+              ? null
+              : redactor.redactJson(rawSummary) as Map<String, dynamic>,
         ),
       );
     }
@@ -679,6 +726,7 @@ class SyscallGate {
     return switch (code) {
       SyscallErrorCode.einval => AuditDecision.invalidArgs,
       SyscallErrorCode.edquot => AuditDecision.quotaExceeded,
+      SyscallErrorCode.econflict => AuditDecision.deniedByPolicy,
       _ => AuditDecision.deniedByPolicy,
     };
   }

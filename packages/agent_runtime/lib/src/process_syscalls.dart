@@ -12,6 +12,9 @@ const Map<String, CapRight> defaultSyscallRequiredRights = <String, CapRight>{
   'sys_jj_status': CapRight.vcsRead,
   'sys_jj_log': CapRight.vcsRead,
   'sys_jj_diff': CapRight.vcsRead,
+  'sys_jj_conflicts': CapRight.vcsRead,
+  'sys_jj_merge': CapRight.vcsTx,
+  'sys_jj_integrate': CapRight.vcsTx,
   'sys_tx_begin': CapRight.vcsTx,
   'sys_tx_describe': CapRight.vcsTx,
   'sys_tx_squash': CapRight.vcsTx,
@@ -21,6 +24,8 @@ const Map<String, CapRight> defaultSyscallRequiredRights = <String, CapRight>{
   'sys_mem_pagein': CapRight.memManage,
   'sys_spawn': CapRight.procSpawn,
   'sys_wait': CapRight.procSpawn,
+  'sys_kill': CapRight.procSpawn,
+  'sys_task_stack': CapRight.vcsTx,
   'sys_exit': CapRight.procSelf,
   'sys_send': CapRight.ipc,
   'sys_recv': CapRight.ipc,
@@ -90,9 +95,17 @@ List<SyscallToolSchema> filterToolSchemasForPcb({
       continue;
     }
 
-    // Ring 3 child exclusions (depth-1 lock and sterile WebResearcher 5-tool boundary).
+    // Ring 3 child exclusions (depth-1 lock, TTY monopoly, and sterile WebResearcher 5-tool boundary).
     if (pcb.ring == ProtectionRing.ring3) {
-      if (name == 'sys_spawn' || name == 'sys_wait') {
+      if (name == 'sys_spawn' ||
+          name == 'sys_wait' ||
+          name == 'sys_kill' ||
+          name.startsWith('sys_tx_') ||
+          name == 'sys_jj_merge' ||
+          name == 'sys_jj_integrate' ||
+          name == 'sys_task_stack' ||
+          name == 'sys_mcp_list_tools' ||
+          name == 'sys_mcp_call') {
         continue;
       }
       if (pcb.profile == ProcessProfileId.webResearcher &&
@@ -126,6 +139,19 @@ List<SyscallDefinition> buildProcessSyscallDefinitions({
       applyIoCap: false,
       validateArgs: _validateSpawnArgs,
       evaluatePolicy: (_, _) async => RingDecision.allow,
+      resultSummaryBuilder: (_, result) {
+        if (!result.ok || result.value == null) {
+          return null;
+        }
+        final v = result.value!;
+        return <String, dynamic>{
+          'childPid': v['childPid'],
+          'logicalTaskId': v['logicalTaskId'],
+          'workspaceName': v['workspaceName'],
+          'baseChangeId': v['baseChangeId'],
+          'workingChangeId': v['workingChangeId'],
+        };
+      },
       handler: (exec) async {
         final specResult = _parseSpawnSpec(exec.args);
         if (!specResult.ok) {
@@ -147,6 +173,28 @@ List<SyscallDefinition> buildProcessSyscallDefinitions({
       cappedTextFields: const <String>['summary'],
       validateArgs: _validateWaitArgs,
       evaluatePolicy: (_, _) async => RingDecision.allow,
+      resultSummaryBuilder: (_, result) {
+        if (!result.ok || result.value == null) {
+          return null;
+        }
+        final children = result.value!['children'];
+        if (children is! List) {
+          return null;
+        }
+        final pids = <Object?>[];
+        final taskIds = <Object?>[];
+        for (final entry in children) {
+          if (entry is Map) {
+            pids.add(entry['pid']);
+            taskIds.add(entry['logicalTaskId']);
+          }
+        }
+        return <String, dynamic>{
+          'childCount': children.length,
+          'pids': pids,
+          'logicalTaskIds': taskIds,
+        };
+      },
       handler: (exec) {
         final rawPids = exec.args['pids'] as List<dynamic>?;
         final pids = rawPids?.map((e) => (e as num).toInt()).toList(growable: false);
@@ -277,6 +325,39 @@ List<SyscallDefinition> buildProcessSyscallDefinitions({
         });
       },
     ),
+    SyscallDefinition(
+      name: 'sys_kill',
+      requiredRight: CapRight.procSpawn,
+      kind: 'other',
+      applyIoCap: false,
+      validateArgs: _validateKillArgs,
+      evaluatePolicy: (_, _) async => RingDecision.allow,
+      resultSummaryBuilder: (_, result) {
+        if (!result.ok || result.value == null) {
+          return null;
+        }
+        final v = result.value!;
+        return <String, dynamic>{
+          'targetPid': v['targetPid'],
+          'signal': v['signal'],
+          'resultingState': v['state'],
+        };
+      },
+      handler: (exec) {
+        final rawSignal = (exec.args['signal'] as String).trim();
+        final signal = ProcessSignalKind.tryParse(rawSignal)!;
+        final pid = (exec.args['pid'] as num?)?.toInt();
+        final logicalTaskId = (exec.args['logicalTaskId'] as String?)?.trim();
+        final constraintMessage = exec.args['constraintMessage'] as String?;
+        return host.handleSysKill(
+          exec,
+          pid: pid,
+          logicalTaskId: logicalTaskId,
+          signal: signal,
+          constraintMessage: constraintMessage,
+        );
+      },
+    ),
   ];
 }
 
@@ -286,15 +367,20 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
     SyscallToolSchema(
       name: 'sys_spawn',
       description:
-          'Spawn a sandboxed Ring 3 sub-agent Isolate (explorer or web_researcher) with attenuated capabilities and donated quota.',
+          'Spawn a sandboxed Ring 3 sub-agent Isolate (explorer, web_researcher, workspace_worker, or conflict_resolver) with attenuated capabilities and donated quota.',
       parametersJsonSchema: const <String, dynamic>{
         'type': 'object',
         'properties': <String, dynamic>{
           'profile': <String, dynamic>{
             'type': 'string',
-            'enum': <String>['explorer', 'web_researcher'],
+            'enum': <String>[
+              'explorer',
+              'web_researcher',
+              'workspace_worker',
+              'conflict_resolver',
+            ],
             'description':
-                'Sandbox profile: "explorer" (read-only /workspace + non-destructive jj) or "web_researcher" (sterile public web only).',
+                'Sandbox profile: "explorer" (read-only /workspace), "web_researcher" (sterile public web), "workspace_worker" (isolated jj workspace editing & dart test/analyze), or "conflict_resolver" (isolated jj conflict resolution).',
           },
           'taskPrompt': <String, dynamic>{
             'type': 'string',
@@ -304,6 +390,16 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
           'name': <String, dynamic>{
             'type': 'string',
             'description': 'Optional human-readable identifier for the child process.',
+          },
+          'baseChangeId': <String, dynamic>{
+            'type': 'string',
+            'description':
+                'Optional Jujutsu Change ID / revision to branch the isolated workspace from (defaults to LeadAgent working change).',
+          },
+          'logicalTaskId': <String, dynamic>{
+            'type': 'string',
+            'description':
+                'Optional logical task identifier for tracking across retries.',
           },
           'model': <String, dynamic>{
             'type': 'string',
@@ -337,6 +433,25 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
             'items': <String, dynamic>{'type': 'string'},
             'description':
                 'Optional further subset of CapRight names to attenuate within the profile.',
+          },
+          'supervision': <String, dynamic>{
+            'type': 'object',
+            'description':
+                'Optional Supervisor automatic recovery policy ({restart: "never"|"on_failure", maxRetries: 0..3, fallbackModel: "<provider>/<model>"}).',
+            'properties': <String, dynamic>{
+              'restart': <String, dynamic>{
+                'type': 'string',
+                'enum': <String>['never', 'on_failure'],
+              },
+              'maxRetries': <String, dynamic>{
+                'type': 'integer',
+                'minimum': 0,
+                'maximum': 3,
+              },
+              'fallbackModel': <String, dynamic>{
+                'type': 'string',
+              },
+            },
           },
         },
         'required': <String>['profile', 'taskPrompt'],
@@ -422,6 +537,35 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
         },
       },
     ),
+    SyscallToolSchema(
+      name: 'sys_kill',
+      description:
+          'Send a control signal (SIGSTOP, SIGCONT, or SIGKILL) to an active Ring 3 child process.',
+      parametersJsonSchema: const <String, dynamic>{
+        'type': 'object',
+        'properties': <String, dynamic>{
+          'pid': <String, dynamic>{
+            'type': 'integer',
+            'description': 'Target child PID (mutually optional with logicalTaskId).',
+          },
+          'logicalTaskId': <String, dynamic>{
+            'type': 'string',
+            'description': 'Target logicalTaskId across Supervisor retries.',
+          },
+          'signal': <String, dynamic>{
+            'type': 'string',
+            'enum': <String>['SIGSTOP', 'SIGCONT', 'SIGKILL'],
+            'description': 'Signal to deliver: SIGSTOP, SIGCONT, or SIGKILL.',
+          },
+          'constraintMessage': <String, dynamic>{
+            'type': 'string',
+            'description':
+                'Optional runtime policy constraint injected on SIGCONT.',
+          },
+        },
+        'required': <String>['signal'],
+      },
+    ),
   ];
 }
 
@@ -431,7 +575,32 @@ SyscallError? _validateSpawnArgs(Map<String, dynamic> args) {
     return const SyscallError(
       code: SyscallErrorCode.einval,
       reason: 'INVALID_PROFILE',
-      message: 'Argument "profile" must be "explorer" or "web_researcher".',
+      message:
+          'Argument "profile" must be one of: explorer, web_researcher, workspace_worker, conflict_resolver.',
+      recoverable: true,
+    );
+  }
+  final baseChangeId = args['baseChangeId'];
+  if (baseChangeId != null) {
+    if (baseChangeId is! String ||
+        baseChangeId.trim().isEmpty ||
+        baseChangeId.trim().startsWith('-')) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_REVISION',
+        message:
+            'Argument "baseChangeId" must be a non-empty non-flag revision string.',
+        recoverable: true,
+      );
+    }
+  }
+  final logicalTaskId = args['logicalTaskId'];
+  if (logicalTaskId != null &&
+      (logicalTaskId is! String || logicalTaskId.trim().isEmpty)) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_ARGS',
+      message: 'Argument "logicalTaskId" must be a non-empty string.',
       recoverable: true,
     );
   }
@@ -556,6 +725,56 @@ SyscallError? _validateSpawnArgs(Map<String, dynamic> args) {
       }
     }
   }
+  final supervision = args['supervision'];
+  if (supervision != null) {
+    if (supervision is! Map) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_SUPERVISION_POLICY',
+        message: 'Argument "supervision" must be a JSON object.',
+        recoverable: true,
+      );
+    }
+    final rawRestart = supervision['restart'];
+    if (rawRestart != null &&
+        (rawRestart is! String || RestartStrategy.tryParse(rawRestart) == null)) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_SUPERVISION_POLICY',
+        message: 'supervision.restart must be "never" or "on_failure".',
+        recoverable: true,
+      );
+    }
+    final maxRetries = supervision['maxRetries'];
+    if (maxRetries != null &&
+        (maxRetries is! int ||
+            maxRetries < 0 ||
+            maxRetries > SupervisionPolicy.maxAllowedRetries)) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_SUPERVISION_POLICY',
+        message:
+            'supervision.maxRetries must be an integer between 0 and ${SupervisionPolicy.maxAllowedRetries}.',
+        recoverable: true,
+      );
+    }
+    final fallbackModel = supervision['fallbackModel'];
+    if (fallbackModel != null) {
+      if (fallbackModel is! String || fallbackModel.trim().isEmpty) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_MODEL',
+          message:
+              'supervision.fallbackModel must be a non-empty "<providerId>/<modelName>" string.',
+          recoverable: true,
+        );
+      }
+      final parsedFallback = ModelIdentifier.parse(fallbackModel);
+      if (!parsedFallback.ok) {
+        return parsedFallback.error;
+      }
+    }
+  }
   return null;
 }
 
@@ -571,6 +790,23 @@ SyscallResult<SpawnSpec> _parseSpawnSpec(Map<String, dynamic> args) {
     }
   }
 
+  SupervisionPolicy? supervision;
+  final rawSupervision = args['supervision'];
+  if (rawSupervision is Map) {
+    final rawRestart = rawSupervision['restart'] as String?;
+    final restart = rawRestart != null
+        ? RestartStrategy.tryParse(rawRestart)!
+        : RestartStrategy.never;
+    final maxRetries = (rawSupervision['maxRetries'] as int?) ?? 0;
+    final fallbackRaw = (rawSupervision['fallbackModel'] as String?)?.trim();
+    supervision = SupervisionPolicy(
+      restart: restart,
+      maxRetries: maxRetries,
+      fallbackModel:
+          (fallbackRaw == null || fallbackRaw.isEmpty) ? null : fallbackRaw,
+    );
+  }
+
   return SyscallResult<SpawnSpec>.success(
     SpawnSpec(
       profile: profile,
@@ -584,8 +820,60 @@ SyscallResult<SpawnSpec> _parseSpawnSpec(Map<String, dynamic> args) {
           (args['maxWallTimeMs'] as int?) ?? SpawnSpec.defaultMaxWallTimeMs,
       maxSteps: (args['maxSteps'] as int?) ?? SpawnSpec.defaultMaxSteps,
       requestedRights: requestedRights,
+      baseChangeId: (args['baseChangeId'] as String?)?.trim(),
+      logicalTaskId: (args['logicalTaskId'] as String?)?.trim(),
+      supervision: supervision,
     ),
   );
+}
+
+SyscallError? _validateKillArgs(Map<String, dynamic> args) {
+  final rawSignal = args['signal'];
+  if (rawSignal is! String || ProcessSignalKind.tryParse(rawSignal) == null) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_SIGNAL',
+      message: 'Argument "signal" must be one of: SIGSTOP, SIGCONT, SIGKILL.',
+      recoverable: true,
+    );
+  }
+  final pid = args['pid'];
+  if (pid != null && (pid is! int || pid <= 0)) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_ARGS',
+      message: 'Argument "pid" must be a positive integer PID.',
+      recoverable: true,
+    );
+  }
+  final logicalTaskId = args['logicalTaskId'];
+  if (logicalTaskId != null &&
+      (logicalTaskId is! String || logicalTaskId.trim().isEmpty)) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_ARGS',
+      message: 'Argument "logicalTaskId" must be a non-empty string.',
+      recoverable: true,
+    );
+  }
+  if (pid == null && logicalTaskId == null) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'MISSING_SIGNAL_TARGET',
+      message: 'Either "pid" or "logicalTaskId" must be provided.',
+      recoverable: true,
+    );
+  }
+  final constraintMessage = args['constraintMessage'];
+  if (constraintMessage != null && constraintMessage is! String) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_ARGS',
+      message: 'Argument "constraintMessage" must be a string.',
+      recoverable: true,
+    );
+  }
+  return null;
 }
 
 SyscallError? _validateWaitArgs(Map<String, dynamic> args) {

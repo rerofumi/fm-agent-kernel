@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:agent_acp/agent_acp.dart';
+import 'package:agent_acp/src/wire/wire_command_splitter.dart';
 import 'package:agent_kernel/agent_kernel.dart';
 import 'package:args/args.dart';
 import 'package:path/path.dart' as p;
@@ -57,6 +58,16 @@ Future<void> _runDaemon(List<String> args) async {
       help:
           'External directory containing <skill>/SKILL.md packages (repeatable; earlier entries win).',
     )
+    ..addOption(
+      'max-context-tokens',
+      help: 'Session-wide effective context window cap (positive integer).',
+    )
+    ..addMultiOption(
+      'mcp-server',
+      splitCommas: false,
+      help:
+          'Register a stdio MCP server (JSON object or "name=command [args...]").',
+    )
     ..addFlag(
       'help',
       abbr: 'h',
@@ -111,6 +122,44 @@ Future<void> _runDaemon(List<String> args) async {
 
   final redactor = SecretRedactor()..registerFromEnvironment(Platform.environment);
 
+  int? maxContextTokens;
+  final rawMaxCtx = parsed.option('max-context-tokens');
+  if (rawMaxCtx != null && rawMaxCtx.trim().isNotEmpty) {
+    maxContextTokens = int.tryParse(rawMaxCtx.trim());
+    if (maxContextTokens == null || maxContextTokens <= 0) {
+      stderr.writeln('Invalid --max-context-tokens: $rawMaxCtx');
+      exitCode = 64;
+      return;
+    }
+  }
+
+  final mcpServers = <McpServerSpec>[];
+  for (final rawMcp in parsed.multiOption('mcp-server')) {
+    if (rawMcp.trim().isEmpty) {
+      continue;
+    }
+    try {
+      final wireSpec = parseWireMcpServerSpec(rawMcp);
+      for (final envVar in wireSpec.env) {
+        redactor.registerSecret(envVar.value);
+      }
+      mcpServers.add(
+        McpServerSpec(
+          name: wireSpec.name,
+          command: wireSpec.command,
+          args: wireSpec.args,
+          env: wireSpec.env
+              .map((e) => McpEnvVar(name: e.name, value: e.value))
+              .toList(growable: false),
+        ),
+      );
+    } on FormatException catch (e) {
+      stderr.writeln('Invalid --mcp-server: ${e.message}');
+      exitCode = 64;
+      return;
+    }
+  }
+
   // JsonRpcPeer is the ONLY component holding `stdout` ([D-018]).
   final peer = JsonRpcPeer(
     input: stdin,
@@ -136,6 +185,8 @@ Future<void> _runDaemon(List<String> args) async {
       maxStepsPerTurn: maxSteps,
       skillsDirs: skillsDirs,
       skillsDirEnv: Platform.environment['AGENT_OS_SKILLS_DIR'],
+      maxContextTokens: maxContextTokens,
+      mcpServers: mcpServers,
     ),
   );
 

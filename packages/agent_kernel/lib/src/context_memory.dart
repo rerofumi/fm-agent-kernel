@@ -117,6 +117,19 @@ class CanonicalToolResultTurn extends CanonicalTurn {
   final bool isError;
 }
 
+/// Deterministic structured summary turn replacing swapped-out Dirty Page Turn Groups ([D-317]).
+class CanonicalSummaryTurn extends CanonicalTurn {
+  const CanonicalSummaryTurn({
+    required this.summaryPageId,
+    required this.swapBatchId,
+    required this.text,
+  });
+
+  final String summaryPageId;
+  final String swapBatchId;
+  final String text;
+}
+
 /// Segment 1 of [VirtualContextMemory]: strictly append-only turn log with in-place Clean Page stub replacement ([D-007], [D-207]).
 class AppendOnlyHistorySegment {
   final List<CanonicalTurn> _turns = <CanonicalTurn>[];
@@ -146,6 +159,27 @@ class AppendOnlyHistorySegment {
       toolName: existing.toolName,
       content: stubContent,
       isError: existing.isError,
+    );
+  }
+
+  /// Collapses an inclusive range `[startIndex .. endIndexInclusive]` of Segment 1 turns
+  /// into a single [CanonicalSummaryTurn] after Dirty Page Swap write-back succeeds ([D-317]).
+  void replaceTurnRangeWithSummary(
+    int startIndex,
+    int endIndexInclusive,
+    CanonicalSummaryTurn summaryTurn,
+  ) {
+    RangeError.checkValidRange(
+      startIndex,
+      endIndexInclusive + 1,
+      _turns.length,
+      'startIndex',
+      'endIndexInclusive',
+    );
+    _turns.replaceRange(
+      startIndex,
+      endIndexInclusive + 1,
+      <CanonicalTurn>[summaryTurn],
     );
   }
 }
@@ -463,6 +497,14 @@ class CanonicalIrProjector {
                 turn.canonicalCallId,
               ),
               toolName: turn.toolName,
+              segmentIndex: 1,
+            ),
+          );
+        case CanonicalSummaryTurn(:final text):
+          messages.add(
+            ProjectedMessage(
+              role: ProjectedRole.user,
+              content: text,
               segmentIndex: 1,
             ),
           );

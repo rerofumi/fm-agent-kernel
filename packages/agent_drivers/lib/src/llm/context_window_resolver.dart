@@ -10,10 +10,11 @@ import 'llm_env_loader.dart';
 import 'ollama_driver.dart';
 import 'openrouter_driver.dart';
 
-/// Configuration and explicit overrides for [ContextWindowResolver] ([D-203], [D-209]).
+/// Configuration and explicit overrides for [ContextWindowResolver] ([D-203], [D-209], [D-316]).
 class ContextWindowConfig {
   const ContextWindowConfig({
     this.modelOverrides = const <String, int>{},
+    this.maxContextTokens,
     this.defaultLocalUnloadedCap = 32768,
     this.defaultLocalFallback = 32768,
     this.defaultCloudFallback = 131072,
@@ -24,6 +25,9 @@ class ContextWindowConfig {
 
   /// Explicit context window overrides keyed by canonical model ID (`<providerId>/<modelName>`).
   final Map<String, int> modelOverrides;
+
+  /// Optional session-wide effective context window cap (`--max-context-tokens`) ([D-316]).
+  final int? maxContextTokens;
 
   /// Conservative cap applied to unloaded `local-ollama` models when `OLLAMA_CONTEXT_LENGTH` is unset.
   final int defaultLocalUnloadedCap;
@@ -95,29 +99,62 @@ class ContextWindowResolver implements ContextWindowSource {
     caseSensitive: false,
   );
 
+  /// Validates [ContextWindowConfig.maxContextTokens] against Segment 0 + output reservation + 512 ([D-316]).
+  SyscallError? validateMaxContextTokens({
+    required PinnedSystemInstruction systemInstruction,
+    TokenEstimator estimator = const TokenEstimator(),
+    int reservedOutputTokens = 512,
+  }) {
+    return ContextPager.validateMaxContextTokens(
+      maxContextTokens: config.maxContextTokens,
+      systemInstruction: systemInstruction,
+      estimator: estimator,
+      reservedOutputTokens: reservedOutputTokens,
+    );
+  }
+
   @override
   Future<ContextWindowSpec> resolve(
     ModelIdentifier model, {
     bool forceRefreshPs = false,
   }) async {
+    final ContextWindowSpec providerSpec;
     // Priority 1: Explicit configuration / test override ([D-203] §3.1(2)).
     final override = config.modelOverrides[model.canonicalId];
     if (override != null && override > 0) {
-      return ContextWindowSpec(
+      providerSpec = ContextWindowSpec(
         contextWindowTokens: override,
         isLoadedExact: true,
         source: 'override',
       );
+    } else {
+      switch (model.provider) {
+        case LlmProviderId.localOllama:
+          providerSpec = await _resolveLocalOllama(
+            model,
+            forceRefreshPs: forceRefreshPs,
+          );
+        case LlmProviderId.ollamaCloud:
+          providerSpec = await _resolveOllamaCloud(model);
+        case LlmProviderId.openRouter:
+          providerSpec = await _resolveOpenRouter(model);
+      }
     }
+    return _applyMaxContextCap(providerSpec);
+  }
 
-    switch (model.provider) {
-      case LlmProviderId.localOllama:
-        return _resolveLocalOllama(model, forceRefreshPs: forceRefreshPs);
-      case LlmProviderId.ollamaCloud:
-        return _resolveOllamaCloud(model);
-      case LlmProviderId.openRouter:
-        return _resolveOpenRouter(model);
+  ContextWindowSpec _applyMaxContextCap(ContextWindowSpec providerSpec) {
+    final cap = config.maxContextTokens;
+    if (cap == null) {
+      return providerSpec;
     }
+    final effective = math.min(providerSpec.contextWindowTokens, cap);
+    return ContextWindowSpec(
+      contextWindowTokens: effective,
+      maxCompletionTokens: providerSpec.maxCompletionTokens,
+      isLoadedExact: providerSpec.isLoadedExact,
+      source: '${providerSpec.source}:capped($cap)',
+    );
   }
 
   /// Releases the internal HTTP client if owned by this resolver.

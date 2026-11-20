@@ -7,6 +7,8 @@ import 'package:args/args.dart';
 import 'package:path/path.dart' as p;
 
 import '../json_rpc_peer.dart';
+import '../wire/wire_command_splitter.dart';
+import '../wire/wire_redactor.dart';
 
 /// Parsed permission policy supporting interactive prompts, fixed decisions,
 /// ordered sequences (`reject_once,allow_once`), and per-operation rules
@@ -141,6 +143,8 @@ class AcpCliRunner {
     String? ollamaUrl,
     int? maxSteps,
     List<String> skillsDirs = const <String>[],
+    int? maxContextTokens,
+    List<String> mcpServerArgs = const <String>[],
   }) {
     final extraArgs = <String>[
       if (model != null && model.trim().isNotEmpty) ...<String>[
@@ -154,6 +158,12 @@ class AcpCliRunner {
       if (maxSteps != null) ...<String>['--max-steps', '$maxSteps'],
       for (final dir in skillsDirs)
         if (dir.trim().isNotEmpty) ...<String>['--skills-dir', dir.trim()],
+      if (maxContextTokens != null) ...<String>[
+        '--max-context-tokens',
+        '$maxContextTokens',
+      ],
+      for (final spec in mcpServerArgs)
+        if (spec.trim().isNotEmpty) ...<String>['--mcp-server', spec.trim()],
     ];
 
     if (explicitDaemonPath != null && explicitDaemonPath.trim().isNotEmpty) {
@@ -229,6 +239,16 @@ class AcpCliRunner {
         splitCommas: false,
         help:
             'External directory containing <skill>/SKILL.md packages passed to the daemon (repeatable).',
+      )
+      ..addOption(
+        'max-context-tokens',
+        help: 'Session-wide effective context window cap (positive integer).',
+      )
+      ..addMultiOption(
+        'mcp-server',
+        splitCommas: false,
+        help:
+            'Register a stdio MCP server (JSON object or "name=command [args...]").',
       )
       ..addMultiOption(
         'batch-commands',
@@ -308,6 +328,32 @@ class AcpCliRunner {
       return 64;
     }
 
+    int? maxContextTokens;
+    final rawMaxCtx = parsed.option('max-context-tokens');
+    if (rawMaxCtx != null && rawMaxCtx.trim().isNotEmpty) {
+      maxContextTokens = int.tryParse(rawMaxCtx.trim());
+      if (maxContextTokens == null || maxContextTokens <= 0) {
+        _err.writeln('Invalid --max-context-tokens: $rawMaxCtx');
+        return 64;
+      }
+    }
+
+    final wireRedactor = WireSecretRedactor();
+    final mcpServerArgs = parsed
+        .multiOption('mcp-server')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList(growable: false);
+    final mcpServers = <WireMcpServerSpec>[];
+    for (final rawMcp in mcpServerArgs) {
+      try {
+        mcpServers.add(parseWireMcpServerSpec(rawMcp, redactor: wireRedactor));
+      } on FormatException catch (e) {
+        _err.writeln('Invalid --mcp-server: ${e.message}');
+        return 64;
+      }
+    }
+
     var permissionPolicy = CliPermissionPolicy.parse('interactive');
     try {
       permissionPolicy = CliPermissionPolicy.parse(
@@ -359,6 +405,8 @@ class AcpCliRunner {
       ollamaUrl: ollamaUrl,
       maxSteps: maxSteps,
       skillsDirs: skillsDirs,
+      maxContextTokens: maxContextTokens,
+      mcpServerArgs: mcpServerArgs,
     );
     if (launchSpec == null) {
       _err.writeln(
@@ -472,7 +520,11 @@ class AcpCliRunner {
       // 2. ACP session/new
       final newRaw = await peer.sendRequest('session/new', <String, dynamic>{
         'cwd': cwd,
-        'mcpServers': const <Object>[],
+        'mcpServers': mcpServers.map((s) => s.toJson()).toList(growable: false),
+        if (maxContextTokens != null)
+          '_meta': <String, dynamic>{
+            'fm_agent_os/maxContextTokens': maxContextTokens,
+          },
       });
       final newMap = _asStringMap(newRaw);
       state.sessionId = newMap['sessionId'] as String?;
@@ -623,7 +675,8 @@ class AcpCliRunner {
     if (trimmed == '/help') {
       _out.writeln(
         'Commands: /model [<provider>/<model>] | /models | /rollback [opId] | '
-        '/status | /cancel | /permission <policy> | /quit',
+        '/status | /cancel | /pause | /resume [msg] | /kill [pid] | /ps | '
+        '/stack list|create|edit|sync | /diff [revOrTaskId] | /permission <policy> | /quit',
       );
       return const _LineAction();
     }
@@ -751,14 +804,42 @@ class AcpCliRunner {
       return const _LineAction();
     }
 
+    final signalOrPs = await _tryHandleSignalOrPsCommand(
+      trimmed,
+      peer: peer,
+      state: state,
+    );
+    if (signalOrPs != null) {
+      return signalOrPs;
+    }
+
+    if (trimmed == '/stack' || trimmed.startsWith('/stack ')) {
+      return _handleStackCommand(trimmed, peer: peer, state: state);
+    }
+
+    if (trimmed == '/diff' || trimmed.startsWith('/diff ')) {
+      return _handleDiffCommand(trimmed, peer: peer, state: state);
+    }
+
     // Send prompt turn
     state.resetTurnDisplay();
     state.turnActive = true;
-    state.stdinRouter?.setMidTurnCancelHandler(() {
-      peer.sendNotification('session/cancel', <String, dynamic>{
-        'sessionId': state.sessionId,
-      });
-      _out.writeln('[Cancel] Sent session/cancel.');
+    state.stdinRouter?.setMidTurnCommandHandler((cmdLine) {
+      final cmdTrimmed = cmdLine.trim();
+      if (cmdTrimmed == '/cancel') {
+        peer.sendNotification('session/cancel', <String, dynamic>{
+          'sessionId': state.sessionId,
+        });
+        _out.writeln('[Cancel] Sent session/cancel.');
+        return true;
+      }
+      if (_isMidTurnControlCommand(cmdTrimmed)) {
+        unawaited(
+          _tryHandleSignalOrPsCommand(cmdTrimmed, peer: peer, state: state),
+        );
+        return true;
+      }
+      return false;
     });
 
     try {
@@ -794,7 +875,278 @@ class AcpCliRunner {
       return const _LineAction(failed: true);
     } finally {
       state.turnActive = false;
-      state.stdinRouter?.setMidTurnCancelHandler(null);
+      state.stdinRouter?.setMidTurnCommandHandler(null);
+    }
+  }
+
+  static bool _isMidTurnControlCommand(String cmd) {
+    return cmd == '/pause' ||
+        cmd == '/stop' ||
+        cmd == '/resume' ||
+        cmd.startsWith('/resume ') ||
+        cmd == '/cont' ||
+        cmd.startsWith('/cont ') ||
+        cmd == '/kill' ||
+        cmd.startsWith('/kill ') ||
+        cmd == '/ps';
+  }
+
+  Future<_LineAction?> _tryHandleSignalOrPsCommand(
+    String trimmed, {
+    required JsonRpcPeer peer,
+    required _CliSessionState state,
+  }) async {
+    if (trimmed == '/pause' || trimmed == '/stop') {
+      try {
+        await peer.sendRequest('_fm_agent_os/signal', <String, dynamic>{
+          'sessionId': state.sessionId,
+          'signal': 'SIGSTOP',
+        });
+        _out.writeln('[Signal] Sent SIGSTOP.');
+        return const _LineAction();
+      } on JsonRpcException catch (e) {
+        _out.writeln('[Signal Error] (${e.code}) ${e.message}');
+        return const _LineAction(failed: true);
+      }
+    }
+
+    if (trimmed == '/resume' ||
+        trimmed.startsWith('/resume ') ||
+        trimmed == '/cont' ||
+        trimmed.startsWith('/cont ')) {
+      final prefix = trimmed.startsWith('/resume') ? '/resume' : '/cont';
+      final msg = trimmed.length > prefix.length
+          ? trimmed.substring(prefix.length).trim()
+          : '';
+      try {
+        await peer.sendRequest('_fm_agent_os/signal', <String, dynamic>{
+          'sessionId': state.sessionId,
+          'signal': 'SIGCONT',
+          if (msg.isNotEmpty) 'constraintMessage': msg,
+        });
+        _out.writeln('[Signal] Sent SIGCONT.');
+        return const _LineAction();
+      } on JsonRpcException catch (e) {
+        _out.writeln('[Signal Error] (${e.code}) ${e.message}');
+        return const _LineAction(failed: true);
+      }
+    }
+
+    if (trimmed == '/kill' || trimmed.startsWith('/kill ')) {
+      final arg = trimmed == '/kill'
+          ? ''
+          : trimmed.substring('/kill '.length).trim();
+      int? targetPid;
+      if (arg.isNotEmpty) {
+        targetPid = int.tryParse(arg);
+        if (targetPid == null || targetPid < 1) {
+          _out.writeln('[Kill Error] Invalid pid "$arg".');
+          return const _LineAction(failed: true);
+        }
+      }
+      try {
+        final raw = await peer.sendRequest('_fm_agent_os/signal', <String, dynamic>{
+          'sessionId': state.sessionId,
+          'signal': 'SIGKILL',
+          'pid': ?targetPid,
+        });
+        final map = _asStringMap(raw);
+        _out.writeln(
+          '[Signal] Sent SIGKILL (affectedPids=${map['affectedPids']}).',
+        );
+        return const _LineAction();
+      } on JsonRpcException catch (e) {
+        _out.writeln('[Signal Error] (${e.code}) ${e.message}');
+        return const _LineAction(failed: true);
+      }
+    }
+
+    if (trimmed == '/ps') {
+      try {
+        final raw = await peer.sendRequest('_fm_agent_os/processes', <String, dynamic>{
+          'sessionId': state.sessionId,
+        });
+        final map = _asStringMap(raw);
+        final lead = _asStringMap(map['lead']);
+        final procs = map['processes'] is List
+            ? (map['processes'] as List).whereType<Map<dynamic, dynamic>>()
+            : const Iterable<Map<dynamic, dynamic>>.empty();
+        _out.writeln(
+          '[PS] lead pid=${lead['pid']} state=${lead['state']} '
+          'suspended=${lead['isSuspended']} change=${lead['jjChangeId']}',
+        );
+        for (final pItem in procs) {
+          _out.writeln(
+            '  pid=${pItem['pid']} profile=${pItem['profile']} '
+            'state=${pItem['state']} model=${pItem['model']} '
+            'ws=${pItem['workspaceName'] ?? '(none)'} '
+            'change=${pItem['workingChangeId'] ?? '(none)'}',
+          );
+        }
+        return const _LineAction();
+      } on JsonRpcException catch (e) {
+        _out.writeln('[PS Error] (${e.code}) ${e.message}');
+        return const _LineAction(failed: true);
+      }
+    }
+
+    return null;
+  }
+
+  Future<_LineAction> _handleStackCommand(
+    String trimmed, {
+    required JsonRpcPeer peer,
+    required _CliSessionState state,
+  }) async {
+    final rest = trimmed == '/stack'
+        ? 'list'
+        : trimmed.substring('/stack '.length).trim();
+    final tokens = splitWireCommandArgs(rest);
+    final sub = tokens.isEmpty ? 'list' : tokens.first.toLowerCase();
+
+    try {
+      switch (sub) {
+        case 'list':
+          final raw = await peer.sendRequest(
+            '_fm_agent_os/stack_list',
+            <String, dynamic>{'sessionId': state.sessionId},
+          );
+          final map = _asStringMap(raw);
+          final tasks = map['tasks'] is List
+              ? (map['tasks'] as List).whereType<Map<dynamic, dynamic>>()
+              : const Iterable<Map<dynamic, dynamic>>.empty();
+          _out.writeln('[Stack] tasks:');
+          for (final t in tasks) {
+            _out.writeln(
+              '  ${t['taskId']} [${t['state']}] '
+              'parent=${t['parentTaskId'] ?? '(root)'} '
+              'change=${t['workingChangeId']} '
+              'conflicts=${t['hasConflicts']} '
+              'title="${t['title']}"',
+            );
+          }
+          return const _LineAction();
+
+        case 'create':
+          if (tokens.length < 2) {
+            _out.writeln(
+              '[Stack Error] Usage: /stack create <taskId> [--parent <parentId>] [--model <m>] <title>',
+            );
+            return const _LineAction(failed: true);
+          }
+          final taskId = tokens[1];
+          String? parentId;
+          String? model;
+          final titleParts = <String>[];
+          for (var i = 2; i < tokens.length; i++) {
+            if (tokens[i] == '--parent' && i + 1 < tokens.length) {
+              parentId = tokens[++i];
+            } else if (tokens[i] == '--model' && i + 1 < tokens.length) {
+              model = tokens[++i];
+            } else {
+              titleParts.add(tokens[i]);
+            }
+          }
+          final title = titleParts.isEmpty ? taskId : titleParts.join(' ');
+          final raw = await peer.sendRequest(
+            '_fm_agent_os/stack_create',
+            <String, dynamic>{
+              'sessionId': state.sessionId,
+              'taskId': taskId,
+              'title': title,
+              'parentTaskId': ?parentId,
+              'model': ?model,
+            },
+          );
+          final map = _asStringMap(raw);
+          final task = _asStringMap(map['task']);
+          _out.writeln(
+            '[Stack Create] taskId=${task['taskId']} '
+            'change=${task['workingChangeId']} ws=${task['workspaceName']}',
+          );
+          return const _LineAction();
+
+        case 'edit':
+          if (tokens.length < 4) {
+            _out.writeln(
+              '[Stack Error] Usage: /stack edit <taskId> <relativePath> <newContent>',
+            );
+            return const _LineAction(failed: true);
+          }
+          final taskId = tokens[1];
+          final relPath = tokens[2];
+          final rawContent = tokens.sublist(3).join(' ');
+          final content = rawContent.replaceAll(r'\n', '\n');
+          final raw = await peer.sendRequest(
+            '_fm_agent_os/stack_edit',
+            <String, dynamic>{
+              'sessionId': state.sessionId,
+              'taskId': taskId,
+              'relativePath': relPath,
+              'content': content,
+            },
+          );
+          final map = _asStringMap(raw);
+          final cascaded = map['cascadedTasks'] is List
+              ? (map['cascadedTasks'] as List).length
+              : 0;
+          _out.writeln(
+            '[Stack Edit] taskId=$taskId cascaded=$cascaded jjOpId=${map['jjOpId']}',
+          );
+          return const _LineAction();
+
+        case 'sync':
+          final taskId = tokens.length >= 2 ? tokens[1] : null;
+          final raw = await peer.sendRequest(
+            '_fm_agent_os/stack_sync',
+            <String, dynamic>{
+              'sessionId': state.sessionId,
+              'taskId': ?taskId,
+            },
+          );
+          final map = _asStringMap(raw);
+          final cascaded = map['cascadedTasks'] is List
+              ? (map['cascadedTasks'] as List).length
+              : 0;
+          _out.writeln('[Stack Sync] cascaded=$cascaded jjOpId=${map['jjOpId']}');
+          return const _LineAction();
+
+        default:
+          _out.writeln('[Stack Error] Unknown subcommand "$sub".');
+          return const _LineAction(failed: true);
+      }
+    } on JsonRpcException catch (e) {
+      _out.writeln('[Stack Error] (${e.code}) ${e.message}');
+      return const _LineAction(failed: true);
+    }
+  }
+
+  Future<_LineAction> _handleDiffCommand(
+    String trimmed, {
+    required JsonRpcPeer peer,
+    required _CliSessionState state,
+  }) async {
+    final arg = trimmed == '/diff'
+        ? ''
+        : trimmed.substring('/diff '.length).trim();
+    try {
+      final raw = await peer.sendRequest(
+        '_fm_agent_os/jj_diff',
+        <String, dynamic>{
+          'sessionId': state.sessionId,
+          if (arg.isNotEmpty) 'taskId': arg,
+        },
+      );
+      final map = _asStringMap(raw);
+      final diffText = (map['diff'] as String?) ?? '';
+      _out.writeln('[Diff] rev=${map['rev'] ?? arg} conflicts=${map['hasConflicts'] ?? false}');
+      if (diffText.isNotEmpty) {
+        _out.writeln(diffText.trimRight());
+      }
+      return const _LineAction();
+    } on JsonRpcException catch (e) {
+      _out.writeln('[Diff Error] (${e.code}) ${e.message}');
+      return const _LineAction(failed: true);
     }
   }
 }
@@ -1106,11 +1458,11 @@ class _StdinLineRouter {
   final List<String> _replBuffer = <String>[];
   Completer<String?>? _permissionWaiter;
   Completer<String?>? _replWaiter;
-  void Function()? _midTurnCancelHandler;
+  bool Function(String line)? _midTurnCommandHandler;
   bool _closed = false;
 
-  void setMidTurnCancelHandler(void Function()? handler) {
-    _midTurnCancelHandler = handler;
+  void setMidTurnCommandHandler(bool Function(String line)? handler) {
+    _midTurnCommandHandler = handler;
   }
 
   void _onLine(String line) {
@@ -1120,8 +1472,7 @@ class _StdinLineRouter {
       w.complete(line);
       return;
     }
-    if (_midTurnCancelHandler != null && line.trim() == '/cancel') {
-      _midTurnCancelHandler!();
+    if (_midTurnCommandHandler != null && _midTurnCommandHandler!(line)) {
       return;
     }
     if (_replWaiter != null && !_replWaiter!.isCompleted) {

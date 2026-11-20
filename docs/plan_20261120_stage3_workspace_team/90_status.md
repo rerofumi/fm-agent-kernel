@@ -1,5 +1,5 @@
 tier: Full
-state: planned
+state: done
 worklog: disabled
 
 # 90_status.md — 進捗正本（`plan_20261120_stage3_workspace_team`）
@@ -27,17 +27,17 @@ worklog: disabled
 
 | 項目 | 内容 |
 | --- | --- |
-| 現在の工程 / 担当 | `plan` / `Lv.2 plan`（単独実行 `fm-dev-plan`） |
-| 担当leaderの実行参照 | `conversation://4c2c6eed-3131-46a1-9e26-85375d010fe4` |
+| 現在の工程 / 担当 | `implement` / `Lv.1/Lv.2 leader`（`fm-dev-process` ＋ `fm-dev-implement` 兼任） |
+| 担当leaderの実行参照 | `conversation://2d00c35b-ede6-4f7e-b0f2-e5865ec6631f` |
 | 呼び出し元 / 返却先 | 利用者 / 利用者 |
-| 工程の結果 | **`ready`**（計画版 `r1` 確定、独立計画レビュー `PT-06`・差分再レビュー `PT-09` にて阻害事項 `0` 件、`50_review_notes.md` §8 参照） |
-| 基準ソース版（Stage 2 完了版） | `jj` commit `a5e8e5d383c85f764bceb7f302d96735b025e813`（change `qzzvklrlqnpqvynmkwoytruxwywpozxv`, bookmark `main`、現在 `@` は空コミット `cdc3624bed94e704eb2792eb259678eb6edb5629`、製品コード差分 `0` 件） |
-| 採用計画 | 未採用（初回計画 `ready` 返却済み。次工程 `implement` 開始時に版 `r1` を採用する） |
-| 利用可能な計画版 | **`r1`**（復元用参照: 基準 `jj` commit `a5e8e5d383c85f764bceb7f302d96735b025e813` ＋ `docs/plan_20261120_stage3_workspace_team/env_manifest.md` 正本 23 ファイル SHA-256 独立照合一致、最終レビュー承認: `50_review_notes.md` §8 `PT-09`） |
+| 工程の結果 | **`complete`**（`WP-1`〜`WP-9` 全完了、独立 `fm-dev-acceptance` にて `REQ-01`〜`REQ-11` 全 11 件 **`pass`**、`fm-dev-release` 完了処理・current docs 反映完了。サブエージェントモデル: `gemini-4-hydrogen-medium`） |
+| 基準ソース版（Stage 2 完了版） | 製品基準版 `jj` commit `a5e8e5d383c85f764bceb7f302d96735b025e813` / 実装開始点 `d05da3c198bc4a8fab601da8ce388ddba2e143f2`（`main | Stage3 Planned`、製品コード差分 `0` 件確認済み） |
+| 採用計画 | **`r1`**（復元用参照: `jj` commit `d05da3c198bc4a8fab601da8ce388ddba2e143f2` ＋ `docs/plan_20261120_stage3_workspace_team/env_manifest.md` 正本 23 ファイル SHA-256 独立照合一致、最終計画レビュー承認: `50_review_notes.md` §8 `PT-09`） |
+| 利用可能な計画版 | **`r1`**（同上） |
 | 改訂案 | なし |
 | 再計画要求 | なし |
-| 現在の作業 / 次の作業 | 計画工程完了（全計画作業 `PT-01`〜`PT-09` 回収・照合済み、未了作業なし） / 次担当: `Lv.2 implement`（`fm-dev-implement` / `fm-dev-process`）による `WP-1` からの実装着手（`WP-1` → `WP-2` → `WP-3` → `WP-4`∥`WP-5`∥`WP-6` → `WP-7` → `WP-8` → `WP-9`） |
-| 保留理由 / 再開条件 | なし（分類 A・分類 B・レビュー阻害事項すべて解消済み。基準ソース版 `a5e8e5d383c85f764bceb7f302d96735b025e813` から直ちに `WP-1` を開始可能） |
+| 現在の作業 / 次の作業 | 完了（`WP-1`〜`WP-9`、独立 `fm-dev-acceptance`、`fm-dev-release` すべて回収・照合済み、未了作業なし） / 次: なし（利用者へ完了報告・引き渡し済み） |
+| 保留理由 / 再開条件 | なし |
 
 ## 計画成果物と担当範囲
 
@@ -53,9 +53,13 @@ worklog: disabled
 | `docs/plan_20261120_stage3_workspace_team/60_review_packet.md` | 利用者向けレビュー案内・判断事項・正本リンク | Lv.2 plan leader | 確定（版 `r1`） |
 | `docs/plan_20261120_stage3_workspace_team/env_manifest.md` | 環境宣言（基準ソース版・テスト資産 32 ファイル・計画正本 23 ファイル SHA-256・照合方法） | Lv.2 plan leader | 確定（版 `r1`：`23/23` 独立照合一致） |
 
-## 現在進行中・未了の作業（Plan 工程）
+## 現在進行中・未了の作業（Implement 工程）
 
-- 未了作業: **なし**（全計画作業 `PT-01`〜`PT-09` はすべて完了・回収済み。完了根拠は下記「履歴」節を参照。次は `fm-dev-implement` / `fm-dev-process` にて計画版 `r1` を採用し `WP-1` から実装を開始する）。
+- 採用計画版: `r1`（実装開始点 `jj` commit `d05da3c198bc4a8fab601da8ce388ddba2e143f2`、作業場所: 共有作業ツリー `e:/programming/AI_generative/fm-agent-kernel`、Lv.3 サブエージェントモデル: `gemini-4-hydrogen-medium`）
+- 完了済み: `IT-01`〜`IT-07`（`WP-1`〜`WP-9` 全 9 WP 完了）、`IT-08`（独立 `fm-dev-acceptance` 全 `REQ-01`〜`REQ-11` `pass` 確定、`evidence/acceptance_report.md`）、`IT-09`（`fm-dev-release` 完了：`README.md`, `docs/plan_index.md`, `docs/cheatsheet/acp_protocol.md` 更新・製品コード非変更確認済み）
+- 実行中: なし
+- 未了: **なし**（全工程 `complete` / `state: done`）
+- 反復累積カウント: `REQ-01`〜`REQ-11` すべて `0 / 3`、再計画 `RP` 累積 `0 / 2`
 
 ## おまかせ判断記録
 
@@ -74,17 +78,17 @@ worklog: disabled
 
 | ID | Requirement summary | 対象設計ID | 状態 | Verification method | Evidence class | WP | Implementer state | Evidence | Acceptance |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `REQ-01` | `WorkspaceWorker` への `jj workspace`（`.agent_os/ws/<pid>`）＆無名 `Change ID` 自動払い出し・並列編集・同時 `dart test`・自動クリーンアップ | `D-301, D-302, D-304, D-305, D-306, D-307, D-308` | `今回実装` | 単体/統合テスト＋並列 `WorkspaceWorker` 同時編集・`dart test`・子専用 `jjChangeId` 実機観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-02` | ホスト単一 `JjDriver` ミューテックスによる全 `jj` 更新・`-R <ws_path>` 即時スナップショット直列化と `jj op log` 一本道維持 | `D-304, D-305, D-308` | `今回実装` | 構造検査＋高頻度並行更新テスト＋並列稼働後の `jj op log` 親数検査 | `E1 / E2 / E3` | `WP-1, WP-2, WP-5, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-03` | `sys_jj_merge([c1, c2, ...])` 多親マージ・非重複変更の 1 発統合・全体テスト通過・単一作業チェンジ統合＆承認 `squash` 連動 | `D-302, D-304, D-305, D-309` | `今回実装` | 多親マージ/平坦化統合テスト＋非重複並列ワーカー成果の統合実機観測 | `E1 / E2` | `WP-1, WP-3, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-04` | `sys_jj_conflicts` 機械可読競合検査・未解消誤 `squash` 防止・同一関数衝突時の First-Class Conflict 非停止解消フロー（親＆`ConflictResolver` 対応） | `D-302, D-304, D-306, D-309, D-310` | `今回実装` | 競合検出/承認前非破壊 `ECONFLICT` 拒否テスト＋同一関数衝突ワーカーの非停止解消実機観測 | `E1 / E2` | `WP-1, WP-3, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-05` | シグナル制御（`SIGSTOP` 一時凍結・`SIGCONT` 方針変更注入再開・`SIGKILL` プロセスツリー＆一時 `jj workspace` 一括強制回収） | `D-302, D-303, D-304, D-312, D-313, D-314, D-320, D-321` | `今回実装` | サスペンド/ペアリング保護/一括回収テスト＋イベント駆動一時停止・タグ制約注入実機観測 | `E1 / E2` | `WP-1, WP-5, WP-6, WP-7, WP-8, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-06` | Supervisor 自動回復ポリシー（異常終了・タイムアウト時の汚染ワークスペース破棄＋クリーン再試行／`fallbackModel` 切替＋クオータ保存則維持） | `D-303, D-304, D-305, D-315` | `今回実装` | DI 異常注入回復・消費計上テスト＋本番 `.exe` `fallbackModel`＆短 `maxWallTimeMs` 実機観測 | `E1 / E2` | `WP-1, WP-5, WP-7, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-07` | 超長期プロセス向け Dirty Page Swap（Turn Group 原子退避・`.agent_os/swap/` 秘密マスク Write-back・決定論的構造化 `SummaryPage`・`sys_mem_pagein` 再展開） | `D-302, D-303, D-304, D-305, D-316, D-317, D-320, D-321` | `今回実装` | Turn Group 退避/マスク/`dirty_swap` 復元テスト＋`--max-context-tokens` 実機 Swap・再展開観測 | `E1 / E2` | `WP-1, WP-4, WP-7, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-08` | `stdio` MCP クライアントドライバ（`sys_mcp_call` 等、ACP `mcpServers` ＆ CLI `--mcp-server` 対応・Ring 2 承認連携・資格情報秘匿・終了時回収） | `D-301, D-302, D-303, D-304, D-305, D-318, D-319, D-320, D-321` | `今回実装` | pure-Dart MCP プロトコル/秘匿/承認テスト＋実 `.exe` MCP サーバー接続呼び出し実機観測 | `E1 / E2` | `WP-1, WP-4, WP-7, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-09` | カンバンタスク対応 Stacked Changes プロセスツリー管理（`c_A -> c_B` 積層・ACP/CLI 公開・親タスク修正時の自動リベース＆`update-stale` 自動追従） | `D-302, D-304, D-308, D-311, D-320, D-321, D-323` | `今回実装` | 積層リベース/`update-stale`/`divergent` 防止テスト＋人間修正自動追従実機観測 | `E1 / E2` | `WP-1, WP-5, WP-6, WP-7, WP-8, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-10` | Stage 1・Stage 2 全機能非回帰・並列ワーカー/MCP 下での Zed ACP `stdio` 100% NDJSON 純度＆TTY 独占維持・全 3 `.exe` 単一ファイル完結 | `D-301, D-304, D-305, D-324` | `今回実装` | 構造検査＋既存 175 件＆新規全自動テスト＋SDK 除外全 3 `.exe` 通し統合実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-3, WP-4, WP-6, WP-7, WP-9` | `todo` | — | `unverified: 計画策定中` |
-| `REQ-11` | ACP 接続型・単一 `.exe` ローカル Web カンバン GUI アプリ（`acp_kanban_app.exe`：`127.0.0.1` 限定・外部 CDN ゼロ・並列/Stacked/シグナル/承認操作） | `D-301, D-320, D-322, D-323, D-324` | `今回実装` | エンジン非 import/CDN ゼロ構造検査＋HTTP/WS/CSRF 自動テスト＋DOM＆実機カンバン一連操作観測 | `E1 / E2 / E3` | `WP-6, WP-7, WP-8, WP-9` | `todo` | — | `unverified: 計画策定中` |
+| `REQ-01` | `WorkspaceWorker` への `jj workspace`（`.agent_os/ws/<pid>`）＆無名 `Change ID` 自動払い出し・並列編集・同時 `dart test`・自動クリーンアップ | `D-301, D-302, D-304, D-305, D-306, D-307, D-308` | `今回実装` | 単体/統合テスト＋並列 `WorkspaceWorker` 同時編集・`dart test`・子専用 `jjChangeId` 実機観測 | `E1 / E2` | `WP-1, WP-2, WP-9` | `implemented` | `evidence/wp2_step3_1.md:"事象 3-1-1"`, `evidence/wp9_final_integration.md:"sys_spawn 並列 2 ワーカー"`, `evidence/acceptance_report.md:"## 4. REQ-01 〜 REQ-11 受け入れ判定表"` | `pass` |
+| `REQ-02` | ホスト単一 `JjDriver` ミューテックスによる全 `jj` 更新・`-R <ws_path>` 即時スナップショット直列化と `jj op log` 一本道維持 | `D-304, D-305, D-308` | `今回実装` | 構造検査＋高頻度並行更新テスト＋並列稼働後の `jj op log` 親数検査 | `E1 / E2 / E3` | `WP-1, WP-2, WP-5, WP-9` | `implemented` | `evidence/wp2_step3_1.md:"1. E3: 構造確認"`, `evidence/wp2_step3_1.md:"事象 3-1-2"`, `evidence/wp9_final_integration.md:"全 27 オペレーションで分岐 0 件"` | `pass` |
+| `REQ-03` | `sys_jj_merge([c1, c2, ...])` 多親マージ・非重複変更の 1 発統合・全体テスト通過・単一作業チェンジ統合＆承認 `squash` 連動 | `D-302, D-304, D-305, D-309` | `今回実装` | 多親マージ/平坦化統合テスト＋非重複並列ワーカー成果の統合実機観測 | `E1 / E2` | `WP-1, WP-3, WP-9` | `implemented` | `evidence/wp3_step3_2.md:"事象 3-2-1"`, `evidence/wp9_final_integration.md:"sys_jj_merge"`, `evidence/acceptance_report.md:"## 4. REQ-01 〜 REQ-11 受け入れ判定表"` | `pass` |
+| `REQ-04` | `sys_jj_conflicts` 機械可読競合検査・未解消誤 `squash` 防止・同一関数衝突時の First-Class Conflict 非停止解消フロー（親＆`ConflictResolver` 対応） | `D-302, D-304, D-306, D-309, D-310` | `今回実装` | 競合検出/承認前非破壊 `ECONFLICT` 拒否テスト＋同一関数衝突ワーカーの非停止解消実機観測 | `E1 / E2` | `WP-1, WP-3, WP-9` | `implemented` | `evidence/wp3_step3_2.md:"事象 3-2-2"`, `evidence/wp3_step3_2.md:"経路 B（専任 ConflictResolver 子ワーカー委譲解消）"` | `pass` |
+| `REQ-05` | シグナル制御（`SIGSTOP` 一時凍結・`SIGCONT` 方針変更注入再開・`SIGKILL` プロセスツリー＆一時 `jj workspace` 一括強制回収） | `D-302, D-303, D-304, D-312, D-313, D-314, D-320, D-321` | `今回実装` | サスペンド/ペアリング保護/一括回収テスト＋イベント駆動一時停止・タグ制約注入実機観測 | `E1 / E2` | `WP-1, WP-5, WP-6, WP-7, WP-8, WP-9` | `implemented` | `evidence/wp5_signals_supervisor_stacked_unit.md:"All tests passed!"`, `evidence/wp7_step3_3_runtime_cli.md:"事象 3-3-2（REQ-05 シグナル制御）"`, `evidence/wp8_kanban_gui.md:"WP8_E2_SIGCONT_991"` | `pass` |
+| `REQ-06` | Supervisor 自動回復ポリシー（異常終了・タイムアウト時の汚染ワークスペース破棄＋クリーン再試行／`fallbackModel` 切替＋クオータ保存則維持） | `D-303, D-304, D-305, D-315` | `今回実装` | DI 異常注入回復・消費計上テスト＋本番 `.exe` `fallbackModel`＆短 `maxWallTimeMs` 実機観測 | `E1 / E2` | `WP-1, WP-5, WP-7, WP-9` | `implemented` | `evidence/wp5_signals_supervisor_stacked_unit.md:"DI 異常注入 Supervisor 全経路①〜⑧"`, `evidence/wp7_step3_3_runtime_cli.md:"事象 3-3-1（REQ-06 Supervisor 回復）"` | `pass` |
+| `REQ-07` | 超長期プロセス向け Dirty Page Swap（Turn Group 原子退避・`.agent_os/swap/` 秘密マスク Write-back・決定論的構造化 `SummaryPage`・`sys_mem_pagein` 再展開） | `D-302, D-303, D-304, D-305, D-316, D-317, D-320, D-321` | `今回実装` | Turn Group 退避/マスク/`dirty_swap` 復元テスト＋`--max-context-tokens` 実機 Swap・再展開観測 | `E1 / E2` | `WP-1, WP-4, WP-7, WP-9` | `implemented` | `evidence/wp4_swap_mcp_unit.md:"All tests passed!"`, `evidence/wp7_step3_3_runtime_cli.md:"3. Dirty Page Swap（REQ-07）"` | `pass` |
+| `REQ-08` | `stdio` MCP クライアントドライバ（`sys_mcp_call` 等、ACP `mcpServers` ＆ CLI `--mcp-server` 対応・Ring 2 承認連携・資格情報秘匿・終了時回収） | `D-301, D-302, D-303, D-304, D-305, D-318, D-319, D-320, D-321` | `今回実装` | pure-Dart MCP プロトコル/秘匿/承認テスト＋実 `.exe` MCP サーバー接続呼び出し実機観測 | `E1 / E2` | `WP-1, WP-4, WP-7, WP-9` | `implemented` | `evidence/wp4_swap_mcp_unit.md:"mock_stdio_mcp_server.dart"`, `evidence/wp7_step3_3_runtime_cli.md:"4. stdio MCP 連携（REQ-08）"`, `evidence/wp9_final_integration.md:"sys_mcp_list_tools"` | `pass` |
+| `REQ-09` | カンバンタスク対応 Stacked Changes プロセスツリー管理（`c_A -> c_B` 積層・ACP/CLI 公開・親タスク修正時の自動リベース＆`update-stale` 自動追従） | `D-302, D-304, D-308, D-311, D-320, D-321, D-323` | `今回実装` | 積層リベース/`update-stale`/`divergent` 防止テスト＋人間修正自動追従実機観測 | `E1 / E2` | `WP-1, WP-5, WP-6, WP-7, WP-8, WP-9` | `implemented` | `evidence/wp5_signals_supervisor_stacked_unit.md:"Step 3-3 3 段積層"`, `evidence/wp7_step3_3_runtime_cli.md:"5. 事象 3-3-3（REQ-09 Stacked Changes）"`, `evidence/wp8_kanban_gui.md:"cascaded=1"` | `pass` |
+| `REQ-10` | Stage 1・Stage 2 全機能非回帰・並列ワーカー/MCP 下での Zed ACP `stdio` 100% NDJSON 純度＆TTY 独占維持・全 3 `.exe` 単一ファイル完結 | `D-301, D-304, D-305, D-324` | `今回実装` | 構造検査＋既存 175 件＆新規全自動テスト＋SDK 除外全 3 `.exe` 通し統合実機観測 | `E1 / E2 / E3` | `WP-1, WP-2, WP-3, WP-4, WP-6, WP-7, WP-9` | `implemented` | `evidence/wp9_final_integration.md:"E3 自動構造検査 5 項目"`, `evidence/wp9_final_integration.md:"daemonNonJsonLines: 0"`, `evidence/acceptance_report.md:"## 4. REQ-01 〜 REQ-11 受け入れ判定表"` | `pass` |
+| `REQ-11` | ACP 接続型・単一 `.exe` ローカル Web カンバン GUI アプリ（`acp_kanban_app.exe`：`127.0.0.1` 限定・外部 CDN ゼロ・並列/Stacked/シグナル/承認操作） | `D-301, D-320, D-322, D-323, D-324` | `今回実装` | エンジン非 import/CDN ゼロ構造検査＋HTTP/WS/CSRF 自動テスト＋DOM＆実機カンバン一連操作観測 | `E1 / E2 / E3` | `WP-6, WP-7, WP-8, WP-9` | `implemented` | `evidence/wp6_kanban_unit.md:"E3 Structural Boundary Checks"`, `evidence/wp8_kanban_gui.md:"E2: .planworks/wp8_e2/"`, `packages/agent_acp/lib/src/kanban/kanban_server.dart:"InternetAddress.loopbackIPv4"` | `pass` |
 
 ## 履歴
 
@@ -133,4 +137,49 @@ worklog: disabled
 担当 / 実行参照 / 対象版: fm-dev-reviewer / conversation://252d1148-3ccd-4d9a-bc10-837cf4157d33 / 計画版 r1（env_manifest.md 正本 23/23 SHA-256 完全一致・保持 17 ファイル不変・WP-4∥WP-5∥WP-6 28 ファイル完全非重複を独立確認）
 結果 / 証跡への参照: 完了（E1/E2/E3：RV-001〜RV-005 全 5 件解消確認、継続/新規指摘 0 件［Critical=0, Must-fix=0, Suggest=0］、ready 移行可能判定） / docs/plan_20261120_stage3_workspace_team/50_review_notes.md:"## 8. 差分再レビュー結論（`PT-09` / 最終進行可否）"
 未了・次の引き渡し: 阻害事項 0 件を確認し plan 工程完了（ready 返却）。次工程 implement（WP-1〜WP-9）へ引き渡し可能
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-01 / WP-1（Ring 0 `agent_kernel` Stage 3 共通契約・データモデル・`SyscallGate`/`ContextPager` 基盤実装、REQ-01〜REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop (`swarm: dev-wp1`, model: `gemini-4-hydrogen-medium`) / conversation://785cedef-7f29-484b-b191-d19770979b85 (board #3) / 計画版 r1（基準 commit d05da3c198bc4a8fab601da8ce388ddba2e143f2）
+結果 / 証跡への参照: 完了（E1/E3：`dart analyze` 0 件、全 4 パッケージ計 186 件 pass［既存 32 ファイル 175 件無修正＋新規 `stage3_kernel_contracts_test.dart` 11 件］、Ring 0 禁止依存 0 件） / docs/plan_20261120_stage3_workspace_team/evidence/wp1_ring0_contracts.md:"E1: 静的解析・全テスト結果", docs/plan_20261120_stage3_workspace_team/evidence/run_records.md:"R-WP1-01"
+未了・次の引き渡し: Ring 0 共有契約確定済み。IT-02（WP-2: Step 3-1 完了ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-02 / WP-2（Step 3-1 完了ゲート：`jj workspace` 自動払い出し・`JjDriver` 単一ミューテックス・プロセス別ドライバ統合・事象 3-1-1/3-1-2 実機確認、REQ-01, REQ-02, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop (`swarm: dev-wp2`, model: `gemini-4-hydrogen-medium`) / conversation://9a102bbb-7b08-4832-bda7-a7ddc11e0454 (board #5) / 計画版 r1
+結果 / 証跡への参照: 完了（E1/E2/E3：`dart analyze` 0 件、全 4 パッケージ計 191 件 pass、子 Isolate `JjDriver` 非保持確認、隔離 Pub Workspaces 実 `jj` リポジトリ × `local-ollama/gemma4:12b` 事象 3-1-1/3-1-2 完走、`.planworks/wp2_e2` 削除・本リポジトリ無汚染確認済み） / docs/plan_20261120_stage3_workspace_team/evidence/wp2_step3_1.md:"事象 3-1-1", docs/plan_20261120_stage3_workspace_team/evidence/run_records.md:"R-WP2-01"
+未了・次の引き渡し: Step 3-1 完了ゲート通過。IT-03（WP-3: Step 3-2 完了ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-03 / WP-3（Step 3-2 完了ゲート：`sys_jj_merge`/`sys_jj_conflicts`/`sys_jj_integrate`・`ECONFLICT` ガード・`ConflictResolver`・事象 3-2-1/3-2-2 実機確認、REQ-03, REQ-04, REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop (`swarm: dev-wp3`, model: `gemini-4-hydrogen-medium`) / conversation://2a4e32ca-abc7-4017-8678-2ac40a6546ed (board #23) / 計画版 r1（snapshot `3c2fb6cc`）
+結果 / 証跡への参照: 完了（E1/E2：`dart analyze` 0 件、全 4 パッケージ計 196 件 pass、隔離実 `jj` リポジトリ × `local-ollama/gemma4:12b` で事象 3-2-1・事象 3-2-2 完走、`.planworks/` 削除・本リポジトリ無汚染・残留プロセス 0 件確認済み） / docs/plan_20261120_stage3_workspace_team/evidence/wp3_step3_2.md:"事象 3-2-1", docs/plan_20261120_stage3_workspace_team/evidence/wp3_step3_2.md:"事象 3-2-2", docs/plan_20261120_stage3_workspace_team/evidence/run_records.md:"R-WP3-02"
+未了・次の引き渡し: Step 3-2 完了ゲート通過。IT-04a（WP-4）∥ IT-04b（WP-5）∥ IT-04c（WP-6）並列実装へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-04a・IT-04b・IT-04c / WP-4 ∥ WP-5 ∥ WP-6（Step 3-3 並列トラック 3 本：Dirty Swap & MCP、シグナル/Supervisor/Stacked、純粋 `wire/*` & `acp_kanban_app`）
+担当 / 実行参照 / 対象版: fm-dev-develop (`dev-wp4` conversation://baf89ae0-007c-4218-a663-5501afb2f556 #28, `dev-wp5` conversation://2a96b668-412a-4f21-b353-845bef15f4bc #30, `dev-wp6` conversation://6a3e1e3e-da4c-4b5f-94b1-ebe494caabea #27, 全員 model: `gemini-4-hydrogen-medium`) / 計画版 r1（snapshot `37c4ac6a`、28 ファイル完全非重複確認済み）
+結果 / 証跡への参照: 完了（E1/E3：WP-4 `dart analyze` 0 件・19/19 pass・E3 OK、WP-5 `dart analyze` 0 件・50/50 pass・E3 OK、WP-6 `dart analyze` 0 件・`acp_kanban_app.exe` AOT ビルド成功・10/10 pass・E3 OK） / docs/plan_20261120_stage3_workspace_team/evidence/wp4_swap_mcp_unit.md:"All tests passed!", docs/plan_20261120_stage3_workspace_team/evidence/wp5_signals_supervisor_stacked_unit.md:"All tests passed!", docs/plan_20261120_stage3_workspace_team/evidence/wp6_kanban_unit.md:"10/10 全件 pass"
+未了・次の引き渡し: 全 3 並列トラック完了・差分非重複照合済み。IT-05（WP-7: Step 3-3 ランタイム・ACP/CLI 完了ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-05 / WP-7（Step 3-3 ランタイム・ACP/CLI 完了ゲート：`KernelBootstrap`/`AcpServer`/`_fm_agent_os/*`/CLI 一括統合＆Step 3-3 全 5 領域実機確認、REQ-05〜REQ-10）
+担当 / 実行参照 / 対象版: fm-dev-develop (`swarm: dev-wp7`, model: `gemini-4-hydrogen-medium`) / conversation://1d71c53c-e08b-4113-9949-95275925c536 (board #38) / 計画版 r1（snapshot `86f420a7`）
+結果 / 証跡への参照: 完了（E1/E2：`dart analyze` 全 4 パッケージ 0 件、全 4 パッケージ計 227 件 pass、隔離実 `jj` リポ × ビルド済み `.exe` × `local-ollama` で事象 3-3-1/3-3-2/Dirty Swap/MCP/事象 3-3-3 の全 5 領域完走、`.planworks/wp7_e2` 削除・本リポ無汚染・残留プロセス 0 件） / docs/plan_20261120_stage3_workspace_team/evidence/wp7_step3_3_runtime_cli.md:"全 227 件 pass", docs/plan_20261120_stage3_workspace_team/evidence/run_records.md:"R-WP7-02"
+未了・次の引き渡し: Step 3-3 ランタイム・ACP/CLI 完了ゲート通過。IT-06（WP-8: ローカル Web カンバン GUI 完了ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-06 / WP-8（ローカル Web カンバン GUI 完了ゲート：`acp_kanban_app.exe` × 実 `agent_os_daemon.exe` 結合 E2E・Edge ヘッドレス DOM・カンバン一連操作①〜④・連鎖回収、REQ-05, REQ-09, REQ-10, REQ-11）
+担当 / 実行参照 / 対象版: fm-dev-develop (`swarm: dev-wp8`, model: `gemini-4-hydrogen-medium`) / conversation://43557e3d-31e7-4281-9576-3b4e3900a194 (board #44) / 計画版 r1（snapshot `eeabdd06`）
+結果 / 証跡への参照: 完了（E1/E2/E3：`dart analyze` 0 件、全 4 パッケージ計 229 件 pass［新規 `kanban_daemon_e2e_test.dart` 2/2 含む］、実機 `.exe` × `msedge.exe --headless --dump-dom` × `local-ollama` で `KANBAN_READY`/CSRF 403/FIFO 0 `-32000`/WS 1933件/SIGSTOP→SIGCONT→SIGKILL/Ring 2 承認・拒否/`stack_edit` 自動リベース/連鎖シャットダウン残留 0 件を確認） / docs/plan_20261120_stage3_workspace_team/evidence/wp8_kanban_gui.md:"全 229 件 pass", docs/plan_20261120_stage3_workspace_team/evidence/wp8_kanban_gui.md:"E2: .planworks/wp8_e2/", docs/plan_20261120_stage3_workspace_team/evidence/run_records.md:"R-WP8-02"
+未了・次の引き渡し: ローカル Web カンバン GUI 完了ゲート通過。IT-07（WP-9: Stage 3 最終 AOT 3 バイナリ E2E 統合ゲート）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-07 / WP-9（Stage 3 最終 AOT 3 バイナリ E2E 統合ゲート・全 E3 構造検査・全 237 テスト・SDK 除外起動・`stdout` 純度・Stage 1/2 非回帰＋Stage 3 通し E2E、REQ-01〜REQ-11）
+担当 / 実行参照 / 対象版: fm-dev-develop (`swarm: dev-wp9`, model: `gemini-4-hydrogen-medium`) / conversation://9e67920a-ec10-4222-ad0f-11566f02af25 (board #50) / 計画版 r1（snapshot `3d0ba22eeebf761757c55cf5764d898879e7029e`）
+結果 / 証跡への参照: 完了（E1/E2/E3：E3 構造検査 5 項目全合格、`dart analyze` 0 件、全 41 テストファイル 237 件 pass、全 3 `.exe` クリーン AOT ビルド＆SHA-256 確定・SDK 除外起動成功、`stdout` 2515 行非 JSON 0 件、`jj op log` 27 ops 分岐 0 件、Stage 1/2 非回帰＋Stage 3 通し完走、`.planworks/` 削除・残留プロセス 0 件） / docs/plan_20261120_stage3_workspace_team/evidence/wp9_final_integration.md:"計 237 件 pass", docs/plan_20261120_stage3_workspace_team/evidence/run_records.md:"R-WP9-01"
+未了・次の引き渡し: `env_manifest.md` 更新完了。IT-08（独立 `fm-dev-acceptance` 全 11 REQ 受け入れ判定）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-08 / 独立受け入れ判定（`REQ-01`〜`REQ-11` 全 11 件・`env_manifest.md` 独立照合・独立 `dart analyze`/`dart test` 実行）
+担当 / 実行参照 / 対象版: fm-dev-acceptance (`swarm: acceptance`, model: `gemini-4-hydrogen-medium`) / conversation://cd9a32e1-0b24-4c75-b269-8e14cfb0bff5 (board #52) / 計画版 r1（snapshot `3d0ba22eeebf761757c55cf5764d898879e7029e`）
+結果 / 証跡への参照: 完了（**全 11 REQ `pass`**［`fail=0`, `unverified=0`, `human-pending=0`, `Critical=0`, `Must-fix=0`, `Suggest=1`］。全 3 `.exe` SHA-256 完全一致・41 テストファイル・`dart analyze` 0 件・`dart test` 236/237＋`win32_job_exec_test.dart` 単独 10/10 全 pass 確認） / docs/plan_20261120_stage3_workspace_team/evidence/acceptance_report.md:"## 4. REQ-01 〜 REQ-11 受け入れ判定表"
+未了・次の引き渡し: 全 11 REQ 独立受け入れ合格。IT-09（`fm-dev-release` current docs 反映・引き渡し整理）へ引き渡し
+
+履歴ID / 対象（作業・REQ/WP・文書）: IT-09 / リリース完了処理・current docs 反映（`README.md`, `docs/plan_index.md`, `docs/cheatsheet/acp_protocol.md`）
+担当 / 実行参照 / 対象版: fm-dev-release (`swarm: release`, model: `gemini-4-hydrogen-medium`) / conversation://44857524-97e8-45bd-84b1-40c6231e47f2 (board #54) / 計画版 r1（受け入れ対象 snapshot `3d0ba22eeebf761757c55cf5764d898879e7029e`）
+結果 / 証跡への参照: 完了（`README.md` Stage 3 反映、`docs/plan_index.md` `done` 更新、`docs/cheatsheet/acp_protocol.md` §4 知見追記、製品コード差分 0 件・全 3 `.exe` SHA-256 一致・リンク 14 件実在確認済み、push/deploy 未実施） / README.md, docs/plan_index.md, docs/cheatsheet/acp_protocol.md
+未了・次の引き渡し: 全工程完了（`state: done` / `complete`）。利用者へ完了報告
 ```

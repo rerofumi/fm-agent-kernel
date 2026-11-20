@@ -9,6 +9,7 @@ import 'package:meta/meta.dart';
 import 'isolate_worker_host.dart';
 import 'process_runner.dart';
 import 'process_syscalls.dart';
+import 'stacked_task_manager.dart';
 import 'sub_agent_worker.dart';
 
 /// Configuration options for [KernelBootstrap.create] ([D-001], [D-022]).
@@ -46,6 +47,12 @@ class KernelBootstrapConfig {
     this.pageFreshnessChecker,
     this.onPagingReport,
     this.enableStage2Multiprocess = false,
+    this.enableStage3Team = false,
+    this.maxContextTokens,
+    this.dirtySwapBackend,
+    this.mcpServers = const <McpServerSpec>[],
+    this.mcpServerManager,
+    this.stackedTaskManager,
     this.childWorkerBackend,
     this.quotaLedger,
     this.leadCspace,
@@ -90,6 +97,12 @@ class KernelBootstrapConfig {
   final PageFreshnessChecker? pageFreshnessChecker;
   final PagingReportObserver? onPagingReport;
   final bool enableStage2Multiprocess;
+  final bool enableStage3Team;
+  final int? maxContextTokens;
+  final DirtySwapBackend? dirtySwapBackend;
+  final List<McpServerSpec> mcpServers;
+  final McpServerManager? mcpServerManager;
+  final StackedTaskManager? stackedTaskManager;
   final ChildWorkerBackend? childWorkerBackend;
   final QuotaLedger? quotaLedger;
   final CapabilityTable? leadCspace;
@@ -145,8 +158,13 @@ class KernelBootstrap {
     required this.processRunner,
     required this.quotaLedger,
     this.workerHost,
+    this.dirtySwapBackend,
+    this.mcpServerManager,
+    this.stackedTaskManager,
+    List<McpServerSpec> initialMcpServers = const <McpServerSpec>[],
     required List<void Function()> ownedClosers,
-  }) : _ownedClosers = ownedClosers;
+  })  : _initialMcpServers = initialMcpServers,
+        _ownedClosers = ownedClosers;
 
   /// Default immutable Segment 0 instruction for Stage 1 Step 1-1/1-2 execution ([D-007]).
   static const String defaultStep1Instruction = '''
@@ -180,17 +198,32 @@ Rules:
   /// Default immutable Segment 0 instruction for Stage 2 multi-process execution ([D-007], [D-211], [D-218], [D-219]).
   static const String defaultStage2Instruction = '''
 $defaultStep1Instruction
-Available Stage 2 virtual memory, multi-process, and skill syscalls:
+Available Stage 2/3 virtual memory, multi-process, merge, and skill syscalls:
 - `sys_mem_pagein`: Reload an evicted Clean Page by `pageId` from Segment 2's Page Directory Summary.
-- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for parallel read-only workspace inspection, `web_researcher` for sterile external web research).
-- `sys_wait`: Wait for spawned child processes and receive only their concise exit summaries (keeping raw file contents and raw web HTML out of your context).
+- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit).
+- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s.
+- `sys_jj_merge`: Merge 2+ completed worker `changeIds` into a multi-parent commit (never aborts on First-Class Conflicts; returns `mergeChangeId`, `hasConflicts`, and `conflictedFiles`).
+- `sys_jj_conflicts`: Non-destructively inspect First-Class Conflicts on a revision (`hasConflicts` and `/workspace/...` `files`).
+- `sys_jj_integrate`: Flatten a conflict-free resolved merge or worker change into your single-parent anchor working change and abandon temporary worker/merge changes before `sys_tx_squash`.
 - `sys_send` / `sys_recv`: Exchange bounded structured IPC messages between parent and own children.
 - `sys_skill_list` / `sys_skill_read` (when `/skills` has mounted skills): Discover and read external read-only `SKILL.md` guides on demand.
 
 Multi-process and isolation rules:
-7. When asked to investigate multiple packages or directories in parallel, spawn `explorer` children with `sys_spawn` (optionally narrowing `allowedSubpaths`) and collect their concise conclusions with `sys_wait`.
-8. Child processes are strictly Read-Only (or zero-workspace) and cannot request user approval; perform any edits, commits, or command executions yourself after reviewing child findings.
-9. Workspace ⊕ Net isolation: You hold `/workspace` access and CANNOT invoke `sys_web_search` or `sys_web_fetch` directly. Whenever external web search or URL documentation lookup is required, delegate to a sterile `web_researcher` child via `sys_spawn(profile: "web_researcher", taskPrompt: "...", model: "<optional provider/model>")` and collect its concise summary and source URLs via `sys_wait`.
+7. When asked to investigate multiple packages or directories in parallel, spawn `explorer` children with `sys_spawn` and collect their findings with `sys_wait`.
+8. When asked to implement changes across multiple modules in parallel, spawn `workspace_worker` children with `sys_spawn`, collect their `workingChangeId`s with `sys_wait`, merge them with `sys_jj_merge(changeIds: [...])`, verify `hasConflicts` with `sys_jj_conflicts`, run `dart test` via `sys_exec`, and flatten/finalize via `sys_jj_integrate` + `sys_tx_squash`.
+9. If `sys_jj_merge` reports `hasConflicts: true`, resolve the conflict markers directly via `sys_read_lines` + `sys_edit_block` OR delegate to `sys_spawn(profile: "conflict_resolver", baseChangeId: mergeChangeId, ...)` followed by `sys_jj_integrate(sourceRev: resolverWorkingChangeId)`, verify `hasConflicts: false` and tests pass, then call `sys_tx_squash`.
+10. Workspace ⊕ Net isolation: You hold `/workspace` access and CANNOT invoke `sys_web_search` or `sys_web_fetch` directly. Whenever external web search or URL documentation lookup is required, delegate to a sterile `web_researcher` child via `sys_spawn(profile: "web_researcher", taskPrompt: "...", model: "<optional provider/model>")` and collect its concise summary and source URLs via `sys_wait`.
+''';
+
+  /// Default immutable Segment 0 instruction for Stage 3 team, signal, dirty-swap, MCP, and stacked-task execution ([D-301], [D-311], [D-312], [D-319]).
+  static const String defaultStage3Instruction = '''
+$defaultStage2Instruction
+Available Stage 3 team, signal, dirty-swap, MCP, and stacked-task syscalls:
+- `sys_kill`: Send `SIGSTOP`, `SIGCONT` (with optional `constraintMessage`), or `SIGKILL` to a running child process (`pid`).
+- `sys_task_stack`: Manage Stacked Changes task trees (`create`, `list`, `focus`, `edit`, `integrate_worker`, `sync`, `remove`).
+- `sys_mcp_list_tools`: List available tools from connected stdio MCP servers.
+- `sys_mcp_call`: Invoke a tool on a connected stdio MCP server (requires Ring 2 user approval).
+- `sys_mem_pagein`: Also restores evicted Dirty Page Turn Groups (`source: "dirty_swap"`) by `pageId` or `summaryPageId`.
 ''';
 
   final String sessionId;
@@ -219,6 +252,10 @@ Multi-process and isolation rules:
   final GreenTaskProcessRunner processRunner;
   final QuotaLedger quotaLedger;
   final IsolateWorkerHost? workerHost;
+  final DirtySwapBackend? dirtySwapBackend;
+  final McpServerManager? mcpServerManager;
+  final StackedTaskManager? stackedTaskManager;
+  final List<McpServerSpec> _initialMcpServers;
   final List<void Function()> _ownedClosers;
 
   ContextPagingReport? _lastPagingReport;
@@ -246,6 +283,11 @@ Multi-process and isolation rules:
         config.envLoader?.redactor ??
         SecretRedactor();
     effectiveRedactor.registerFromEnvironment(Platform.environment);
+    for (final mcpSpec in config.mcpServers) {
+      for (final envVar in mcpSpec.env) {
+        effectiveRedactor.registerSecret(envVar.value);
+      }
+    }
 
     // Load external SKILL.md manifests at startup in [D-203] §3.1(3) priority order ([D-219]).
     final skillLoader = SkillDirectoryLoader(
@@ -284,22 +326,55 @@ Multi-process and isolation rules:
       handler: config.approvalHandler ?? PolicyApprovalHandler.alwaysAllow(),
     );
 
-    final isStage2Multiprocess =
-        config.enableStage2Multiprocess || config.quota.maxChildProcesses > 0;
+    final isStage3Team = config.enableStage3Team;
+    final isStage2Multiprocess = config.enableStage2Multiprocess ||
+        isStage3Team ||
+        config.quota.maxChildProcesses > 0;
     final effectiveQuota = (isStage2Multiprocess &&
             config.quota.maxChildProcesses == 0)
         ? ResourceQuota.stage2Default
         : config.quota;
     final effectiveQuotaLedger = config.quotaLedger ?? QuotaLedger();
 
+    final McpServerManager? effectiveMcpManager = config.mcpServerManager ??
+        ((isStage3Team || config.mcpServers.isNotEmpty)
+            ? McpServerManager(
+                workspaceHostRoot: namespace.workspaceHostRoot!,
+                redactor: effectiveRedactor,
+              )
+            : null);
+
+    final DirtySwapBackend? effectiveDirtySwapBackend =
+        config.dirtySwapBackend ??
+            (isStage3Team
+                ? JsonlDirtySwapStore(
+                    workspaceHostRoot: namespace.workspaceHostRoot!,
+                    redactor: effectiveRedactor,
+                  )
+                : null);
+
+    final jjSchemas = isStage2Multiprocess
+        ? JjDriver.allToolSchemas()
+        : JjDriver.allToolSchemas()
+            .where(
+              (s) =>
+                  s.name != 'sys_jj_merge' &&
+                  s.name != 'sys_jj_conflicts' &&
+                  s.name != 'sys_jj_integrate',
+            )
+            .toList(growable: false);
+
     final allToolSchemas = <SyscallToolSchema>[
       ...HostFsDriver.allToolSchemas(),
-      ...JjDriver.allToolSchemas(),
+      ...jjSchemas,
       ...Win32JobExecDriver.toolSchemas(),
       buildMemPageinToolSchema(),
       if (isStage2Multiprocess) ...buildProcessToolSchemas(),
       if (isStage2Multiprocess) buildWebSearchToolSchema(),
       if (isStage2Multiprocess) buildWebFetchToolSchema(),
+      if (isStage3Team || effectiveMcpManager != null) ...buildMcpToolSchemas(),
+      if (isStage3Team || config.stackedTaskManager != null)
+        StackedTaskManager.buildToolSchema(),
       if (skillRegistry.isNotEmpty) ...SkillSyscallDriver.toolSchemas(),
       ...config.extraToolSchemas,
     ];
@@ -308,6 +383,10 @@ Multi-process and isolation rules:
     final CapabilityTable baseCspace;
     if (config.leadCspace != null) {
       baseCspace = config.leadCspace!;
+    } else if (isStage3Team) {
+      baseCspace = CapabilityTable.stage3LeadAgent(
+        workspaceHandle: defaultCapHandle,
+      );
     } else if (isStage2Multiprocess) {
       baseCspace = CapabilityTable.stage2LeadAgent(
         workspaceHandle: defaultCapHandle,
@@ -351,6 +430,16 @@ Multi-process and isolation rules:
           )
         : allToolSchemas;
 
+    final pinnedSystem = PinnedSystemInstruction(
+      instruction: config.systemInstruction ??
+          (isStage3Team
+              ? defaultStage3Instruction
+              : (isStage2Multiprocess
+                  ? defaultStage2Instruction
+                  : defaultStep1Instruction)),
+      tools: leadToolSchemas,
+    );
+
     final pcb = ProcessControlBlock(
       pid: 1,
       name: 'lead-agent',
@@ -361,13 +450,7 @@ Multi-process and isolation rules:
       jjContext: jjContext,
       memory: VirtualContextMemory(
         sessionId: effectiveSessionId,
-        systemInstruction: PinnedSystemInstruction(
-          instruction: config.systemInstruction ??
-              (isStage2Multiprocess
-                  ? defaultStage2Instruction
-                  : defaultStep1Instruction),
-          tools: leadToolSchemas,
-        ),
+        systemInstruction: pinnedSystem,
       ),
     );
 
@@ -394,11 +477,16 @@ Multi-process and isolation rules:
       ensureActiveTransaction: jjDriver.ensureActiveTransaction,
       syncWorkingCopySnapshot: jjDriver.syncWorkingCopySnapshot,
       currentCommitIdProvider: jjDriver.getCurrentCommitIdNonDestructive,
+      ensureActiveTransactionForPcb: jjDriver.ensureActiveTransactionForPcb,
+      syncWorkingCopySnapshotForPcb: jjDriver.syncWorkingCopySnapshotForPcb,
+      currentCommitIdForPcbProvider: jjDriver.getCurrentCommitIdForPcb,
     );
     final win32JobExecDriver = Win32JobExecDriver(
       namespace: namespace,
       ensureActiveTransaction: jjDriver.ensureActiveTransaction,
       syncWorkingCopySnapshot: jjDriver.syncWorkingCopySnapshot,
+      ensureActiveTransactionForPcb: jjDriver.ensureActiveTransactionForPcb,
+      syncWorkingCopySnapshotForPcb: jjDriver.syncWorkingCopySnapshotForPcb,
       ioCapper: ioCapper,
     );
 
@@ -476,6 +564,7 @@ Multi-process and isolation rules:
       hooks: effectiveHooks,
       txHooks: config.txHooks,
       jjAuditInfoProvider: jjDriver.getAuditInfo,
+      jjProcessAuditInfoProvider: jjDriver.getAuditInfoForProcess,
     );
 
     final modelResolver = ModelResolver(
@@ -496,6 +585,7 @@ Multi-process and isolation rules:
         parentCurrentModelProvider: () =>
             leadAgent.activeTurnModel?.canonicalId ??
             modelResolver.effectiveModelString(),
+        jjDriver: jjDriver,
         backend: config.childWorkerBackend ?? const IsolateChildWorkerBackend(),
       );
     }
@@ -512,12 +602,43 @@ Multi-process and isolation rules:
           : () => workerHost!.terminateActiveChildrenForParent(pcb.pid),
     );
 
+    final effectiveWindowConfig = config.maxContextTokens != null
+        ? ContextWindowConfig(
+            modelOverrides: config.contextWindowConfig.modelOverrides,
+            maxContextTokens: config.maxContextTokens,
+            defaultLocalUnloadedCap:
+                config.contextWindowConfig.defaultLocalUnloadedCap,
+            defaultLocalFallback:
+                config.contextWindowConfig.defaultLocalFallback,
+            defaultCloudFallback:
+                config.contextWindowConfig.defaultCloudFallback,
+            defaultOpenRouterFallback:
+                config.contextWindowConfig.defaultOpenRouterFallback,
+            localProbeTimeout: config.contextWindowConfig.localProbeTimeout,
+            remoteProbeTimeout: config.contextWindowConfig.remoteProbeTimeout,
+          )
+        : config.contextWindowConfig;
+
+    if (config.maxContextTokens != null) {
+      final tokenErr = ContextPager.validateMaxContextTokens(
+        maxContextTokens: config.maxContextTokens,
+        systemInstruction: pinnedSystem,
+      );
+      if (tokenErr != null) {
+        throw ArgumentError.value(
+          config.maxContextTokens,
+          'maxContextTokens',
+          '${tokenErr.reason}: ${tokenErr.message}',
+        );
+      }
+    }
+
     final ContextWindowSource effectiveWindowSource;
     if (config.contextWindowSource != null) {
       effectiveWindowSource = config.contextWindowSource!;
     } else {
       final resolver = ContextWindowResolver(
-        config: config.contextWindowConfig,
+        config: effectiveWindowConfig,
         localOllamaBaseUrl: config.localOllamaBaseUrl,
         ollamaCloudBaseUrl: config.ollamaCloudBaseUrl,
         openRouterBaseUrl: config.openRouterBaseUrl,
@@ -537,7 +658,12 @@ Multi-process and isolation rules:
 
     final effectiveContextPager = ContextPager(
       config: config.pagerWatermarkConfig,
+      dirtySwapBackend: effectiveDirtySwapBackend,
     );
+
+    final StackedTaskManager? effectiveStackedManager =
+        config.stackedTaskManager ??
+            (isStage3Team ? StackedTaskManager(jjDriver: jjDriver) : null);
 
     final WebSearchBackend effectiveWebSearchBackend;
     if (config.webSearchBackend != null) {
@@ -573,8 +699,23 @@ Multi-process and isolation rules:
         hostFsDriver: hostFsDriver,
         jjDriver: jjDriver,
         freshnessChecker: effectiveFreshnessChecker,
+        dirtySwapBackend: effectiveDirtySwapBackend,
+        redactor: effectiveRedactor,
       ),
     );
+    if (effectiveMcpManager != null) {
+      for (final def in buildMcpSyscallDefinitions(
+        manager: effectiveMcpManager,
+        redactor: effectiveRedactor,
+      )) {
+        syscallGate.registerSyscall(def);
+      }
+    }
+    if (effectiveStackedManager != null) {
+      syscallGate.registerSyscall(
+        effectiveStackedManager.buildSyscallDefinition(),
+      );
+    }
     if (workerHost != null) {
       for (final def in buildProcessSyscallDefinitions(
         host: workerHost,
@@ -614,7 +755,12 @@ Multi-process and isolation rules:
       syscallGate.registerSyscall(extra);
     }
 
-    final processRunner = GreenTaskProcessRunner(leadAgent: leadAgent);
+    final processRunner = GreenTaskProcessRunner(
+      leadAgent: leadAgent,
+      onKillTree: workerHost == null
+          ? null
+          : (reason) => workerHost!.killProcessTree(1, reason: reason),
+    );
 
     bootstrap = KernelBootstrap._(
       sessionId: effectiveSessionId,
@@ -643,9 +789,30 @@ Multi-process and isolation rules:
       processRunner: processRunner,
       quotaLedger: effectiveQuotaLedger,
       workerHost: workerHost,
+      dirtySwapBackend: effectiveDirtySwapBackend,
+      mcpServerManager: effectiveMcpManager,
+      stackedTaskManager: effectiveStackedManager,
+      initialMcpServers: config.mcpServers,
       ownedClosers: ownedClosers,
     );
     return bootstrap;
+  }
+
+  /// Connects configured or supplied `stdio` MCP servers ([D-318], [D-320]).
+  Future<SyscallResult<void>> connectMcpServers([
+    List<McpServerSpec>? specs,
+  ]) async {
+    final manager = mcpServerManager;
+    final targetSpecs = specs ?? _initialMcpServers;
+    if (manager == null || targetSpecs.isEmpty) {
+      return const SyscallResult<void>.success(null);
+    }
+    return manager.registerAndConnectAll(targetSpecs);
+  }
+
+  /// Renders a lightweight Segment 2 dynamic context summary (e.g., connected MCP servers) ([D-319]).
+  String renderDynamicContextSummary() {
+    return mcpServerManager?.renderDynamicContextSummary() ?? '';
   }
 
   /// Registers a Stage 3/6 hook on [syscallGate] ([D-220]).
@@ -666,6 +833,8 @@ Multi-process and isolation rules:
     _disposed = true;
     await processRunner.dispose();
     await workerHost?.dispose();
+    await stackedTaskManager?.dispose();
+    await mcpServerManager?.dispose();
     await auditLogger.flush();
     for (final closer in _ownedClosers) {
       try {

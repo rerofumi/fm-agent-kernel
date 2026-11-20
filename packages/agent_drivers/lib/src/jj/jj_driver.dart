@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:agent_kernel/agent_kernel.dart';
 import 'package:path/path.dart' as p;
 
+import 'jj_workspace_ops.dart';
+
 /// Strict FIFO asynchronous mutex serializing Jujutsu operations ([D-014]).
 class AsyncMutex {
   bool _locked = false;
@@ -47,23 +49,27 @@ class JjDriver {
     required this.namespace,
     JjTxContext? txContext,
     this.jjExecutable = 'jj',
+    this.stackedTaskRegistry,
   }) : txContext = txContext ?? JjTxContext();
 
   factory JjDriver.forWorkspace(
     String workspaceHostRoot, {
     JjTxContext? txContext,
     String jjExecutable = 'jj',
+    StackedTaskRegistry? stackedTaskRegistry,
   }) {
     return JjDriver(
       namespace: VfsNamespace(workspaceHostRoot: workspaceHostRoot),
       txContext: txContext,
       jjExecutable: jjExecutable,
+      stackedTaskRegistry: stackedTaskRegistry,
     );
   }
 
   final VfsNamespace namespace;
   final JjTxContext txContext;
   final String jjExecutable;
+  StackedTaskRegistry? stackedTaskRegistry;
   final AsyncMutex _mutex = AsyncMutex();
 
   String get workspaceHostRoot => namespace.workspaceHostRoot!;
@@ -129,11 +135,20 @@ class JjDriver {
   /// Non-destructively reads the current `@` `commit_id` using `--ignore-working-copy` ([D-204], [D-208]).
   ///
   /// Never triggers a working-copy snapshot or advances `jj op log`.
-  Future<String?> getCurrentCommitIdNonDestructive() {
-    return _mutex.synchronized(_readCurrentCommitIdLocked);
+  Future<String?> getCurrentCommitIdNonDestructive({String? repositoryPath}) {
+    return _mutex.synchronized(
+      () => _readCurrentCommitIdLocked(repositoryPath: repositoryPath),
+    );
   }
 
-  Future<String?> _readCurrentCommitIdLocked({String? atOp}) async {
+  /// Non-destructively reads the current `@` `commit_id` for [pcb] ([D-308]).
+  Future<String?> getCurrentCommitIdForPcb(ProcessControlBlock pcb) =>
+      getCurrentCommitIdNonDestructive(repositoryPath: pcb.jjWorkspaceRoot);
+
+  Future<String?> _readCurrentCommitIdLocked({
+    String? atOp,
+    String? repositoryPath,
+  }) async {
     final res = await _runJjRaw(<String>[
       'log',
       '--no-graph',
@@ -146,7 +161,7 @@ class JjDriver {
       ],
       '-T',
       'commit_id',
-    ]);
+    ], repositoryPath: repositoryPath);
     if (!res.ok) {
       return null;
     }
@@ -205,6 +220,139 @@ class JjDriver {
     });
   }
 
+  /// Non-destructively reads process-specific `jjChangeId` and `jjOpId` for Stage 8 audit logs ([D-305]).
+  Future<JjAuditInfo> getAuditInfoForProcess(ProcessControlBlock? pcb) {
+    if (pcb == null || !pcb.hasIsolatedJjWorkspace) {
+      return getAuditInfo();
+    }
+    return _mutex.synchronized(() async {
+      final opRes = await _runJjRaw(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '--ignore-working-copy',
+        '-T',
+        'self.id()',
+      ]);
+      final opId = opRes.ok
+          ? (opRes.value!.stdout as String).trim()
+          : (pcb.jjContext.currentOpId ?? '');
+
+      String? changeId = pcb.jjContext.workingChangeId;
+      final wsRoot = pcb.jjWorkspaceRoot;
+      if (wsRoot != null && Directory(wsRoot).existsSync()) {
+        final logRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          '@',
+          '--ignore-working-copy',
+          '-T',
+          'change_id.short(12)',
+        ], repositoryPath: wsRoot);
+        if (logRes.ok) {
+          final parsed = (logRes.value!.stdout as String).trim();
+          if (parsed.isNotEmpty) {
+            changeId = parsed;
+            pcb.jjContext.workingChangeId = parsed;
+          }
+        }
+      }
+      if (opId.isNotEmpty) {
+        pcb.jjContext.currentOpId = opId;
+      }
+
+      return JjAuditInfo(
+        jjChangeId: (changeId == null || changeId.isEmpty) ? null : changeId,
+        jjOpId: opId.isEmpty ? null : opId,
+      );
+    });
+  }
+
+  /// Explicitly triggers a working-copy snapshot for [pcb] inside the single [AsyncMutex] ([D-308]).
+  Future<SyscallResult<JjAuditInfo>> syncWorkingCopySnapshotForPcb(
+    ProcessControlBlock pcb,
+  ) {
+    final targetRoot = pcb.jjWorkspaceRoot;
+    return _mutex.synchronized(() async {
+      final opRes = await _runJjWithAutoUpdateStale(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '-T',
+        'self.id()',
+      ], repositoryPath: targetRoot);
+      if (!opRes.ok) {
+        return SyscallResult<JjAuditInfo>.failure(opRes.error!);
+      }
+      final opId = (opRes.value!.stdout as String).trim();
+
+      final logRes = await _runJjRaw(<String>[
+        'log',
+        '--no-graph',
+        '-r',
+        '@',
+        '--ignore-working-copy',
+        '-T',
+        'change_id.short(12)',
+      ], repositoryPath: targetRoot);
+      if (!logRes.ok) {
+        return SyscallResult<JjAuditInfo>.failure(logRes.error!);
+      }
+      final changeId = (logRes.value!.stdout as String).trim();
+
+      pcb.jjContext.updateSnapshot(
+        currentOpId: opId.isEmpty ? null : opId,
+        workingChangeId: changeId.isEmpty ? null : changeId,
+      );
+      if (!pcb.hasIsolatedJjWorkspace) {
+        txContext.updateSnapshot(
+          currentOpId: opId.isEmpty ? null : opId,
+          workingChangeId: changeId.isEmpty ? null : changeId,
+        );
+      }
+
+      if (stackedTaskRegistry != null && changeId.isNotEmpty) {
+        final taskNode = stackedTaskRegistry!.findByWorkingChangeId(changeId);
+        if (taskNode != null) {
+          final descendants = stackedTaskRegistry!
+              .descendantsInTopologicalOrder(taskNode.taskId);
+          await _syncTaskNodeAndCascadeLocked(
+            taskNode: taskNode,
+            descendants: descendants,
+            alreadySnapshottedOpId: opId,
+          );
+        }
+      }
+
+      return SyscallResult<JjAuditInfo>.success(
+        JjAuditInfo(
+          jjChangeId: changeId.isEmpty ? null : changeId,
+          jjOpId: opId.isEmpty ? null : opId,
+        ),
+      );
+    });
+  }
+
+  /// Ensures an isolated transaction for [pcb] ([D-308]).
+  ///
+  /// Isolated worker workspaces already have their own `@` change and return immediately.
+  Future<SyscallResult<JjTxContext>> ensureActiveTransactionForPcb(
+    ProcessControlBlock pcb, {
+    String? description,
+  }) {
+    if (pcb.hasIsolatedJjWorkspace) {
+      return Future<SyscallResult<JjTxContext>>.value(
+        SyscallResult<JjTxContext>.success(pcb.jjContext),
+      );
+    }
+    return ensureActiveTransaction(description: description);
+  }
+
   /// Explicitly triggers a working-copy snapshot and updates [txContext] ([D-003], [D-014]).
   ///
   /// Runs WITHOUT `--ignore-working-copy` inside the single [AsyncMutex] so
@@ -257,6 +405,7 @@ class JjDriver {
   Future<SyscallResult<Map<String, dynamic>>> status({
     String? atOp,
     bool forceIgnoreWorkingCopy = false,
+    String? repositoryPath,
   }) async {
     final opValidation = _validateOptionalAtOp(atOp);
     if (opValidation != null) {
@@ -277,7 +426,7 @@ class JjDriver {
         ],
       ];
 
-      final opRes = await _runJjRaw(<String>[
+      final opRes = await _runJjWithAutoUpdateStale(<String>[
         'op',
         'log',
         '--no-graph',
@@ -286,13 +435,13 @@ class JjDriver {
         ...baseFlags,
         '-T',
         'self.id()',
-      ]);
+      ], repositoryPath: repositoryPath);
       if (!opRes.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(opRes.error!);
       }
       final opId = (opRes.value!.stdout as String).trim();
 
-      final wcRes = await _runJjRaw(<String>[
+      final wcRes = await _runJjWithAutoUpdateStale(<String>[
         'log',
         '--no-graph',
         '-r',
@@ -300,7 +449,7 @@ class JjDriver {
         ...baseFlags,
         '-T',
         commitJsonTemplate,
-      ]);
+      ], repositoryPath: repositoryPath);
       if (!wcRes.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(wcRes.error!);
       }
@@ -321,7 +470,7 @@ class JjDriver {
       final workingCopy = wcParsed.value!.first;
 
       Map<String, dynamic>? parentCommit;
-      final parentRes = await _runJjRaw(<String>[
+      final parentRes = await _runJjWithAutoUpdateStale(<String>[
         'log',
         '--no-graph',
         '-r',
@@ -329,7 +478,7 @@ class JjDriver {
         ...baseFlags,
         '-T',
         commitJsonTemplate,
-      ]);
+      ], repositoryPath: repositoryPath);
       if (parentRes.ok) {
         final parentParsed = _parseJsonLines(parentRes.value!.stdout as String);
         if (parentParsed.ok && parentParsed.value!.isNotEmpty) {
@@ -337,13 +486,13 @@ class JjDriver {
         }
       }
 
-      final diffRes = await _runJjRaw(<String>[
+      final diffRes = await _runJjWithAutoUpdateStale(<String>[
         'diff',
         '--summary',
         '-r',
         '@',
         ...baseFlags,
-      ]);
+      ], repositoryPath: repositoryPath);
       if (!diffRes.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(diffRes.error!);
       }
@@ -371,6 +520,7 @@ class JjDriver {
     int limit = 20,
     String? atOp,
     bool forceIgnoreWorkingCopy = false,
+    String? repositoryPath,
   }) async {
     final trimmedRevset = revset.trim();
     if (trimmedRevset.isEmpty || trimmedRevset.startsWith('-')) {
@@ -420,7 +570,10 @@ class JjDriver {
         commitJsonTemplate,
       ];
 
-      final res = await _runJjRaw(args);
+      final res = await _runJjWithAutoUpdateStale(
+        args,
+        repositoryPath: repositoryPath,
+      );
       if (!res.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(res.error!);
       }
@@ -431,7 +584,10 @@ class JjDriver {
       }
 
       final commits = parsed.value!;
-      final commitId = await _readCurrentCommitIdLocked(atOp: atOp);
+      final commitId = await _readCurrentCommitIdLocked(
+        atOp: atOp,
+        repositoryPath: repositoryPath,
+      );
       return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
         'revset': trimmedRevset,
         'limit': limit,
@@ -450,6 +606,7 @@ class JjDriver {
     String? atOp,
     bool forceIgnoreWorkingCopy = false,
     VfsNamespace? namespaceOverride,
+    String? repositoryPath,
   }) async {
     final effectiveNamespace = namespaceOverride ?? namespace;
     final trimmedRev = rev.trim();
@@ -509,12 +666,18 @@ class JjDriver {
         ],
       ];
 
-      final res = await _runJjRaw(args);
+      final res = await _runJjWithAutoUpdateStale(
+        args,
+        repositoryPath: repositoryPath,
+      );
       if (!res.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(res.error!);
       }
 
-      final commitId = await _readCurrentCommitIdLocked(atOp: atOp);
+      final commitId = await _readCurrentCommitIdLocked(
+        atOp: atOp,
+        repositoryPath: repositoryPath,
+      );
       return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
         'rev': trimmedRev,
         'diff': res.value!.stdout as String,
@@ -565,98 +728,502 @@ class JjDriver {
 
   Future<SyscallResult<({JjTxContext context, bool alreadyActive})>>
       _ensureActiveTransactionInternal({String? description}) {
-    return _mutex.synchronized(() async {
-      if (txContext.state == TxState.active) {
-        return SyscallResult<({JjTxContext context, bool alreadyActive})>.success(
-          (context: txContext, alreadyActive: true),
-        );
-      }
+    return _mutex.synchronized(
+      () => _ensureActiveTransactionLocked(description: description),
+    );
+  }
 
+  Future<SyscallResult<({JjTxContext context, bool alreadyActive})>>
+      _ensureActiveTransactionLocked({String? description}) async {
+    if (txContext.state == TxState.active) {
+      return SyscallResult<({JjTxContext context, bool alreadyActive})>.success(
+        (context: txContext, alreadyActive: true),
+      );
+    }
+
+    ensureAgentOsGitignoreSync(workspaceHostRoot);
+
+    // 1. Snapshot user's current working copy WITHOUT --ignore-working-copy and record baseOpId.
+    final snapOpRes = await _runJjRaw(<String>[
+      'op',
+      'log',
+      '--no-graph',
+      '--limit',
+      '1',
+      '-T',
+      'self.id()',
+    ]);
+    if (!snapOpRes.ok) {
+      return SyscallResult<
+          ({JjTxContext context, bool alreadyActive})>.failure(
+        snapOpRes.error!,
+      );
+    }
+    final baseOpId = (snapOpRes.value!.stdout as String).trim();
+    if (baseOpId.isEmpty) {
+      return const SyscallResult<
+          ({JjTxContext context, bool alreadyActive})>.failure(
+        SyscallError(
+          code: SyscallErrorCode.eio,
+          reason: 'JJ_EMPTY_OP_ID',
+          message: 'jj op log returned an empty operation ID during tx begin.',
+          recoverable: false,
+        ),
+      );
+    }
+
+    // 2. Capture the user's current change ID (which will become immutable parent @-).
+    final parentChangeRes = await _runJjRaw(<String>[
+      'log',
+      '--no-graph',
+      '-r',
+      '@',
+      '--ignore-working-copy',
+      '-T',
+      'change_id.short(12)',
+    ]);
+    if (!parentChangeRes.ok) {
+      return SyscallResult<
+          ({JjTxContext context, bool alreadyActive})>.failure(
+        parentChangeRes.error!,
+      );
+    }
+    final parentChangeId = (parentChangeRes.value!.stdout as String).trim();
+
+    // 3. Split a fresh child working change `@` with `jj new`.
+    final effectiveMessage =
+        (description != null && description.trim().isNotEmpty)
+            ? description.trim()
+            : 'agent-os: working change';
+    final newRes = await _runJjRaw(<String>[
+      'new',
+      '-m',
+      effectiveMessage,
+    ]);
+    if (!newRes.ok) {
+      return SyscallResult<
+          ({JjTxContext context, bool alreadyActive})>.failure(
+        newRes.error!,
+      );
+    }
+
+    // 4. Read new `@` change_id and head op_id non-destructively.
+    final workChangeRes = await _runJjRaw(<String>[
+      'log',
+      '--no-graph',
+      '-r',
+      '@',
+      '--ignore-working-copy',
+      '-T',
+      'change_id.short(12)',
+    ]);
+    if (!workChangeRes.ok) {
+      return SyscallResult<
+          ({JjTxContext context, bool alreadyActive})>.failure(
+        workChangeRes.error!,
+      );
+    }
+    final workingChangeId = (workChangeRes.value!.stdout as String).trim();
+
+    final newOpRes = await _runJjRaw(<String>[
+      'op',
+      'log',
+      '--no-graph',
+      '--limit',
+      '1',
+      '--ignore-working-copy',
+      '-T',
+      'self.id()',
+    ]);
+    if (!newOpRes.ok) {
+      return SyscallResult<
+          ({JjTxContext context, bool alreadyActive})>.failure(
+        newOpRes.error!,
+      );
+    }
+    final currentOpId = (newOpRes.value!.stdout as String).trim();
+
+    txContext.enterActive(
+      baseOpId: baseOpId,
+      parentChangeId: parentChangeId,
+      workingChangeId: workingChangeId,
+      currentOpId: currentOpId.isEmpty ? baseOpId : currentOpId,
+    );
+    txContext.anchorWorkingChangeId = workingChangeId;
+    txContext.pendingWorkerChangeIds.clear();
+
+    return SyscallResult<({JjTxContext context, bool alreadyActive})>.success(
+      (context: txContext, alreadyActive: false),
+    );
+  }
+
+  /// Allocates an isolated `--no-colocate` `jj workspace` at `.agent_os/ws/<pid>` ([D-307]).
+  Future<SyscallResult<AllocatedWorkspace>> allocateWorkerWorkspace({
+    required Pid pid,
+    String? baseChangeId,
+    String? description,
+  }) {
+    return _mutex.synchronized(() async {
       ensureAgentOsGitignoreSync(workspaceHostRoot);
 
-      // 1. Snapshot user's current working copy WITHOUT --ignore-working-copy and record baseOpId.
-      final snapOpRes = await _runJjRaw(<String>[
-        'op',
+      late final String effectiveBase;
+      if (baseChangeId != null && baseChangeId.trim().isNotEmpty) {
+        final trimmed = baseChangeId.trim();
+        if (trimmed.startsWith('-')) {
+          return const SyscallResult<AllocatedWorkspace>.failure(
+            SyscallError(
+              code: SyscallErrorCode.einval,
+              reason: 'INVALID_REVISION',
+              message: 'baseChangeId must not start with "-".',
+              recoverable: true,
+            ),
+          );
+        }
+        final verifyRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          trimmed,
+          '--ignore-working-copy',
+          '-T',
+          'change_id.short(12)',
+        ]);
+        if (!verifyRes.ok) {
+          return SyscallResult<AllocatedWorkspace>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message:
+                  'Target baseChangeId "$trimmed" was not found: ${verifyRes.error!.message}',
+              recoverable: true,
+            ),
+          );
+        }
+        final resolved = (verifyRes.value!.stdout as String).trim();
+        if (resolved.isEmpty) {
+          return SyscallResult<AllocatedWorkspace>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message: 'Target baseChangeId "$trimmed" resolved to empty.',
+              recoverable: true,
+            ),
+          );
+        }
+        effectiveBase = resolved;
+      } else {
+        if (txContext.state == TxState.readOnly) {
+          final txRes = await _ensureActiveTransactionLocked(
+            description: description,
+          );
+          if (!txRes.ok) {
+            return SyscallResult<AllocatedWorkspace>.failure(txRes.error!);
+          }
+        }
+        effectiveBase = txContext.workingChangeId!;
+      }
+
+      final wsName = JjWorkspaceOps.workspaceNameForPid(pid);
+      final wsRoot = JjWorkspaceOps.workspaceRootForPid(workspaceHostRoot, pid);
+      final wsParent = Directory(p.dirname(wsRoot));
+      if (!wsParent.existsSync()) {
+        wsParent.createSync(recursive: true);
+      }
+      final existingDir = Directory(wsRoot);
+      if (existingDir.existsSync()) {
+        await _deleteDirectoryWithRetry(existingDir);
+      }
+
+      final addRes = await _runJjRaw(
+        JjWorkspaceOps.buildWorkspaceAddArgs(
+          workspaceRoot: wsRoot,
+          workspaceName: wsName,
+          baseChangeId: effectiveBase,
+          description: description,
+        ),
+      );
+      if (!addRes.ok) {
+        return SyscallResult<AllocatedWorkspace>.failure(addRes.error!);
+      }
+
+      final wcRes = await _runJjRaw(<String>[
         'log',
         '--no-graph',
-        '--limit',
-        '1',
+        '-r',
+        '@',
+        '--ignore-working-copy',
         '-T',
-        'self.id()',
-      ]);
-      if (!snapOpRes.ok) {
-        return SyscallResult<
-            ({JjTxContext context, bool alreadyActive})>.failure(
-          snapOpRes.error!,
-        );
+        commitJsonTemplate,
+      ], repositoryPath: wsRoot);
+      if (!wcRes.ok) {
+        return SyscallResult<AllocatedWorkspace>.failure(wcRes.error!);
       }
-      final baseOpId = (snapOpRes.value!.stdout as String).trim();
-      if (baseOpId.isEmpty) {
-        return const SyscallResult<
-            ({JjTxContext context, bool alreadyActive})>.failure(
+      final parsed = _parseJsonLines(wcRes.value!.stdout as String);
+      if (!parsed.ok || parsed.value!.isEmpty) {
+        return const SyscallResult<AllocatedWorkspace>.failure(
           SyscallError(
             code: SyscallErrorCode.eio,
-            reason: 'JJ_EMPTY_OP_ID',
-            message: 'jj op log returned an empty operation ID during tx begin.',
+            reason: 'JJ_EMPTY_WORKSPACE_STATUS',
+            message: 'Allocated workspace returned no @ commit metadata.',
             recoverable: false,
           ),
         );
       }
+      final wc = parsed.value!.first;
+      final workingChangeId = (wc['change_id'] as String?)?.trim() ?? '';
+      final commitId = (wc['commit_id'] as String?)?.trim() ?? '';
 
-      // 2. Capture the user's current change ID (which will become immutable parent @-).
-      final parentChangeRes = await _runJjRaw(<String>[
+      final opRes = await _runJjRaw(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '--ignore-working-copy',
+        '-T',
+        'self.id()',
+      ], repositoryPath: wsRoot);
+      final currentOpId = opRes.ok ? (opRes.value!.stdout as String).trim() : '';
+
+      return SyscallResult<AllocatedWorkspace>.success(
+        AllocatedWorkspace(
+          workspaceName: wsName,
+          workspaceRoot: wsRoot,
+          baseChangeId: effectiveBase,
+          workingChangeId: workingChangeId,
+          commitId: commitId,
+          currentOpId: currentOpId,
+        ),
+      );
+    });
+  }
+
+  /// Cleans up a child worker's `jj workspace` (`forget`, optional `abandon`, and directory deletion) ([D-307]).
+  Future<WorkspaceCleanupResult> cleanupWorkerWorkspace({
+    required String workspaceName,
+    required String workspaceRoot,
+    String? workingChangeId,
+    String? baseChangeId,
+    required bool abandonChange,
+  }) async {
+    String? finalChangeId = workingChangeId;
+    String? finalCommitId;
+
+    await _mutex.synchronized(() async {
+      if (!abandonChange && Directory(workspaceRoot).existsSync()) {
+        final wcRes = await _runJjWithAutoUpdateStale(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          '@',
+          '-T',
+          commitJsonTemplate,
+        ], repositoryPath: workspaceRoot);
+        if (wcRes.ok) {
+          final parsed = _parseJsonLines(wcRes.value!.stdout as String);
+          if (parsed.ok && parsed.value!.isNotEmpty) {
+            final wc = parsed.value!.first;
+            final cId = (wc['change_id'] as String?)?.trim();
+            final comId = (wc['commit_id'] as String?)?.trim();
+            if (cId != null && cId.isNotEmpty) {
+              finalChangeId = cId;
+            }
+            if (comId != null && comId.isNotEmpty) {
+              finalCommitId = comId;
+            }
+          }
+        }
+      }
+
+      await _runJjRaw(JjWorkspaceOps.buildWorkspaceForgetArgs(workspaceName));
+
+      if (abandonChange &&
+          finalChangeId != null &&
+          finalChangeId!.isNotEmpty &&
+          finalChangeId != baseChangeId) {
+        await _runJjRaw(<String>['abandon', finalChangeId!]);
+      }
+    });
+
+    final dir = Directory(workspaceRoot);
+    final cleanedUp = await _deleteDirectoryWithRetry(dir);
+    return WorkspaceCleanupResult(
+      finalChangeId: finalChangeId,
+      finalCommitId: abandonChange ? null : finalCommitId,
+      cleanedUp: cleanedUp,
+    );
+  }
+
+  /// Lists registered Jujutsu workspaces non-destructively inside the single mutex ([D-307]).
+  Future<SyscallResult<List<Map<String, dynamic>>>> listWorkspaces() {
+    return _mutex.synchronized(() async {
+      final res = await _runJjRaw(JjWorkspaceOps.buildWorkspaceListArgs());
+      if (!res.ok) {
+        return SyscallResult<List<Map<String, dynamic>>>.failure(res.error!);
+      }
+      return SyscallResult<List<Map<String, dynamic>>>.success(
+        JjWorkspaceOps.parseWorkspaceListJsonLines(res.value!.stdout as String),
+      );
+    });
+  }
+
+  /// Allocates an isolated `--no-colocate` `jj workspace` for a Stacked Changes task ([D-311]).
+  Future<SyscallResult<AllocatedWorkspace>> allocateTaskWorkspace({
+    required String taskId,
+    String? baseChangeId,
+    String? description,
+  }) {
+    return _mutex.synchronized(() async {
+      ensureAgentOsGitignoreSync(workspaceHostRoot);
+
+      late final String effectiveBase;
+      if (baseChangeId != null && baseChangeId.trim().isNotEmpty) {
+        final trimmed = baseChangeId.trim();
+        if (trimmed.startsWith('-')) {
+          return const SyscallResult<AllocatedWorkspace>.failure(
+            SyscallError(
+              code: SyscallErrorCode.einval,
+              reason: 'INVALID_REVISION',
+              message: 'baseChangeId must not start with "-".',
+              recoverable: true,
+            ),
+          );
+        }
+        final verifyRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          trimmed,
+          '--ignore-working-copy',
+          '-T',
+          'change_id.short(12)',
+        ]);
+        if (!verifyRes.ok) {
+          return SyscallResult<AllocatedWorkspace>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message:
+                  'Target baseChangeId "$trimmed" was not found: ${verifyRes.error!.message}',
+              recoverable: true,
+            ),
+          );
+        }
+        final resolved = (verifyRes.value!.stdout as String).trim();
+        if (resolved.isEmpty) {
+          return SyscallResult<AllocatedWorkspace>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message: 'Target baseChangeId "$trimmed" resolved to empty.',
+              recoverable: true,
+            ),
+          );
+        }
+        effectiveBase = resolved;
+      } else {
+        if (txContext.state == TxState.readOnly) {
+          final txRes = await _ensureActiveTransactionLocked(
+            description: description,
+          );
+          if (!txRes.ok) {
+            return SyscallResult<AllocatedWorkspace>.failure(txRes.error!);
+          }
+        }
+        effectiveBase = txContext.workingChangeId!;
+      }
+
+      final wsName = JjWorkspaceOps.taskWorkspaceName(taskId);
+      final wsRoot = JjWorkspaceOps.taskWorkspaceRoot(workspaceHostRoot, taskId);
+      final wsParent = Directory(p.dirname(wsRoot));
+      if (!wsParent.existsSync()) {
+        wsParent.createSync(recursive: true);
+      }
+      final existingDir = Directory(wsRoot);
+      if (existingDir.existsSync()) {
+        await _deleteDirectoryWithRetry(existingDir);
+      }
+
+      final addRes = await _runJjRaw(
+        JjWorkspaceOps.buildWorkspaceAddArgs(
+          workspaceRoot: wsRoot,
+          workspaceName: wsName,
+          baseChangeId: effectiveBase,
+          description: description ?? 'task($taskId)',
+        ),
+      );
+      if (!addRes.ok) {
+        return SyscallResult<AllocatedWorkspace>.failure(addRes.error!);
+      }
+
+      final wcRes = await _runJjRaw(<String>[
         'log',
         '--no-graph',
         '-r',
         '@',
         '--ignore-working-copy',
         '-T',
-        'change_id.short(12)',
-      ]);
-      if (!parentChangeRes.ok) {
-        return SyscallResult<
-            ({JjTxContext context, bool alreadyActive})>.failure(
-          parentChangeRes.error!,
+        commitJsonTemplate,
+      ], repositoryPath: wsRoot);
+      if (!wcRes.ok) {
+        return SyscallResult<AllocatedWorkspace>.failure(wcRes.error!);
+      }
+      final parsed = _parseJsonLines(wcRes.value!.stdout as String);
+      if (!parsed.ok || parsed.value!.isEmpty) {
+        return const SyscallResult<AllocatedWorkspace>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eio,
+            reason: 'JJ_EMPTY_WORKSPACE_STATUS',
+            message: 'Allocated task workspace returned no @ commit metadata.',
+            recoverable: false,
+          ),
         );
       }
-      final parentChangeId = (parentChangeRes.value!.stdout as String).trim();
+      final wc = parsed.value!.first;
+      final workingChangeId = (wc['change_id'] as String?)?.trim() ?? '';
+      final commitId = (wc['commit_id'] as String?)?.trim() ?? '';
 
-      // 3. Split a fresh child working change `@` with `jj new`.
-      final effectiveMessage =
-          (description != null && description.trim().isNotEmpty)
-              ? description.trim()
-              : 'agent-os: working change';
-      final newRes = await _runJjRaw(<String>[
-        'new',
-        '-m',
-        effectiveMessage,
-      ]);
-      if (!newRes.ok) {
-        return SyscallResult<
-            ({JjTxContext context, bool alreadyActive})>.failure(
-          newRes.error!,
-        );
-      }
-
-      // 4. Read new `@` change_id and head op_id non-destructively.
-      final workChangeRes = await _runJjRaw(<String>[
+      final opRes = await _runJjRaw(<String>[
+        'op',
         'log',
         '--no-graph',
-        '-r',
-        '@',
+        '--limit',
+        '1',
         '--ignore-working-copy',
         '-T',
-        'change_id.short(12)',
-      ]);
-      if (!workChangeRes.ok) {
-        return SyscallResult<
-            ({JjTxContext context, bool alreadyActive})>.failure(
-          workChangeRes.error!,
-        );
-      }
-      final workingChangeId = (workChangeRes.value!.stdout as String).trim();
+        'self.id()',
+      ], repositoryPath: wsRoot);
+      final currentOpId = opRes.ok ? (opRes.value!.stdout as String).trim() : '';
 
-      final newOpRes = await _runJjRaw(<String>[
+      return SyscallResult<AllocatedWorkspace>.success(
+        AllocatedWorkspace(
+          workspaceName: wsName,
+          workspaceRoot: wsRoot,
+          baseChangeId: effectiveBase,
+          workingChangeId: workingChangeId,
+          commitId: commitId,
+          currentOpId: currentOpId,
+        ),
+      );
+    });
+  }
+
+  /// Removes a Stacked Changes task workspace (`forget`, optional `abandon`, and directory deletion) ([D-311]).
+  Future<({bool cleanedUp, String opId})> removeTaskWorkspace({
+    required String workspaceName,
+    required String workspaceRoot,
+    String? workingChangeId,
+    bool abandonChange = false,
+  }) async {
+    var opId = '';
+    await _mutex.synchronized(() async {
+      await _runJjRaw(JjWorkspaceOps.buildWorkspaceForgetArgs(workspaceName));
+      if (abandonChange &&
+          workingChangeId != null &&
+          workingChangeId.trim().isNotEmpty) {
+        await _runJjRaw(<String>['abandon', workingChangeId.trim()]);
+      }
+      final opRes = await _runJjRaw(<String>[
         'op',
         'log',
         '--no-graph',
@@ -666,25 +1233,461 @@ class JjDriver {
         '-T',
         'self.id()',
       ]);
-      if (!newOpRes.ok) {
+      if (opRes.ok) {
+        opId = (opRes.value!.stdout as String).trim();
+      }
+    });
+    final cleanedUp = await _deleteDirectoryWithRetry(Directory(workspaceRoot));
+    return (cleanedUp: cleanedUp, opId: opId);
+  }
+
+  /// Snapshots [taskNode]'s workspace and cascades `workspace update-stale` in topological order ([D-311]).
+  Future<SyscallResult<({List<StackedCascadeTaskResult> cascaded, String opId})>>
+      syncTaskWorkspaceAndCascade({
+    required StackedTaskNode taskNode,
+    required List<StackedTaskNode> descendants,
+  }) {
+    return _mutex.synchronized(
+      () => _syncTaskNodeAndCascadeLocked(
+        taskNode: taskNode,
+        descendants: descendants,
+      ),
+    );
+  }
+
+  Future<SyscallResult<({List<StackedCascadeTaskResult> cascaded, String opId})>>
+      _syncTaskNodeAndCascadeLocked({
+    required StackedTaskNode taskNode,
+    required List<StackedTaskNode> descendants,
+    String? alreadySnapshottedOpId,
+  }) async {
+    var opId = alreadySnapshottedOpId ?? '';
+    if (alreadySnapshottedOpId == null) {
+      final snapRes = await _runJjWithAutoUpdateStale(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '-T',
+        'self.id()',
+      ], repositoryPath: taskNode.workspaceRoot);
+      if (!snapRes.ok) {
         return SyscallResult<
-            ({JjTxContext context, bool alreadyActive})>.failure(
-          newOpRes.error!,
+            ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+          snapRes.error!,
         );
       }
-      final currentOpId = (newOpRes.value!.stdout as String).trim();
+      opId = (snapRes.value!.stdout as String).trim();
+    }
 
-      txContext.enterActive(
-        baseOpId: baseOpId,
-        parentChangeId: parentChangeId,
-        workingChangeId: workingChangeId,
-        currentOpId: currentOpId.isEmpty ? baseOpId : currentOpId,
+    final selfSyncErr = await _refreshTaskNodeMetadataLocked(
+      taskNode,
+      opId: opId,
+    );
+    if (selfSyncErr != null) {
+      return SyscallResult<
+          ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+        selfSyncErr,
       );
+    }
 
-      return SyscallResult<({JjTxContext context, bool alreadyActive})>.success(
-        (context: txContext, alreadyActive: false),
+    final cascadeRes = await _cascadeUpdateStaleLocked(
+      descendants: descendants,
+      initialOpId: opId,
+    );
+    if (!cascadeRes.ok) {
+      return SyscallResult<
+          ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+        cascadeRes.error!,
+      );
+    }
+    return SyscallResult<
+        ({List<StackedCascadeTaskResult> cascaded, String opId})>.success(
+      cascadeRes.value!,
+    );
+  }
+
+  /// Integrates one or more worker changes into [taskNode]'s change and cascades `update-stale` ([D-311]).
+  Future<SyscallResult<({List<StackedCascadeTaskResult> cascaded, String opId})>>
+      integrateWorkerChangesIntoTask({
+    required StackedTaskNode taskNode,
+    required List<String> workerChangeIds,
+    bool abandonWorkerChanges = true,
+    List<StackedTaskNode> descendants = const <StackedTaskNode>[],
+  }) {
+    if (workerChangeIds.isEmpty) {
+      return Future<
+          SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>>.value(
+        const SyscallResult<
+            ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+          SyscallError(
+            code: SyscallErrorCode.einval,
+            reason: 'INVALID_ARGS',
+            message: 'workerChangeIds must contain at least one Change ID.',
+            recoverable: true,
+          ),
+        ),
+      );
+    }
+    for (final id in workerChangeIds) {
+      final trimmed = id.trim();
+      if (trimmed.isEmpty || trimmed.startsWith('-')) {
+        return Future<
+            SyscallResult<
+                ({List<StackedCascadeTaskResult> cascaded, String opId})>>.value(
+          const SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            SyscallError(
+              code: SyscallErrorCode.einval,
+              reason: 'INVALID_REVISION',
+              message:
+                  'Each entry in workerChangeIds must be a non-empty non-flag revision string.',
+              recoverable: true,
+            ),
+          ),
+        );
+      }
+    }
+
+    return _mutex.synchronized(() async {
+      // 1. Validate worker Change IDs exist.
+      final resolvedWorkers = <String>[];
+      final seen = <String>{};
+      for (final raw in workerChangeIds) {
+        final trimmed = raw.trim();
+        final verifyRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          trimmed,
+          '--ignore-working-copy',
+          '-T',
+          'change_id.short(12)',
+        ]);
+        if (!verifyRes.ok) {
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message:
+                  'Worker revision "$trimmed" was not found: ${verifyRes.error!.message}',
+              recoverable: true,
+            ),
+          );
+        }
+        final resolved = (verifyRes.value!.stdout as String).trim();
+        if (resolved.isEmpty) {
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message: 'Worker revision "$trimmed" resolved to empty.',
+              recoverable: true,
+            ),
+          );
+        }
+        if (resolved != taskNode.workingChangeId && seen.add(resolved)) {
+          resolvedWorkers.add(resolved);
+        }
+      }
+
+      // 2. Snapshot task workspace first so any prior local edits are committed.
+      final snapRes = await _runJjWithAutoUpdateStale(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '-T',
+        'self.id()',
+      ], repositoryPath: taskNode.workspaceRoot);
+      if (!snapRes.ok) {
+        return SyscallResult<
+            ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+          snapRes.error!,
+        );
+      }
+
+      if (resolvedWorkers.isNotEmpty) {
+        // Record main @ change_id so we can restore main working copy if needed.
+        final mainWcRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          '@',
+          '--ignore-working-copy',
+          '-T',
+          'change_id.short(12)',
+        ]);
+        final prevMainChangeId =
+            mainWcRes.ok ? (mainWcRes.value!.stdout as String).trim() : '';
+
+        // Create temporary merge change combining taskNode.workingChangeId + worker changes.
+        final newRes = await _runJjRaw(<String>[
+          'new',
+          taskNode.workingChangeId,
+          ...resolvedWorkers,
+          '-m',
+          'agent-os: integrate workers into ${taskNode.taskId}',
+        ]);
+        if (!newRes.ok) {
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            newRes.error!,
+          );
+        }
+
+        final mergeIdRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          '@',
+          '--ignore-working-copy',
+          '-T',
+          'change_id.short(12)',
+        ]);
+        if (!mergeIdRes.ok) {
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            mergeIdRes.error!,
+          );
+        }
+        final mergeChangeId = (mergeIdRes.value!.stdout as String).trim();
+
+        // Transfer merged tree (including any First-Class Conflicts) into taskNode.workingChangeId.
+        final restoreRes = await _runJjRaw(<String>[
+          'restore',
+          '--from',
+          mergeChangeId,
+          '--into',
+          taskNode.workingChangeId,
+        ]);
+        if (!restoreRes.ok) {
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            restoreRes.error!,
+          );
+        }
+
+        if (prevMainChangeId.isNotEmpty && prevMainChangeId != mergeChangeId) {
+          await _runJjRaw(<String>['edit', prevMainChangeId]);
+        }
+
+        final toAbandon = <String>[
+          if (mergeChangeId.isNotEmpty &&
+              mergeChangeId != taskNode.workingChangeId)
+            mergeChangeId,
+          if (abandonWorkerChanges)
+            ...resolvedWorkers.where(
+              (id) =>
+                  id != taskNode.workingChangeId &&
+                  id != prevMainChangeId &&
+                  id != txContext.parentChangeId &&
+                  id != txContext.anchorWorkingChangeId,
+            ),
+        ];
+        if (toAbandon.isNotEmpty) {
+          await _runJjRaw(<String>['abandon', ...toAbandon]);
+        }
+
+        // Update task workspace working copy to match updated c_A.
+        final updateTaskWsRes = await _runJjRaw(
+          JjWorkspaceOps.buildWorkspaceUpdateStaleArgs(),
+          repositoryPath: taskNode.workspaceRoot,
+        );
+        if (!updateTaskWsRes.ok &&
+            !JjWorkspaceOps.isStaleWorkingCopyError(
+              updateTaskWsRes.error!.message,
+            )) {
+          // If workspace wasn't stale (or update-stale is no-op), continue unless fatal.
+          // Note: jj workspace update-stale exits 0 even when already up-to-date.
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            updateTaskWsRes.error!,
+          );
+        }
+      }
+
+      final opRes = await _runJjRaw(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '--ignore-working-copy',
+        '-T',
+        'self.id()',
+      ]);
+      final opId = opRes.ok ? (opRes.value!.stdout as String).trim() : '';
+
+      final selfSyncErr = await _refreshTaskNodeMetadataLocked(
+        taskNode,
+        opId: opId,
+      );
+      if (selfSyncErr != null) {
+        return SyscallResult<
+            ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+          selfSyncErr,
+        );
+      }
+
+      return _cascadeUpdateStaleLocked(
+        descendants: descendants,
+        initialOpId: opId,
       );
     });
+  }
+
+  /// Non-destructively refreshes [taskNode]'s `commitId`, `hasConflicts`, and `conflictedFiles` ([D-311]).
+  Future<SyscallResult<void>> inspectTaskNodeMetadata({
+    required StackedTaskNode taskNode,
+  }) {
+    return _mutex.synchronized(() async {
+      final err = await _refreshTaskNodeMetadataLocked(taskNode);
+      if (err != null) {
+        return SyscallResult<void>.failure(err);
+      }
+      return const SyscallResult<void>.success(null);
+    });
+  }
+
+  /// Reads non-destructive Git-format diff for [taskNode]'s workspace (`focus`) ([D-311]).
+  Future<SyscallResult<String>> diffForTask({
+    required StackedTaskNode taskNode,
+  }) async {
+    final res = await diff(
+      rev: '@',
+      forceIgnoreWorkingCopy: true,
+      repositoryPath: taskNode.workspaceRoot,
+    );
+    if (!res.ok) {
+      return SyscallResult<String>.failure(res.error!);
+    }
+    return SyscallResult<String>.success((res.value!['diff'] as String?) ?? '');
+  }
+
+  Future<SyscallError?> _refreshTaskNodeMetadataLocked(
+    StackedTaskNode node, {
+    String? opId,
+  }) async {
+    final conflictRes = await _inspectConflictsNonDestructiveLocked(
+      rev: node.workingChangeId,
+      namespaceOverride: VfsNamespace(workspaceHostRoot: node.workspaceRoot),
+    );
+    if (!conflictRes.ok) {
+      return conflictRes.error!;
+    }
+    final info = conflictRes.value!;
+    final commitId = (info['commitId'] as String?)?.trim() ?? '';
+    final hasConflicts = info['hasConflicts'] == true;
+    final files = (info['files'] as List<dynamic>).cast<String>();
+
+    if (commitId.isNotEmpty) {
+      node.commitId = commitId;
+    }
+    node.hasConflicts = hasConflicts;
+    node.conflictedFiles = List<String>.from(files);
+    if (opId != null && opId.isNotEmpty) {
+      node.lastSyncedOpId = opId;
+    }
+    if (hasConflicts) {
+      node.state = StackedTaskState.conflict;
+    } else if (node.state == StackedTaskState.conflict) {
+      node.state = StackedTaskState.todo;
+    }
+    return null;
+  }
+
+  Future<SyscallResult<({List<StackedCascadeTaskResult> cascaded, String opId})>>
+      _cascadeUpdateStaleLocked({
+    required List<StackedTaskNode> descendants,
+    required String initialOpId,
+  }) async {
+    final cascaded = <StackedCascadeTaskResult>[];
+    var latestOpId = initialOpId;
+
+    for (final childNode in descendants) {
+      if (Directory(childNode.workspaceRoot).existsSync()) {
+        final updateRes = await _runJjRaw(
+          JjWorkspaceOps.buildWorkspaceUpdateStaleArgs(),
+          repositoryPath: childNode.workspaceRoot,
+        );
+        if (!updateRes.ok) {
+          return SyscallResult<
+              ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+            updateRes.error!,
+          );
+        }
+      }
+
+      final opRes = await _runJjRaw(<String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '--ignore-working-copy',
+        '-T',
+        'self.id()',
+      ]);
+      if (opRes.ok) {
+        final op = (opRes.value!.stdout as String).trim();
+        if (op.isNotEmpty) {
+          latestOpId = op;
+        }
+      }
+
+      final metaErr = await _refreshTaskNodeMetadataLocked(
+        childNode,
+        opId: latestOpId,
+      );
+      if (metaErr != null) {
+        return SyscallResult<
+            ({List<StackedCascadeTaskResult> cascaded, String opId})>.failure(
+          metaErr,
+        );
+      }
+
+      cascaded.add(
+        StackedCascadeTaskResult(
+          taskId: childNode.taskId,
+          workingChangeId: childNode.workingChangeId,
+          commitId: childNode.commitId,
+          hasConflicts: childNode.hasConflicts,
+          conflictedFiles: List<String>.from(childNode.conflictedFiles),
+          state: childNode.state.wireValue,
+        ),
+      );
+    }
+
+    return SyscallResult<
+        ({List<StackedCascadeTaskResult> cascaded, String opId})>.success(
+      (cascaded: cascaded, opId: latestOpId),
+    );
+  }
+
+  static Future<bool> _deleteDirectoryWithRetry(Directory dir) async {
+    if (!dir.existsSync()) {
+      return true;
+    }
+    const delaysMs = <int>[50, 100, 150, 250, 400];
+    for (var attempt = 0; attempt <= delaysMs.length; attempt++) {
+      try {
+        await dir.delete(recursive: true);
+        if (!dir.existsSync()) {
+          return true;
+        }
+      } on FileSystemException {
+        if (attempt < delaysMs.length) {
+          await Future<void>.delayed(Duration(milliseconds: delaysMs[attempt]));
+        }
+      }
+    }
+    return !dir.existsSync();
   }
 
   /// Updates the description of the active isolated working change (`sys_tx_describe`) ([D-015]).
@@ -747,10 +1750,477 @@ class JjDriver {
     });
   }
 
-  /// Builds a strictly non-destructive Stage 4 approval preview for `sys_tx_squash` ([D-015], [D-020], RV-001).
+  /// Non-destructively inspects First-Class Conflicts on [rev] (`sys_jj_conflicts`) ([D-310]).
   ///
-  /// Uses ONLY `--ignore-working-copy` commands so neither `op_id` nor `commit_id`
-  /// advances during approval prompting or upon user rejection.
+  /// Uses `conflicted_files` JSON template with `--ignore-working-copy` so it
+  /// always exits `0` regardless of whether conflicts exist (avoiding `jj resolve --list` exit=2).
+  Future<SyscallResult<Map<String, dynamic>>> inspectConflictsNonDestructive({
+    String rev = '@',
+    VfsNamespace? namespaceOverride,
+    String? repositoryPath,
+  }) {
+    final trimmedRev = rev.trim();
+    if (trimmedRev.isEmpty || trimmedRev.startsWith('-')) {
+      return Future<SyscallResult<Map<String, dynamic>>>.value(
+        const SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.einval,
+            reason: 'INVALID_ARGS',
+            message:
+                'Argument "rev" must be a non-empty revision expression not starting with "-".',
+            recoverable: true,
+          ),
+        ),
+      );
+    }
+    return _mutex.synchronized(
+      () => _inspectConflictsNonDestructiveLocked(
+        rev: trimmedRev,
+        namespaceOverride: namespaceOverride,
+        repositoryPath: repositoryPath,
+      ),
+    );
+  }
+
+  Future<SyscallResult<Map<String, dynamic>>>
+      _inspectConflictsNonDestructiveLocked({
+    String rev = '@',
+    VfsNamespace? namespaceOverride,
+    String? repositoryPath,
+  }) async {
+    final opRes = await _runJjRaw(
+      <String>[
+        'op',
+        'log',
+        '--no-graph',
+        '--limit',
+        '1',
+        '--ignore-working-copy',
+        '-T',
+        'self.id()',
+      ],
+      repositoryPath: repositoryPath,
+    );
+    final opId = opRes.ok ? (opRes.value!.stdout as String).trim() : '';
+
+    final res = await _runJjWithAutoUpdateStale(
+      <String>[
+        'log',
+        '--no-graph',
+        '-r',
+        rev,
+        '--ignore-working-copy',
+        '-T',
+        JjWorkspaceOps.conflictsJsonTemplate,
+      ],
+      repositoryPath: repositoryPath,
+    );
+    if (!res.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.enoent,
+          reason: 'JJ_TARGET_NOT_FOUND',
+          message:
+              'Revision "$rev" could not be resolved for conflict inspection: ${res.error!.message}',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final parsedRes = _parseJsonLines(res.value!.stdout as String);
+    if (!parsedRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(parsedRes.error!);
+    }
+    final rows = parsedRes.value!;
+    if (rows.isEmpty) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.enoent,
+          reason: 'JJ_TARGET_NOT_FOUND',
+          message: 'Revision "$rev" matched 0 commits.',
+          recoverable: true,
+        ),
+      );
+    }
+    if (rows.length > 1) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'AMBIGUOUS_REVISION',
+          message:
+              'Revision "$rev" matched ${rows.length} commits; specify a single revision.',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final row = rows.first;
+    final changeId = (row['change_id'] as String?)?.trim() ?? '';
+    final commitId = (row['commit_id'] as String?)?.trim() ?? '';
+    final hasConflicts = row['conflict'] == true;
+    final rawFiles = row['files'] is List ? row['files'] as List : const <dynamic>[];
+    final files = JjWorkspaceOps.normalizeConflictedVirtualPaths(
+      rawFiles,
+      namespace: namespaceOverride,
+    );
+
+    return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+      'rev': rev,
+      'changeId': changeId,
+      'commitId': commitId,
+      'hasConflicts': hasConflicts,
+      'files': files,
+      'opId': ?(opId.isNotEmpty ? opId : null),
+    });
+  }
+
+  /// Creates a multi-parent merge commit over [changeIds] (`sys_jj_merge`) ([D-309]).
+  ///
+  /// Never aborts on First-Class Conflicts: records `hasConflicts` and `conflictedFiles`
+  /// in the returned payload so the caller or `ConflictResolver` can resolve them.
+  Future<SyscallResult<Map<String, dynamic>>> mergeChanges({
+    required List<String> changeIds,
+    String? message,
+    VfsNamespace? namespaceOverride,
+  }) {
+    final validation = _validateMergeArgs(<String, dynamic>{
+      'changeIds': changeIds,
+      'message': ?message,
+    });
+    if (validation != null) {
+      return Future<SyscallResult<Map<String, dynamic>>>.value(
+        SyscallResult<Map<String, dynamic>>.failure(validation),
+      );
+    }
+
+    return _mutex.synchronized(() async {
+      ensureAgentOsGitignoreSync(workspaceHostRoot);
+
+      if (txContext.state == TxState.readOnly) {
+        final txRes = await _ensureActiveTransactionLocked(
+          description: 'agent-os: working change',
+        );
+        if (!txRes.ok) {
+          return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
+        }
+      }
+      txContext.anchorWorkingChangeId ??= txContext.workingChangeId;
+
+      final resolvedParents = <String>[];
+      final seenParents = <String>{};
+      for (final rawId in changeIds) {
+        final target = rawId.trim();
+        final verifyRes = await _runJjRaw(<String>[
+          'log',
+          '--no-graph',
+          '-r',
+          target,
+          '--ignore-working-copy',
+          '-T',
+          r'change_id.short(12) ++ "\n"',
+        ]);
+        if (!verifyRes.ok) {
+          return SyscallResult<Map<String, dynamic>>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message:
+                  'Merge parent revision "$target" was not found: ${verifyRes.error!.message}',
+              recoverable: true,
+            ),
+          );
+        }
+        final lines = const LineSplitter()
+            .convert(verifyRes.value!.stdout as String)
+            .map((l) => l.trim())
+            .where((l) => l.isNotEmpty)
+            .toList(growable: false);
+        if (lines.isEmpty) {
+          return SyscallResult<Map<String, dynamic>>.failure(
+            SyscallError(
+              code: SyscallErrorCode.enoent,
+              reason: 'JJ_TARGET_NOT_FOUND',
+              message: 'Merge parent revision "$target" resolved to 0 commits.',
+              recoverable: true,
+            ),
+          );
+        }
+        if (lines.length > 1) {
+          return SyscallResult<Map<String, dynamic>>.failure(
+            SyscallError(
+              code: SyscallErrorCode.einval,
+              reason: 'AMBIGUOUS_REVISION',
+              message:
+                  'Merge parent "$target" resolved to ${lines.length} commits.',
+              recoverable: true,
+            ),
+          );
+        }
+        final resolved = lines.first;
+        if (seenParents.add(resolved)) {
+          resolvedParents.add(resolved);
+        }
+      }
+
+      if (resolvedParents.length < 2) {
+        return const SyscallResult<Map<String, dynamic>>.failure(
+          SyscallError(
+            code: SyscallErrorCode.einval,
+            reason: 'INVALID_MERGE_PARENTS',
+            message:
+                'sys_jj_merge requires at least 2 distinct parent Change IDs.',
+            recoverable: true,
+          ),
+        );
+      }
+
+      final effectiveMessage =
+          (message != null && message.trim().isNotEmpty)
+              ? message.trim()
+              : 'agent-os: merge worker changes';
+      final newRes = await _runJjRaw(<String>[
+        'new',
+        ...resolvedParents,
+        '-m',
+        effectiveMessage,
+      ]);
+      if (!newRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(newRes.error!);
+      }
+
+      final conflictRes = await _inspectConflictsNonDestructiveLocked(
+        rev: '@',
+        namespaceOverride: namespaceOverride,
+      );
+      if (!conflictRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(conflictRes.error!);
+      }
+      final info = conflictRes.value!;
+      final mergeChangeId = info['changeId'] as String;
+      final mergeCommitId = info['commitId'] as String;
+      final hasConflicts = info['hasConflicts'] == true;
+      final files = (info['files'] as List<dynamic>).cast<String>();
+      final opId = (info['opId'] as String?) ?? txContext.currentOpId ?? '';
+
+      txContext.updateSnapshot(
+        currentOpId: opId,
+        workingChangeId: mergeChangeId,
+      );
+      txContext.pendingWorkerChangeIds.addAll(resolvedParents);
+
+      return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+        'mergeChangeId': mergeChangeId,
+        'mergeCommitId': mergeCommitId,
+        'parentChangeIds': resolvedParents,
+        'anchorWorkingChangeId': txContext.anchorWorkingChangeId,
+        'hasConflicts': hasConflicts,
+        'conflictedFiles': files,
+        'jjOpId': opId,
+      });
+    });
+  }
+
+  /// Flattens a resolved merge (or worker) change onto the single-parent anchor
+  /// working change `W_lead` (`sys_jj_integrate`) ([D-309]).
+  Future<SyscallResult<Map<String, dynamic>>> integrateIntoWorkingChange({
+    String sourceRev = '@',
+    List<String>? abandonChangeIds,
+    Set<String> protectedChangeIds = const <String>{},
+    VfsNamespace? namespaceOverride,
+  }) {
+    final validation = _validateIntegrateArgs(<String, dynamic>{
+      'sourceRev': sourceRev,
+      'abandonChangeIds': ?abandonChangeIds,
+    });
+    if (validation != null) {
+      return Future<SyscallResult<Map<String, dynamic>>>.value(
+        SyscallResult<Map<String, dynamic>>.failure(validation),
+      );
+    }
+    return _mutex.synchronized(
+      () => _integrateIntoWorkingChangeLocked(
+        sourceRev: sourceRev.trim(),
+        abandonChangeIds: abandonChangeIds,
+        protectedChangeIds: protectedChangeIds,
+        namespaceOverride: namespaceOverride,
+      ),
+    );
+  }
+
+  Future<SyscallResult<Map<String, dynamic>>> _integrateIntoWorkingChangeLocked({
+    String sourceRev = '@',
+    List<String>? abandonChangeIds,
+    Set<String> protectedChangeIds = const <String>{},
+    VfsNamespace? namespaceOverride,
+  }) async {
+    if (txContext.state != TxState.active) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.econflict,
+          reason: 'NO_ACTIVE_TRANSACTION',
+          message:
+              'Cannot integrate: no active isolated transaction (TxState != active).',
+          recoverable: true,
+        ),
+      );
+    }
+
+    ensureAgentOsGitignoreSync(workspaceHostRoot);
+
+    // Finalize main working copy snapshot prior to conflict check.
+    final snapRes = await _runJjRaw(<String>[
+      'op',
+      'log',
+      '--no-graph',
+      '--limit',
+      '1',
+      '-T',
+      'self.id()',
+    ]);
+    if (!snapRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(snapRes.error!);
+    }
+
+    final conflictRes = await _inspectConflictsNonDestructiveLocked(
+      rev: sourceRev,
+      namespaceOverride: namespaceOverride,
+    );
+    if (!conflictRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(conflictRes.error!);
+    }
+    final info = conflictRes.value!;
+    final sourceChangeId = info['changeId'] as String;
+    final hasConflicts = info['hasConflicts'] == true;
+    final files = (info['files'] as List<dynamic>).cast<String>();
+    if (hasConflicts) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.econflict,
+          reason: 'UNRESOLVED_CONFLICTS',
+          message:
+              'Cannot integrate "$sourceRev": unresolved First-Class Conflicts remain.',
+          recoverable: true,
+          hint:
+              'Inspect conflicted files via sys_jj_conflicts / sys_read_lines, resolve all conflict markers with sys_edit_block or a conflict_resolver worker, verify tests, then retry.',
+          details: <String, dynamic>{
+            'conflictedFiles': files,
+            'workingChangeId': sourceChangeId,
+          },
+        ),
+      );
+    }
+
+    final anchorId = txContext.anchorWorkingChangeId ?? txContext.workingChangeId;
+    if (anchorId == null || anchorId.isEmpty) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.econflict,
+          reason: 'NO_ANCHOR_WORKING_CHANGE',
+          message: 'No single-parent anchor working change is recorded.',
+          recoverable: false,
+        ),
+      );
+    }
+
+    if (sourceChangeId != anchorId) {
+      final restoreRes = await _runJjRaw(<String>[
+        'restore',
+        '--from',
+        sourceChangeId,
+        '--into',
+        anchorId,
+      ]);
+      if (!restoreRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(restoreRes.error!);
+      }
+
+      final editRes = await _runJjRaw(<String>[
+        'edit',
+        anchorId,
+      ]);
+      if (!editRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(editRes.error!);
+      }
+    }
+
+    final candidateAbandon = <String>[
+      ...(abandonChangeIds ?? txContext.pendingWorkerChangeIds),
+      if (sourceChangeId != anchorId) sourceChangeId,
+    ];
+    final toAbandon = <String>[];
+    final seenAbandon = <String>{};
+    for (final raw in candidateAbandon) {
+      final trimmed = raw.trim();
+      if (trimmed.isEmpty || trimmed.startsWith('-')) {
+        continue;
+      }
+      final resolveRes = await _runJjRaw(<String>[
+        'log',
+        '--no-graph',
+        '-r',
+        trimmed,
+        '--ignore-working-copy',
+        '-T',
+        'change_id.short(12)',
+      ]);
+      if (!resolveRes.ok) {
+        continue;
+      }
+      final resolved = (resolveRes.value!.stdout as String).trim();
+      if (resolved.isEmpty ||
+          resolved == anchorId ||
+          resolved == txContext.parentChangeId ||
+          protectedChangeIds.contains(resolved)) {
+        continue;
+      }
+      if (seenAbandon.add(resolved)) {
+        toAbandon.add(resolved);
+      }
+    }
+
+    if (toAbandon.isNotEmpty) {
+      final abandonRes = await _runJjRaw(<String>[
+        'abandon',
+        ...toAbandon,
+      ]);
+      if (!abandonRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(abandonRes.error!);
+      }
+    }
+
+    final opRes = await _runJjRaw(<String>[
+      'op',
+      'log',
+      '--no-graph',
+      '--limit',
+      '1',
+      '--ignore-working-copy',
+      '-T',
+      'self.id()',
+    ]);
+    if (!opRes.ok) {
+      return SyscallResult<Map<String, dynamic>>.failure(opRes.error!);
+    }
+    final newOpId = (opRes.value!.stdout as String).trim();
+
+    txContext.anchorWorkingChangeId = anchorId;
+    txContext.pendingWorkerChangeIds.clear();
+    txContext.updateSnapshot(
+      currentOpId: newOpId,
+      workingChangeId: anchorId,
+    );
+
+    return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+      'integratedChangeId': anchorId,
+      'abandonedChangeIds': toAbandon,
+      'jjOpId': newOpId,
+    });
+  }
+
+  /// Builds a strictly non-destructive Stage 4 approval preview for `sys_tx_squash` ([D-015], [D-020], [D-309], RV-001).
+  ///
+  /// Uses ONLY `--ignore-working-copy` commands against `baseRev` (`txContext.parentChangeId ?? '@-'`)
+  /// so neither `op_id` nor `commit_id` advances and multi-parent merges produce complete Diff blocks.
   Future<ApprovalPreview?> buildSquashApprovalPreview(
     SyscallHookContext context,
   ) {
@@ -759,10 +2229,13 @@ class JjDriver {
         return null;
       }
 
+      final baseRev = txContext.parentChangeId ?? '@-';
       final diffRes = await _runJjRaw(<String>[
         'diff',
         '--git',
-        '-r',
+        '--from',
+        baseRev,
+        '--to',
         '@',
         '--ignore-working-copy',
       ]);
@@ -771,7 +2244,9 @@ class JjDriver {
       final summaryRes = await _runJjRaw(<String>[
         'diff',
         '--summary',
-        '-r',
+        '--from',
+        baseRev,
+        '--to',
         '@',
         '--ignore-working-copy',
       ]);
@@ -801,13 +2276,13 @@ class JjDriver {
             continue;
           }
         } else if (statusCode == 'D') {
-          oldText = await _readTextFileAtRevIgnoreWc('@-', oldRel);
+          oldText = await _readTextFileAtRevIgnoreWc(baseRev, oldRel);
           newText = '';
           if (oldText == null) {
             continue;
           }
         } else {
-          oldText = await _readTextFileAtRevIgnoreWc('@-', oldRel);
+          oldText = await _readTextFileAtRevIgnoreWc(baseRev, oldRel);
           newText = await _readTextFileAtRevIgnoreWc('@', newRel);
           if (newText == null) {
             continue;
@@ -850,10 +2325,12 @@ class JjDriver {
     });
   }
 
-  /// Non-interactively squashes `@` into `@-` (`sys_tx_squash`) and resets to [TxState.readOnly] ([D-015]).
+  /// Non-interactively squashes `@` into `@-` (`sys_tx_squash`) and resets to [TxState.readOnly] ([D-015], [D-309]).
   ///
   /// Always supplies `-m <message>` or `-u` (`--use-destination-message`) alongside
   /// non-interactive editor env vars so `jj squash` never blocks waiting for an editor.
+  /// When `@` is a multi-parent merge (or diverges from `anchorWorkingChangeId`), automatically
+  /// flattens onto the single-parent anchor change before squashing ([D-309] §4.2-2).
   Future<SyscallResult<Map<String, dynamic>>> txSquash({
     String? message,
   }) async {
@@ -886,7 +2363,7 @@ class JjDriver {
 
       ensureAgentOsGitignoreSync(workspaceHostRoot);
 
-      // Finalize working-copy snapshot prior to non-interactive squash.
+      // Finalize working-copy snapshot prior to conflict/parent check and squash.
       final snapRes = await _runJjRaw(<String>[
         'op',
         'log',
@@ -898,6 +2375,38 @@ class JjDriver {
       ]);
       if (!snapRes.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(snapRes.error!);
+      }
+
+      // Check whether @ is multi-parent or diverges from anchorWorkingChangeId; flatten if so ([D-309]).
+      final metaRes = await _runJjRaw(<String>[
+        'log',
+        '--no-graph',
+        '-r',
+        '@',
+        '--ignore-working-copy',
+        '-T',
+        r'change_id.short(12) ++ "\t" ++ parents.len() ++ "\n"',
+      ]);
+      if (metaRes.ok) {
+        final parts = (metaRes.value!.stdout as String).trim().split('\t');
+        final currentChangeId = parts.isNotEmpty ? parts[0].trim() : '';
+        final parentCount =
+            parts.length >= 2 ? (int.tryParse(parts[1].trim()) ?? 1) : 1;
+        final anchorId = txContext.anchorWorkingChangeId;
+        if (parentCount >= 2 ||
+            (anchorId != null &&
+                anchorId.isNotEmpty &&
+                currentChangeId.isNotEmpty &&
+                currentChangeId != anchorId)) {
+          final flattenRes = await _integrateIntoWorkingChangeLocked(
+            sourceRev: '@',
+          );
+          if (!flattenRes.ok) {
+            return SyscallResult<Map<String, dynamic>>.failure(
+              flattenRes.error!,
+            );
+          }
+        }
       }
 
       final trimmedMessage = message?.trim();
@@ -944,6 +2453,8 @@ class JjDriver {
           : txContext.workingChangeId;
 
       final previousBaseOpId = txContext.baseOpId;
+      txContext.anchorWorkingChangeId = null;
+      txContext.pendingWorkerChangeIds.clear();
       txContext.resetToReadOnly(
         currentOpId: newOpId.isEmpty ? null : newOpId,
         workingChangeId:
@@ -1026,6 +2537,8 @@ class JjDriver {
           ? (changeRes.value!.stdout as String).trim()
           : null;
 
+      txContext.anchorWorkingChangeId = null;
+      txContext.pendingWorkerChangeIds.clear();
       txContext.resetToReadOnly(
         currentOpId: newOpId.isEmpty ? null : newOpId,
         workingChangeId:
@@ -1104,12 +2617,94 @@ class JjDriver {
         kind: 'edit',
         applyIoCap: false,
         validateArgs: _validateTxSquashArgs,
-        checkPreconditions: (pcb, _) async => _requireActiveTx(pcb),
+        checkPreconditions: (pcb, _) async {
+          final activeErr = _requireActiveTx(pcb);
+          if (activeErr != null) {
+            return activeErr;
+          }
+          final conflictRes = await inspectConflictsNonDestructive(rev: '@');
+          if (!conflictRes.ok) {
+            return conflictRes.error;
+          }
+          final info = conflictRes.value!;
+          if (info['hasConflicts'] == true) {
+            return SyscallError(
+              code: SyscallErrorCode.econflict,
+              reason: 'UNRESOLVED_CONFLICTS',
+              message:
+                  'Unresolved First-Class Conflicts remain in @. Resolve conflicts before calling sys_tx_squash.',
+              recoverable: true,
+              hint:
+                  'Unresolved First-Class Conflicts remain in @. Inspect conflicted files via sys_jj_conflicts / sys_read_lines, resolve all <<<<<<< ... >>>>>>> markers with sys_edit_block or a conflict_resolver worker, verify tests, then retry sys_tx_squash.',
+              details: <String, dynamic>{
+                'conflictedFiles': info['files'],
+                'workingChangeId': info['changeId'],
+              },
+            );
+          }
+          return null;
+        },
         evaluatePolicy: (_, _) async => RingDecision.askUser,
         approvalPreviewBuilder: buildSquashApprovalPreview,
         handler: (exec) => txSquash(
           message: exec.args['message'] as String?,
         ),
+      ),
+      SyscallDefinition(
+        name: 'sys_jj_merge',
+        requiredRight: CapRight.vcsTx,
+        kind: 'edit',
+        applyIoCap: false,
+        validateArgs: _validateMergeArgs,
+        evaluatePolicy: (_, _) async => RingDecision.allow,
+        resultSummaryBuilder: (_, result) {
+          if (!result.ok || result.value == null) {
+            return null;
+          }
+          final v = result.value!;
+          final files = v['conflictedFiles'];
+          return <String, dynamic>{
+            'mergeChangeId': v['mergeChangeId'],
+            'mergeCommitId': v['mergeCommitId'],
+            'hasConflicts': v['hasConflicts'],
+            'conflictedFilesCount': files is List ? files.length : 0,
+          };
+        },
+        handler: (exec) {
+          final rawIds = exec.args['changeIds'] as List<dynamic>;
+          return mergeChanges(
+            changeIds: rawIds.cast<String>(),
+            message: exec.args['message'] as String?,
+            namespaceOverride: exec.pcb.namespace,
+          );
+        },
+      ),
+      SyscallDefinition(
+        name: 'sys_jj_integrate',
+        requiredRight: CapRight.vcsTx,
+        kind: 'edit',
+        applyIoCap: false,
+        validateArgs: _validateIntegrateArgs,
+        checkPreconditions: (pcb, _) async => _requireActiveTx(pcb),
+        evaluatePolicy: (_, _) async => RingDecision.allow,
+        resultSummaryBuilder: (_, result) {
+          if (!result.ok || result.value == null) {
+            return null;
+          }
+          final v = result.value!;
+          return <String, dynamic>{
+            'targetChangeId': v['integratedChangeId'],
+            'abandonedChangeIds': v['abandonedChangeIds'],
+          };
+        },
+        handler: (exec) {
+          final rawAbandon = exec.args['abandonChangeIds'] as List<dynamic>?;
+          return integrateIntoWorkingChange(
+            sourceRev: (exec.args['sourceRev'] as String?) ?? '@',
+            abandonChangeIds: rawAbandon?.cast<String>(),
+            namespaceOverride: exec.pcb.namespace,
+          );
+        },
       ),
       SyscallDefinition(
         name: 'sys_tx_rollback',
@@ -1151,6 +2746,7 @@ class JjDriver {
         handler: (exec) => status(
           atOp: exec.args['atOp'] as String?,
           forceIgnoreWorkingCopy: shouldForceIgnoreWc(exec.pcb),
+          repositoryPath: exec.pcb.jjWorkspaceRoot,
         ),
       ),
       SyscallDefinition(
@@ -1166,6 +2762,7 @@ class JjDriver {
           limit: exec.args['limit'] as int? ?? 20,
           atOp: exec.args['atOp'] as String?,
           forceIgnoreWorkingCopy: shouldForceIgnoreWc(exec.pcb),
+          repositoryPath: exec.pcb.jjWorkspaceRoot,
         ),
       ),
       SyscallDefinition(
@@ -1184,8 +2781,34 @@ class JjDriver {
             atOp: exec.args['atOp'] as String?,
             forceIgnoreWorkingCopy: shouldForceIgnoreWc(exec.pcb),
             namespaceOverride: exec.pcb.namespace,
+            repositoryPath: exec.pcb.jjWorkspaceRoot,
           );
         },
+      ),
+      SyscallDefinition(
+        name: 'sys_jj_conflicts',
+        requiredRight: CapRight.vcsRead,
+        kind: 'read',
+        applyIoCap: false,
+        validateArgs: _validateConflictsArgs,
+        evaluatePolicy: (_, _) async => RingDecision.allow,
+        resultSummaryBuilder: (_, result) {
+          if (!result.ok || result.value == null) {
+            return null;
+          }
+          final v = result.value!;
+          final files = v['files'];
+          return <String, dynamic>{
+            'rev': v['rev'],
+            'hasConflicts': v['hasConflicts'],
+            'filesCount': files is List ? files.length : 0,
+          };
+        },
+        handler: (exec) => inspectConflictsNonDestructive(
+          rev: (exec.args['rev'] as String?) ?? '@',
+          namespaceOverride: exec.pcb.namespace,
+          repositoryPath: exec.pcb.jjWorkspaceRoot,
+        ),
       ),
     ];
   }
@@ -1260,10 +2883,54 @@ class JjDriver {
           },
         },
       ),
+      SyscallToolSchema(
+        name: 'sys_jj_merge',
+        description:
+            'Create a multi-parent merge commit combining 2..16 completed worker Change IDs (`jj new c1 c2 ...`). Never aborts on First-Class Conflicts; returns `hasConflicts` and `conflictedFiles`.',
+        parametersJsonSchema: const <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'changeIds': <String, dynamic>{
+              'type': 'array',
+              'items': <String, dynamic>{'type': 'string'},
+              'minItems': 2,
+              'maxItems': 16,
+              'description':
+                  'List of 2 to 16 distinct Jujutsu Change IDs or revisions to merge.',
+            },
+            'message': <String, dynamic>{
+              'type': 'string',
+              'description': 'Optional merge commit description.',
+            },
+          },
+          'required': <String>['changeIds'],
+        },
+      ),
+      SyscallToolSchema(
+        name: 'sys_jj_integrate',
+        description:
+            'Flatten a conflict-free resolved merge or worker change into the single-parent anchor working change (`W_lead`) and abandon temporary worker/merge changes so `sys_tx_squash` can proceed.',
+        parametersJsonSchema: const <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'sourceRev': <String, dynamic>{
+              'type': 'string',
+              'description':
+                  'Revision of the resolved merge or worker change to integrate (default "@").',
+            },
+            'abandonChangeIds': <String, dynamic>{
+              'type': 'array',
+              'items': <String, dynamic>{'type': 'string'},
+              'description':
+                  'Optional list of temporary worker/merge Change IDs to abandon after flattening.',
+            },
+          },
+        },
+      ),
     ];
   }
 
-  /// Returns canonical tool schemas for `sys_jj_status`, `sys_jj_log`, and `sys_jj_diff` ([D-007], [D-014]).
+  /// Returns canonical tool schemas for `sys_jj_status`, `sys_jj_log`, `sys_jj_diff`, and `sys_jj_conflicts` ([D-007], [D-014], [D-310]).
   static List<SyscallToolSchema> readToolSchemas() {
     return <SyscallToolSchema>[
       SyscallToolSchema(
@@ -1325,6 +2992,20 @@ class JjDriver {
           },
         },
       ),
+      SyscallToolSchema(
+        name: 'sys_jj_conflicts',
+        description:
+            'Non-destructively inspect First-Class Conflicts on a revision (default "@"). Always succeeds whether conflicts exist or not, returning `hasConflicts` and normalized `/workspace/...` `files`.',
+        parametersJsonSchema: const <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'rev': <String, dynamic>{
+              'type': 'string',
+              'description': 'Revision to inspect (default "@").',
+            },
+          },
+        },
+      ),
     ];
   }
 
@@ -1364,9 +3045,40 @@ class JjDriver {
     }
   }
 
-  /// Runs `jj --no-pager <args>` with `runInShell: false` and checks `exitCode == 0`.
-  Future<SyscallResult<ProcessResult>> _runJjRaw(List<String> args) async {
-    final fullArgs = <String>['--no-pager', ...args];
+  /// Runs `jj --no-pager [-R <repositoryPath>] <args>` with `runInShell: false` and auto-retries once on stale workspace ([D-308]).
+  Future<SyscallResult<ProcessResult>> _runJjWithAutoUpdateStale(
+    List<String> args, {
+    String? repositoryPath,
+  }) async {
+    final res = await _runJjRaw(args, repositoryPath: repositoryPath);
+    if (!res.ok &&
+        repositoryPath != null &&
+        repositoryPath.trim().isNotEmpty &&
+        JjWorkspaceOps.isStaleWorkingCopyError(res.error!.message)) {
+      final updateRes = await _runJjRaw(
+        JjWorkspaceOps.buildWorkspaceUpdateStaleArgs(),
+        repositoryPath: repositoryPath,
+      );
+      if (updateRes.ok) {
+        return _runJjRaw(args, repositoryPath: repositoryPath);
+      }
+    }
+    return res;
+  }
+
+  /// Runs `jj --no-pager [-R <repositoryPath>] <args>` with `runInShell: false` and checks `exitCode == 0`.
+  Future<SyscallResult<ProcessResult>> _runJjRaw(
+    List<String> args, {
+    String? repositoryPath,
+  }) async {
+    final fullArgs = <String>[
+      '--no-pager',
+      if (repositoryPath != null && repositoryPath.trim().isNotEmpty) ...<String>[
+        '-R',
+        p.normalize(p.absolute(repositoryPath)),
+      ],
+      ...args,
+    ];
     final ProcessResult procResult;
     try {
       procResult = await Process.run(
@@ -1612,6 +3324,124 @@ class JjDriver {
               'Argument "targetOpId" ("$targetOpId") must be a hexadecimal operation ID.',
           recoverable: true,
         );
+      }
+    }
+    return null;
+  }
+
+  static SyscallError? _validateMergeArgs(Map<String, dynamic> args) {
+    final rawIds = args['changeIds'];
+    if (rawIds is! List<dynamic>) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_MERGE_PARENTS',
+        message: 'Argument "changeIds" must be a list of 2 to 16 revision strings.',
+        recoverable: true,
+      );
+    }
+    if (rawIds.length < 2 || rawIds.length > 16) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_MERGE_PARENTS',
+        message: 'Argument "changeIds" must contain between 2 and 16 Change IDs.',
+        recoverable: true,
+      );
+    }
+    final distinct = <String>{};
+    for (final item in rawIds) {
+      if (item is! String) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_MERGE_PARENTS',
+          message: 'Each element of "changeIds" must be a string.',
+          recoverable: true,
+        );
+      }
+      final trimmed = item.trim();
+      if (trimmed.isEmpty || trimmed.startsWith('-')) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_MERGE_PARENTS',
+          message:
+              'Each Change ID in "changeIds" must be non-empty and must not start with "-".',
+          recoverable: true,
+        );
+      }
+      distinct.add(trimmed);
+    }
+    if (distinct.length < 2) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_MERGE_PARENTS',
+        message: 'Argument "changeIds" must contain at least 2 distinct Change IDs.',
+        recoverable: true,
+      );
+    }
+    final message = args['message'];
+    if (message != null && message is! String) {
+      return const SyscallError(
+        code: SyscallErrorCode.einval,
+        reason: 'INVALID_ARGS',
+        message: 'Argument "message" must be a string.',
+        recoverable: true,
+      );
+    }
+    return null;
+  }
+
+  static SyscallError? _validateConflictsArgs(Map<String, dynamic> args) {
+    final rev = args['rev'];
+    if (rev != null) {
+      if (rev is! String || rev.trim().isEmpty || rev.trim().startsWith('-')) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_ARGS',
+          message:
+              'Argument "rev" must be a non-empty string not starting with "-".',
+          recoverable: true,
+        );
+      }
+    }
+    return null;
+  }
+
+  static SyscallError? _validateIntegrateArgs(Map<String, dynamic> args) {
+    final sourceRev = args['sourceRev'];
+    if (sourceRev != null) {
+      if (sourceRev is! String ||
+          sourceRev.trim().isEmpty ||
+          sourceRev.trim().startsWith('-')) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_ARGS',
+          message:
+              'Argument "sourceRev" must be a non-empty string not starting with "-".',
+          recoverable: true,
+        );
+      }
+    }
+    final abandonIds = args['abandonChangeIds'];
+    if (abandonIds != null) {
+      if (abandonIds is! List<dynamic>) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_ARGS',
+          message: 'Argument "abandonChangeIds" must be a list of strings.',
+          recoverable: true,
+        );
+      }
+      for (final item in abandonIds) {
+        if (item is! String ||
+            item.trim().isEmpty ||
+            item.trim().startsWith('-')) {
+          return const SyscallError(
+            code: SyscallErrorCode.einval,
+            reason: 'INVALID_ARGS',
+            message:
+                'Each element of "abandonChangeIds" must be a non-empty string not starting with "-".',
+            recoverable: true,
+          );
+        }
       }
     }
     return null;

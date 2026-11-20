@@ -227,11 +227,15 @@ class Win32JobExecDriver {
     required this.namespace,
     EnsureActiveTransactionCallback? ensureActiveTransaction,
     SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
+    EnsureActiveTransactionForPcbCallback? ensureActiveTransactionForPcb,
+    SyncWorkingCopySnapshotForPcbCallback? syncWorkingCopySnapshotForPcb,
     IoPayloadCapper? ioCapper,
     SysExecClassifier? classifier,
     Win32Kernel32? kernel32,
   })  : _ensureActiveTransaction = ensureActiveTransaction,
         _syncWorkingCopySnapshot = syncWorkingCopySnapshot,
+        _ensureActiveTransactionForPcb = ensureActiveTransactionForPcb,
+        _syncWorkingCopySnapshotForPcb = syncWorkingCopySnapshotForPcb,
         _ioCapper = ioCapper ??
             IoPayloadCapper(workspaceHostRoot: namespace.workspaceHostRoot),
         classifier = classifier ?? SysExecClassifier(namespace: namespace),
@@ -241,6 +245,8 @@ class Win32JobExecDriver {
     String workspaceHostRoot, {
     EnsureActiveTransactionCallback? ensureActiveTransaction,
     SyncWorkingCopySnapshotCallback? syncWorkingCopySnapshot,
+    EnsureActiveTransactionForPcbCallback? ensureActiveTransactionForPcb,
+    SyncWorkingCopySnapshotForPcbCallback? syncWorkingCopySnapshotForPcb,
     IoPayloadCapper? ioCapper,
   }) {
     final ns = VfsNamespace(workspaceHostRoot: workspaceHostRoot);
@@ -248,6 +254,8 @@ class Win32JobExecDriver {
       namespace: ns,
       ensureActiveTransaction: ensureActiveTransaction,
       syncWorkingCopySnapshot: syncWorkingCopySnapshot,
+      ensureActiveTransactionForPcb: ensureActiveTransactionForPcb,
+      syncWorkingCopySnapshotForPcb: syncWorkingCopySnapshotForPcb,
       ioCapper: ioCapper,
     );
   }
@@ -278,6 +286,8 @@ class Win32JobExecDriver {
   final VfsNamespace namespace;
   final EnsureActiveTransactionCallback? _ensureActiveTransaction;
   final SyncWorkingCopySnapshotCallback? _syncWorkingCopySnapshot;
+  final EnsureActiveTransactionForPcbCallback? _ensureActiveTransactionForPcb;
+  final SyncWorkingCopySnapshotForPcbCallback? _syncWorkingCopySnapshotForPcb;
   final IoPayloadCapper _ioCapper;
   final SysExecClassifier classifier;
   Win32Kernel32? _kernel32;
@@ -308,7 +318,10 @@ class Win32JobExecDriver {
     CancellationToken? cancelToken,
     String sessionId = 'exec',
     int syscallSeq = 0,
+    VfsNamespace? namespaceOverride,
+    ProcessControlBlock? callerPcb,
   }) async {
+    final effectiveNamespace = namespaceOverride ?? namespace;
     final validationError = validateRawArgs(<String, dynamic>{
       'command': command,
       'args': ?args,
@@ -329,7 +342,10 @@ class Win32JobExecDriver {
             : workingDir.trim();
     final effectiveTimeoutMs = timeoutMs ?? defaultTimeoutMs;
 
-    final wdPrecheck = _resolveWorkingDir(effectiveWorkingDir);
+    final wdPrecheck = _resolveWorkingDir(
+      effectiveWorkingDir,
+      namespaceOverride: effectiveNamespace,
+    );
     if (!wdPrecheck.ok) {
       return SyscallResult<Map<String, dynamic>>.failure(wdPrecheck.error!);
     }
@@ -371,7 +387,12 @@ class Win32JobExecDriver {
     }
 
     // 1. Ensure isolated CoW working change before running external process ([D-015], [D-016]).
-    if (_ensureActiveTransaction != null) {
+    if (callerPcb != null && _ensureActiveTransactionForPcb != null) {
+      final txRes = await _ensureActiveTransactionForPcb(callerPcb);
+      if (!txRes.ok) {
+        return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
+      }
+    } else if (_ensureActiveTransaction != null) {
       final txRes = await _ensureActiveTransaction();
       if (!txRes.ok) {
         return SyscallResult<Map<String, dynamic>>.failure(txRes.error!);
@@ -435,6 +456,7 @@ class Win32JobExecDriver {
       final spawnPlan = _buildSpawnPlan(
         normalized: normalized,
         hostWorkingDir: hostWorkingDir,
+        effectiveNamespace: effectiveNamespace,
       );
       final sanitizedEnv = buildSanitizedEnvironment();
 
@@ -602,8 +624,12 @@ class Win32JobExecDriver {
         k32.closeHandle(hJob);
       }
       calloc.free(infoPtr);
-      if (txIsolated && _syncWorkingCopySnapshot != null) {
-        await _syncWorkingCopySnapshot();
+      if (txIsolated) {
+        if (callerPcb != null && _syncWorkingCopySnapshotForPcb != null) {
+          await _syncWorkingCopySnapshotForPcb(callerPcb);
+        } else if (_syncWorkingCopySnapshot != null) {
+          await _syncWorkingCopySnapshot();
+        }
       }
     }
   }
@@ -670,7 +696,9 @@ class Win32JobExecDriver {
   ({String executable, List<String> arguments}) _buildSpawnPlan({
     required NormalizedExecCommand normalized,
     required String hostWorkingDir,
+    VfsNamespace? effectiveNamespace,
   }) {
+    final ns = effectiveNamespace ?? namespace;
     final exeBase = _normalizeExeBase(normalized.command);
     if (normalized.hadShellMeta && !_shellExecutables.contains(exeBase)) {
       // Execute approved shell-syntax commands via explicit powershell.exe with runInShell: false
@@ -692,7 +720,7 @@ class Win32JobExecDriver {
     final resolvedArgs = exeBase == 'dart'
         ? normalized.args
             .map((a) => SysExecClassifier.resolveHostCommandArg(
-                  namespace,
+                  ns,
                   hostWorkingDir,
                   a,
                 ))
@@ -705,8 +733,12 @@ class Win32JobExecDriver {
     );
   }
 
-  SyscallResult<VfsPathResolution> _resolveWorkingDir(String rawWorkingDir) {
-    final resolved = namespace.resolveVirtualPath(
+  SyscallResult<VfsPathResolution> _resolveWorkingDir(
+    String rawWorkingDir, {
+    VfsNamespace? namespaceOverride,
+  }) {
+    final effectiveNamespace = namespaceOverride ?? namespace;
+    final resolved = effectiveNamespace.resolveVirtualPath(
       rawWorkingDir,
       allowRoot: true,
       checkProtected: true,
@@ -755,13 +787,16 @@ class Win32JobExecDriver {
       cappedTextFields: const <String>['stdout', 'stderr'],
       validateArgs: validateRawArgs,
       normalizeArgs: normalizeRawArgs,
-      checkPreconditions: (_, args) async {
+      checkPreconditions: (pcb, args) async {
         final workingDir =
             (args['workingDir'] as String?) ?? VfsNamespace.virtualRoot;
-        final res = _resolveWorkingDir(workingDir);
+        final res = _resolveWorkingDir(
+          workingDir,
+          namespaceOverride: pcb.namespace,
+        );
         return res.ok ? null : res.error;
       },
-      evaluatePolicy: (_, args) async {
+      evaluatePolicy: (pcb, args) async {
         final command = args['command'] as String;
         final rawArgs = args['args'] as List<dynamic>?;
         final resolvedArgs = rawArgs?.cast<String>() ?? const <String>[];
@@ -773,6 +808,7 @@ class Win32JobExecDriver {
               args: resolvedArgs,
               workingDir: workingDir,
               timeoutMs: timeoutMs,
+              namespaceOverride: pcb.namespace,
             )
             .decision;
       },
@@ -833,6 +869,8 @@ class Win32JobExecDriver {
           cancelToken: exec.context.cancelToken,
           sessionId: exec.context.sessionId,
           syscallSeq: exec.syscallSeq,
+          namespaceOverride: exec.pcb.namespace,
+          callerPcb: exec.pcb,
         );
       },
     );

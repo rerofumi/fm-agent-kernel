@@ -1,20 +1,23 @@
 import 'capability.dart';
 import 'pcb.dart';
+import 'supervision.dart';
 
-/// Standard Stage 2 sandboxed Ring 3 child process profiles ([D-211]).
+/// Sandboxed Ring 3 child process profiles ([D-211], [D-306]).
 enum ProcessProfileId {
   explorer('explorer'),
-  webResearcher('web_researcher');
+  webResearcher('web_researcher'),
+  workspaceWorker('workspace_worker'),
+  conflictResolver('conflict_resolver');
 
   const ProcessProfileId(this.wireValue);
 
   /// Wire string used in `sys_spawn` arguments and audit records.
   final String wireValue;
 
-  /// Protection ring enforced for this profile (`ring3` fixed in Stage 2).
+  /// Protection ring enforced for this profile (`ring3` fixed).
   ProtectionRing get ring => ProtectionRing.ring3;
 
-  /// Default capability rights granted to this profile ([D-211] §2.2).
+  /// Default capability rights granted to this profile ([D-211] §2.2, [D-306] §1.1).
   Set<CapRight> get defaultRights {
     return switch (this) {
       ProcessProfileId.explorer => const <CapRight>{
@@ -31,27 +34,50 @@ enum ProcessProfileId {
           CapRight.ipc,
           CapRight.procSelf,
         },
+      ProcessProfileId.workspaceWorker ||
+      ProcessProfileId.conflictResolver => const <CapRight>{
+          CapRight.read,
+          CapRight.writeCow,
+          CapRight.exec,
+          CapRight.vcsRead,
+          CapRight.llmInfer,
+          CapRight.memManage,
+          CapRight.ipc,
+          CapRight.procSelf,
+        },
     };
   }
 
   /// Primary CSpace resource scope for this profile.
   String get primaryResourceScope {
     return switch (this) {
-      ProcessProfileId.explorer => '/workspace',
+      ProcessProfileId.explorer ||
+      ProcessProfileId.workspaceWorker ||
+      ProcessProfileId.conflictResolver => '/workspace',
       ProcessProfileId.webResearcher => 'net:public_readonly',
     };
   }
 
   /// Whether `/workspace` is mounted for this profile.
-  bool get mountsWorkspace => this == ProcessProfileId.explorer;
+  bool get mountsWorkspace => this != ProcessProfileId.webResearcher;
 
   /// Whether `/skills` is mounted Read-Only for this profile.
-  bool get mountsSkills => this == ProcessProfileId.explorer;
+  bool get mountsSkills => this != ProcessProfileId.webResearcher;
 
-  /// Whether `sys_jj_*` calls must force `--ignore-working-copy` ([D-204]).
-  bool get forcesVcsIgnoreWorkingCopy => this == ProcessProfileId.explorer;
+  /// Whether this profile requires an isolated `.agent_os/ws/<pid>` Jujutsu workspace ([D-306]).
+  bool get requiresIsolatedJjWorkspace =>
+      this == ProcessProfileId.workspaceWorker ||
+      this == ProcessProfileId.conflictResolver;
 
-  /// Parses a wire profile identifier (`"explorer"` or `"web_researcher"`).
+  /// Whether this profile is permitted to mutate files and run preset commands in its isolated workspace ([D-306]).
+  bool get allowsIsolatedWorkspaceMutation =>
+      this == ProcessProfileId.workspaceWorker ||
+      this == ProcessProfileId.conflictResolver;
+
+  /// Whether `sys_jj_*` calls must force `--ignore-working-copy` ([D-204], [D-306]).
+  bool get forcesVcsIgnoreWorkingCopy => this != ProcessProfileId.webResearcher;
+
+  /// Parses a wire profile identifier.
   static ProcessProfileId? tryParse(String raw) {
     final normalized = raw.trim().toLowerCase();
     for (final value in ProcessProfileId.values) {
@@ -63,7 +89,7 @@ enum ProcessProfileId {
   }
 }
 
-/// Validated specification for spawning a Ring 3 child process via `sys_spawn` ([D-211]).
+/// Validated specification for spawning a Ring 3 child process via `sys_spawn` ([D-211], [D-307], [D-315]).
 class SpawnSpec {
   SpawnSpec({
     required this.profile,
@@ -76,6 +102,9 @@ class SpawnSpec {
     this.maxWallTimeMs = defaultMaxWallTimeMs,
     this.maxSteps = defaultMaxSteps,
     Set<CapRight>? requestedRights,
+    this.baseChangeId,
+    this.logicalTaskId,
+    this.supervision,
   })  : assert(maxWallTimeMs > 0 && maxWallTimeMs <= maxAllowedWallTimeMs),
         assert(maxSteps > 0 && maxSteps <= maxAllowedSteps),
         allowedSubpaths = allowedSubpaths == null
@@ -100,6 +129,9 @@ class SpawnSpec {
   final int maxWallTimeMs;
   final int maxSteps;
   final Set<CapRight>? requestedRights;
+  final String? baseChangeId;
+  final String? logicalTaskId;
+  final SupervisionPolicy? supervision;
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
@@ -114,11 +146,14 @@ class SpawnSpec {
       'maxSteps': maxSteps,
       if (requestedRights != null)
         'requestedRights': requestedRights!.map((r) => r.name).toList(),
+      if (baseChangeId != null) 'baseChangeId': baseChangeId,
+      if (logicalTaskId != null) 'logicalTaskId': logicalTaskId,
+      if (supervision != null) 'supervision': supervision!.toJson(),
     };
   }
 }
 
-/// Summary status returned by `sys_wait` when a child process terminates ([D-211], [D-214]).
+/// Summary status returned by `sys_wait` when a child process terminates ([D-211], [D-214], [D-307], [D-315]).
 class ChildExitStatus {
   const ChildExitStatus({
     required this.pid,
@@ -132,6 +167,13 @@ class ChildExitStatus {
     required this.consumedTokens,
     required this.consumedCostMicroUsd,
     required this.durationMs,
+    this.logicalTaskId,
+    this.workspaceName,
+    this.baseChangeId,
+    this.workingChangeId,
+    this.finalCommitId,
+    this.workspaceCleanedUp = true,
+    this.attempts = const <SupervisorAttemptRecord>[],
   });
 
   final Pid pid;
@@ -145,6 +187,13 @@ class ChildExitStatus {
   final int consumedTokens;
   final int consumedCostMicroUsd;
   final int durationMs;
+  final String? logicalTaskId;
+  final String? workspaceName;
+  final String? baseChangeId;
+  final String? workingChangeId;
+  final String? finalCommitId;
+  final bool workspaceCleanedUp;
+  final List<SupervisorAttemptRecord> attempts;
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
@@ -159,6 +208,13 @@ class ChildExitStatus {
       'consumedTokens': consumedTokens,
       'consumedCostMicroUsd': consumedCostMicroUsd,
       'durationMs': durationMs,
+      if (logicalTaskId != null) 'logicalTaskId': logicalTaskId,
+      if (workspaceName != null) 'workspaceName': workspaceName,
+      if (baseChangeId != null) 'baseChangeId': baseChangeId,
+      if (workingChangeId != null) 'workingChangeId': workingChangeId,
+      if (finalCommitId != null) 'finalCommitId': finalCommitId,
+      'workspaceCleanedUp': workspaceCleanedUp,
+      'attempts': attempts.map((a) => a.toJson()).toList(growable: false),
     };
   }
 }

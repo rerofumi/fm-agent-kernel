@@ -85,10 +85,13 @@ class AcpEventMapper {
       'residentCleanPages': report.residentCleanPages,
       'evictedCleanPages': report.evictedCleanPages,
       'stalePagesCount': report.stalePagesCount,
+      'swappedDirtyPagesInStep': report.swappedDirtyPagesInStep,
+      'swappedDirtyPagesTotal': report.swappedDirtyPagesTotal,
+      'swappedTurnGroupsInStep': report.swappedTurnGroupsInStep,
     };
   }
 
-  /// Builds paging telemetry fields suitable for `turnSummary._meta` and `_fm_agent_os/status` ([D-215]).
+  /// Builds paging telemetry fields suitable for `turnSummary._meta` and `_fm_agent_os/status` ([D-215], [D-305]).
   Map<String, dynamic> buildTurnSummaryPagingMeta(
     VirtualContextMemory memory,
   ) {
@@ -97,9 +100,24 @@ class AcpEventMapper {
       'residentCleanPagesCount': memory.pageTable.residentCleanPagesCount,
       'evictedCleanPagesCount': memory.pageTable.evictedCleanPagesCount,
       'stalePagesCount': memory.pageTable.stalePagesCount,
-      if (_lastPagingReport != null)
+      'swappedDirtyPagesTotal': _lastPagingReport?.swappedDirtyPagesTotal ?? 0,
+      if (_lastPagingReport != null) ...<String, dynamic>{
         'lastEvictedPagesInStep': _lastPagingReport!.evictedPagesInStep,
+        'swappedDirtyPagesInStep': _lastPagingReport!.swappedDirtyPagesInStep,
+        'swappedTurnGroupsInStep': _lastPagingReport!.swappedTurnGroupsInStep,
+      },
     };
+  }
+
+  /// Emits a Stage 3 team/signal/stacked event inside ACP `session/update._meta["fm_agent_os/teamEvent"]` ([D-320]).
+  void emitTeamEvent(Map<String, dynamic> teamEvent) {
+    _sendUpdate(<String, dynamic>{
+      'sessionUpdate': 'plan',
+      'entries': const <Object>[],
+      '_meta': <String, dynamic>{
+        'fm_agent_os/teamEvent': _redactor.redactJson(teamEvent),
+      },
+    });
   }
 
   ModelIdentifier? _currentTurnModel;
@@ -259,7 +277,9 @@ class AcpEventMapper {
       'sys_jj_status' ||
       'sys_jj_log' ||
       'sys_jj_diff' ||
+      'sys_jj_conflicts' ||
       'sys_mem_pagein' ||
+      'sys_mcp_list_tools' ||
       'sys_skill_list' ||
       'sys_skill_read' =>
         'read',
@@ -270,9 +290,12 @@ class AcpEventMapper {
       'sys_tx_begin' ||
       'sys_tx_describe' ||
       'sys_tx_squash' ||
-      'sys_tx_rollback' =>
+      'sys_tx_rollback' ||
+      'sys_jj_merge' ||
+      'sys_jj_integrate' ||
+      'sys_task_stack' =>
         'edit',
-      'sys_exec' => 'execute',
+      'sys_exec' || 'sys_kill' => 'execute',
       _ => 'other',
     };
   }
@@ -344,6 +367,20 @@ class AcpEventMapper {
         return 'List skills';
       case 'sys_skill_read':
         return 'Read skill ${args['name'] ?? ''}';
+      case 'sys_kill':
+        return 'Signal ${args['signal'] ?? ''} to pid=${args['pid'] ?? ''}';
+      case 'sys_task_stack':
+        return 'Task stack ${args['action'] ?? ''} ${args['taskId'] ?? ''}'.trim();
+      case 'sys_mcp_list_tools':
+        return 'List MCP tools (${args['server'] ?? 'all'})';
+      case 'sys_mcp_call':
+        return 'MCP ${args['server'] ?? ''}:${args['tool'] ?? ''}';
+      case 'sys_jj_merge':
+        return 'jj merge';
+      case 'sys_jj_conflicts':
+        return 'jj conflicts (${args['rev'] ?? '@'})';
+      case 'sys_jj_integrate':
+        return 'jj integrate';
       default:
         return toolName;
     }
@@ -371,6 +408,11 @@ class AcpEventMapper {
           'ttftMs': usage.ttftMs,
           'durationMs': usage.durationMs,
           'effectiveContextWindow': _contextWindowSize,
+          if (_lastPagingReport != null) ...<String, dynamic>{
+            'swappedDirtyPagesInStep':
+                _lastPagingReport!.swappedDirtyPagesInStep,
+            'swappedDirtyPagesTotal': _lastPagingReport!.swappedDirtyPagesTotal,
+          },
           if (_lastPagingSummary != null) 'paging': _lastPagingSummary,
         },
       },

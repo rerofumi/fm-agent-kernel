@@ -6,12 +6,15 @@ import 'cancellation.dart';
 import 'pcb.dart';
 import 'syscall_error.dart';
 
-/// Priority control signal kinds delivered over the reserved kernel lane ([D-212]).
+/// Priority control signal kinds delivered over the reserved kernel lane ([D-212], [D-312]).
 enum ControlSignalKind {
   cancel('cancel'),
   shutdown('shutdown'),
   quotaExceeded('quota_exceeded'),
-  childExited('child_exited');
+  childExited('child_exited'),
+  sigstop('sigstop'),
+  sigcont('sigcont'),
+  sigkill('sigkill');
 
   const ControlSignalKind(this.wireValue);
 

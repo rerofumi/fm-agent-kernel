@@ -21,6 +21,8 @@ enum CapRight {
   procSelf,
   ipc,
   netRead,
+  // --- Stage 3 rights ([D-302]) ---
+  mcpCall,
 }
 
 /// Single capability descriptor binding a scope and set of rights to a [CapHandle].
@@ -106,12 +108,45 @@ class CapabilityTable {
     );
   }
 
+  /// Creates the default Stage 3 LeadAgent capability table ([D-302]).
+  ///
+  /// Includes all Stage 2 rights plus `CapRight.mcpCall` scoped to `mcp:session`.
+  factory CapabilityTable.stage3LeadAgent({
+    CapHandle workspaceHandle = const CapHandle('cap_workspace_rw'),
+    CapHandle netHandle = const CapHandle('cap_net_public'),
+    CapHandle mcpHandle = const CapHandle('cap_mcp_session'),
+  }) {
+    return CapabilityTable(
+      initialEntries: <CapabilityEntry>[
+        ...CapabilityTable.stage2LeadAgent(
+          workspaceHandle: workspaceHandle,
+          netHandle: netHandle,
+        ).entries,
+        CapabilityEntry(
+          handle: mcpHandle,
+          resourceScope: 'mcp:session',
+          rights: const <CapRight>{
+            CapRight.mcpCall,
+          },
+        ),
+      ],
+    );
+  }
+
   /// Rights unconditionally forbidden on Stage 2 Ring 3 child processes ([D-204], [D-213]).
   static const Set<CapRight> stage2ForbiddenChildRights = <CapRight>{
     CapRight.writeCow,
     CapRight.vcsTx,
     CapRight.exec,
     CapRight.procSpawn,
+    CapRight.admin,
+  };
+
+  /// Rights unconditionally forbidden on all Stage 3 Ring 3 child processes ([D-306]).
+  static const Set<CapRight> stage3ForbiddenChildRights = <CapRight>{
+    CapRight.vcsTx,
+    CapRight.procSpawn,
+    CapRight.mcpCall,
     CapRight.admin,
   };
 
@@ -245,7 +280,7 @@ class CapabilityTable {
     );
   }
 
-  /// Derives a child CSpace constrained to [profile]'s allowed rights and optional subset [requestedRights] ([D-211], [D-213]).
+  /// Derives a child CSpace constrained to [profile]'s allowed rights and optional subset [requestedRights] ([D-211], [D-213], [D-306]).
   SyscallResult<CapabilityTable> deriveForProfile(
     ProcessProfileId profile, {
     Set<CapRight>? requestedRights,
@@ -254,23 +289,43 @@ class CapabilityTable {
     final profileDefaults = profile.defaultRights;
     final targetRights = requestedRights ?? profileDefaults;
 
-    // Enforce Stage 2 child lock first so mutating rights always surface STAGE2_READONLY_CHILD_LOCK.
-    final forbidden = targetRights.intersection(stage2ForbiddenChildRights);
-    if (forbidden.isNotEmpty) {
-      final names = forbidden.map((r) => r.name).toList()..sort();
-      return SyscallResult<CapabilityTable>.failure(
-        SyscallError(
-          code: SyscallErrorCode.eperm,
-          reason: 'STAGE2_READONLY_CHILD_LOCK',
-          message:
-              'Stage 2 child profile "${profile.wireValue}" cannot hold forbidden rights: ${names.join(', ')}.',
-          recoverable: false,
-          details: <String, dynamic>{
-            'profile': profile.wireValue,
-            'forbiddenRights': names,
-          },
-        ),
-      );
+    if (profile.allowsIsolatedWorkspaceMutation) {
+      final forbidden = targetRights.intersection(stage3ForbiddenChildRights);
+      if (forbidden.isNotEmpty) {
+        final names = forbidden.map((r) => r.name).toList()..sort();
+        return SyscallResult<CapabilityTable>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eperm,
+            reason: 'STAGE3_FORBIDDEN_CHILD_RIGHT',
+            message:
+                'Stage 3 child profile "${profile.wireValue}" cannot hold forbidden rights: ${names.join(', ')}.',
+            recoverable: false,
+            details: <String, dynamic>{
+              'profile': profile.wireValue,
+              'forbiddenRights': names,
+            },
+          ),
+        );
+      }
+    } else {
+      // Enforce Stage 2 child lock first so mutating rights always surface STAGE2_READONLY_CHILD_LOCK.
+      final forbidden = targetRights.intersection(stage2ForbiddenChildRights);
+      if (forbidden.isNotEmpty) {
+        final names = forbidden.map((r) => r.name).toList()..sort();
+        return SyscallResult<CapabilityTable>.failure(
+          SyscallError(
+            code: SyscallErrorCode.eperm,
+            reason: 'STAGE2_READONLY_CHILD_LOCK',
+            message:
+                'Stage 2 child profile "${profile.wireValue}" cannot hold forbidden rights: ${names.join(', ')}.',
+            recoverable: false,
+            details: <String, dynamic>{
+              'profile': profile.wireValue,
+              'forbiddenRights': names,
+            },
+          ),
+        );
+      }
     }
 
     if (requestedRights != null) {
@@ -297,7 +352,7 @@ class CapabilityTable {
       requestedRights: targetRights,
       childHandle: childHandle ?? CapHandle('cap_${profile.wireValue}'),
       resourceScope: profile.primaryResourceScope,
-      enforceStage2ReadOnlyChildLock: true,
+      enforceStage2ReadOnlyChildLock: !profile.allowsIsolatedWorkspaceMutation,
     );
   }
 }

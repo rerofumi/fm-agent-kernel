@@ -423,6 +423,52 @@ class LeadAgent {
           );
         }
 
+        // Cooperative step-boundary suspend gate ([D-312]) and SIGCONT constraint injection ([D-313]).
+        if (pcb.suspendController.isSuspended) {
+          await pcb.suspendController.waitIfSuspended(
+            pcb: pcb,
+            cancelToken: cancelToken,
+          );
+          if (cancelToken?.isCancelled ?? false) {
+            const err = SyscallError(
+              code: SyscallErrorCode.ecancelled,
+              reason: 'CANCELLED',
+              message: 'Turn cancelled while suspended.',
+              recoverable: true,
+            );
+            _emit(
+              AgentTurnFailedEvent(
+                sessionId: sessionId,
+                turnIndex: turnIndex,
+                model: resolvedModel,
+                error: err,
+              ),
+            );
+            return AgentTurnResult.failure(
+              turnIndex: turnIndex,
+              model: resolvedModel,
+              error: err,
+              steps: steps,
+              toolCallsExecuted: toolCallsExecuted,
+            );
+          }
+        }
+
+        final injectedConstraint =
+            pcb.suspendController.drainPendingConstraintText();
+        if (injectedConstraint != null && injectedConstraint.isNotEmpty) {
+          if (!userTurnCommitted) {
+            final baseInput =
+                pcb.memory.ephemeralSegment.currentUserInput ?? userInput;
+            pcb.memory.ephemeralSegment.currentUserInput =
+                '$baseInput\n\n[Runtime Policy Update / SIGCONT]\n$injectedConstraint';
+          } else {
+            pcb.memory.appendUserTurn(
+              '[Runtime Policy Update / SIGCONT]\n$injectedConstraint',
+            );
+          }
+        }
+
         final quotaCheck = pcb.quotaUsage.checkBeforeSyscall(pcb.quota);
         if (quotaCheck != null) {
           _emit(
@@ -515,7 +561,9 @@ class LeadAgent {
 
         // Commit user prompt into Segment 1 once Step 1 succeeds and clear Segment 2.
         if (!userTurnCommitted) {
-          pcb.memory.appendUserTurn(userInput);
+          final committedInput =
+              pcb.memory.ephemeralSegment.currentUserInput ?? userInput;
+          pcb.memory.appendUserTurn(committedInput);
           pcb.memory.ephemeralSegment.dynamicContextSummary = null;
           pcb.memory.ephemeralSegment.currentUserInput = null;
           userTurnCommitted = true;
@@ -815,6 +863,7 @@ class LeadAgent {
       case 'sys_jj_status':
       case 'sys_jj_log':
       case 'sys_jj_diff':
+      case 'sys_jj_conflicts':
       case 'sys_glob':
       case 'sys_grep':
         var commitId = (resultPayload['commitId'] as String?)?.trim();
@@ -884,12 +933,15 @@ abstract interface class ProcessRunner {
 class GreenTaskProcessRunner implements ProcessRunner {
   GreenTaskProcessRunner({
     required this.leadAgent,
+    this.onKillTree,
   });
 
   final LeadAgent leadAgent;
+  final Future<void> Function(String reason)? onKillTree;
   CancellationTokenSource? _activeCancelSource;
   Future<void> _turnQueue = Future<void>.value();
   bool _disposed = false;
+  final List<String> _pendingStopConstraints = <String>[];
 
   @override
   Stream<AgentLoopEvent> get events => leadAgent.events;
@@ -974,7 +1026,55 @@ class GreenTaskProcessRunner implements ProcessRunner {
 
   @override
   void cancelActiveTurn([String? reason]) {
+    leadAgent.pcb.suspendController.releaseForTermination();
     _activeCancelSource?.cancel(reason);
+  }
+
+  /// Delivers a process control signal (`SIGSTOP`, `SIGCONT`, `SIGKILL`) to the root `LeadAgent` ([D-312], [D-314]).
+  void sendSignal(
+    ProcessSignalKind signal, {
+    String? constraintMessage,
+    String? reason,
+  }) {
+    switch (signal) {
+      case ProcessSignalKind.sigstop:
+        if (constraintMessage != null && constraintMessage.trim().isNotEmpty) {
+          _pendingStopConstraints.add(constraintMessage.trim());
+        }
+        leadAgent.pcb.suspendController.requestStop(reason: reason);
+        if (leadAgent.pcb.state != ProcessState.terminated) {
+          leadAgent.pcb.state = ProcessState.stopped;
+        }
+      case ProcessSignalKind.sigcont:
+        if (_pendingStopConstraints.isNotEmpty) {
+          for (final preAttached in _pendingStopConstraints) {
+            leadAgent.pcb.suspendController.requestContinue(
+              constraintMessage: preAttached,
+            );
+          }
+          _pendingStopConstraints.clear();
+        }
+        leadAgent.pcb.suspendController.requestContinue(
+          constraintMessage: constraintMessage,
+        );
+        if (leadAgent.pcb.state == ProcessState.stopped) {
+          leadAgent.pcb.state = ProcessState.running;
+        }
+      case ProcessSignalKind.sigkill:
+        unawaited(killActiveTurnAndTree(reason ?? 'KILLED_BY_SIGNAL'));
+    }
+  }
+
+  /// Releases any suspend lock, cancels the active turn, invokes [onKillTree], and awaits turn exit ([D-314]).
+  Future<void> killActiveTurnAndTree([
+    String reason = 'KILLED_BY_SIGNAL',
+  ]) async {
+    leadAgent.pcb.suspendController.releaseForTermination();
+    _activeCancelSource?.cancel(reason);
+    if (onKillTree != null) {
+      await onKillTree!(reason);
+    }
+    await _turnQueue;
   }
 
   @override
