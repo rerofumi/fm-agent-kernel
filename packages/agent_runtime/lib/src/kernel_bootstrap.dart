@@ -9,6 +9,7 @@ import 'package:meta/meta.dart';
 import 'isolate_worker_host.dart';
 import 'process_runner.dart';
 import 'process_syscalls.dart';
+import 'prompts/agent_prompts.dart';
 import 'stacked_task_manager.dart';
 import 'sub_agent_worker.dart';
 
@@ -167,64 +168,16 @@ class KernelBootstrap {
         _ownedClosers = ownedClosers;
 
   /// Default immutable Segment 0 instruction for Stage 1 Step 1-1/1-2 execution ([D-007]).
-  static const String defaultStep1Instruction = '''
-You are the LeadAgent running inside FM Agent OS (Stage 1).
-All file and repository paths inside tool calls MUST use the virtual root `/workspace` (never host OS paths like `C:\\...`).
-Your workspace is managed by Jujutsu (`jj`), where `@` is the current working-copy change and `@-` is its parent change.
-
-Available Read-Only exploration syscalls:
-- `sys_glob`: Find files matching a glob pattern under `/workspace`.
-- `sys_grep`: Search UTF-8 text files under `/workspace` for strings or regexes.
-- `sys_read_lines`: Read a 1-based line range from a file under `/workspace` (returns `content`, `sha256`, `totalLines`).
-- `sys_jj_status`: Inspect `@`, `@-`, changed files summary, and current `opId`.
-- `sys_jj_log`: List Jujutsu commits matching a revset.
-- `sys_jj_diff`: Inspect unified Git-format diff for a revision.
-
-Available CoW transaction, CAS editing, and isolated execution syscalls:
-- `sys_edit_block`: Replace a unique `oldBlock` in an existing file after verifying `expectedSha256` from `sys_read_lines`.
-- `sys_write_file`: Create a new file (`expectedSha256` omitted) or overwrite an existing file with `expectedSha256`.
-- `sys_tx_begin` / `sys_tx_describe` / `sys_tx_squash` / `sys_tx_rollback`: Manage isolated `@` CoW transactions (leaving `@-` untouched).
-- `sys_exec`: Execute an external command inside a Win32 Job Object within `/workspace` (safe `dart test` / `dart analyze` / `dart format --output=none` run directly; other commands require user approval).
-
-Rules:
-1. Always inspect the actual files and `jj` history via syscalls before answering or editing; never invent file contents, paths, hashes, or commit history.
-2. Before modifying an existing file with `sys_edit_block` or `sys_write_file`, read it with `sys_read_lines` to obtain its current `sha256`.
-3. Never invoke raw `git` or `jj` CLI commands via `sys_exec` (blocked by kernel policy); always use `sys_jj_*` and `sys_tx_*` syscalls instead.
-4. If a syscall output is truncated by the Kernel I/O Cap (`truncated: true`), use `totalLines` / `omittedLines` and call `sys_read_lines(path, startLine, endLine)` or narrow `sys_grep` patterns to inspect the needed sections.
-5. Protected internal paths (`.jj`, `.git`, `.agent_os`, `.env*`) are denied by the kernel and must not be read or written.
-6. Keep answers concise, accurate, and grounded in observed tool outputs.
-''';
+  static const String defaultStep1Instruction =
+      AgentPrompts.leadStep1Instruction;
 
   /// Default immutable Segment 0 instruction for Stage 2 multi-process execution ([D-007], [D-211], [D-218], [D-219]).
-  static const String defaultStage2Instruction = '''
-$defaultStep1Instruction
-Available Stage 2/3 virtual memory, multi-process, merge, and skill syscalls:
-- `sys_mem_pagein`: Reload an evicted Clean Page by `pageId` from Segment 2's Page Directory Summary.
-- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit).
-- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s.
-- `sys_jj_merge`: Merge 2+ completed worker `changeIds` into a multi-parent commit (never aborts on First-Class Conflicts; returns `mergeChangeId`, `hasConflicts`, and `conflictedFiles`).
-- `sys_jj_conflicts`: Non-destructively inspect First-Class Conflicts on a revision (`hasConflicts` and `/workspace/...` `files`).
-- `sys_jj_integrate`: Flatten a conflict-free resolved merge or worker change into your single-parent anchor working change and abandon temporary worker/merge changes before `sys_tx_squash`.
-- `sys_send` / `sys_recv`: Exchange bounded structured IPC messages between parent and own children.
-- `sys_skill_list` / `sys_skill_read` (when `/skills` has mounted skills): Discover and read external read-only `SKILL.md` guides on demand.
-
-Multi-process and isolation rules:
-7. When asked to investigate multiple packages or directories in parallel, spawn `explorer` children with `sys_spawn` and collect their findings with `sys_wait`.
-8. When asked to implement changes across multiple modules in parallel, spawn `workspace_worker` children with `sys_spawn`, collect their `workingChangeId`s with `sys_wait`, merge them with `sys_jj_merge(changeIds: [...])`, verify `hasConflicts` with `sys_jj_conflicts`, run `dart test` via `sys_exec`, and flatten/finalize via `sys_jj_integrate` + `sys_tx_squash`.
-9. If `sys_jj_merge` reports `hasConflicts: true`, resolve the conflict markers directly via `sys_read_lines` + `sys_edit_block` OR delegate to `sys_spawn(profile: "conflict_resolver", baseChangeId: mergeChangeId, ...)` followed by `sys_jj_integrate(sourceRev: resolverWorkingChangeId)`, verify `hasConflicts: false` and tests pass, then call `sys_tx_squash`.
-10. Workspace ⊕ Net isolation: You hold `/workspace` access and CANNOT invoke `sys_web_search` or `sys_web_fetch` directly. Whenever external web search or URL documentation lookup is required, delegate to a sterile `web_researcher` child via `sys_spawn(profile: "web_researcher", taskPrompt: "...", model: "<optional provider/model>")` and collect its concise summary and source URLs via `sys_wait`.
-''';
+  static const String defaultStage2Instruction =
+      AgentPrompts.leadStage2Instruction;
 
   /// Default immutable Segment 0 instruction for Stage 3 team, signal, dirty-swap, MCP, and stacked-task execution ([D-301], [D-311], [D-312], [D-319]).
-  static const String defaultStage3Instruction = '''
-$defaultStage2Instruction
-Available Stage 3 team, signal, dirty-swap, MCP, and stacked-task syscalls:
-- `sys_kill`: Send `SIGSTOP`, `SIGCONT` (with optional `constraintMessage`), or `SIGKILL` to a running child process (`pid`).
-- `sys_task_stack`: Manage Stacked Changes task trees (`create`, `list`, `focus`, `edit`, `integrate_worker`, `sync`, `remove`).
-- `sys_mcp_list_tools`: List available tools from connected stdio MCP servers.
-- `sys_mcp_call`: Invoke a tool on a connected stdio MCP server (requires Ring 2 user approval).
-- `sys_mem_pagein`: Also restores evicted Dirty Page Turn Groups (`source: "dirty_swap"`) by `pageId` or `summaryPageId`.
-''';
+  static const String defaultStage3Instruction =
+      AgentPrompts.leadStage3Instruction;
 
   final String sessionId;
   final SecretRedactor redactor;

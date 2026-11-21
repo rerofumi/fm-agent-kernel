@@ -4,6 +4,8 @@ import 'dart:math';
 
 import 'package:agent_kernel/agent_kernel.dart';
 
+import 'prompts/agent_prompts.dart';
+
 /// Resolves `<providerId>/<modelName>` according to `[D-002]` §2.1(2) precedence:
 /// 1. `turnOverride` (per-turn only, never mutates session selection)
 /// 2. `sessionSelected` (`/model` or `session/set_config_option`)
@@ -461,10 +463,15 @@ class LeadAgent {
             final baseInput =
                 pcb.memory.ephemeralSegment.currentUserInput ?? userInput;
             pcb.memory.ephemeralSegment.currentUserInput =
-                '$baseInput\n\n[Runtime Policy Update / SIGCONT]\n$injectedConstraint';
+                AgentPrompts.formatSigcontConstraint(
+              baseInput: baseInput,
+              constraint: injectedConstraint,
+            );
           } else {
             pcb.memory.appendUserTurn(
-              '[Runtime Policy Update / SIGCONT]\n$injectedConstraint',
+              AgentPrompts.formatSigcontConstraint(
+                constraint: injectedConstraint,
+              ),
             );
           }
         }

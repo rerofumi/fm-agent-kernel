@@ -22,7 +22,7 @@ Pub Workspaces（ルート [pubspec.yaml](./pubspec.yaml)）により以下の 4
 | :--- | :--- | :--- |
 | [`packages/agent_kernel`](./packages/agent_kernel/pubspec.yaml) | Ring 0 TCB カーネルコア（外部通信・FFI・HTML/YAML・UI 依存なし） | `SyscallGate`、`ProcessControlBlock` / `ProtectionRing`（Ring 0/2/3）・`ProcessProfile`（`WorkspaceWorker` / `ConflictResolver` / `Explorer` / `WebResearcher`）、Capability / `QuotaLedger`、`VfsNamespace`（`/workspace`・`/skills`）、`ContextPager` / `PageTable` / `DirtyPageSwapper`、`BoundedMailbox`、`SkillRegistry`、`SyscallHook` / `LlmHook` / `TxHook`、Canonical IR、`IoPayloadCapper`、`AuditLogger` / `SecretRedactor` |
 | [`packages/agent_drivers`](./packages/agent_drivers/pubspec.yaml) | OS・VCS・LLM・Web・MCP・Skill・Hook の具体ドライバ | `HostFsDriver`（探索＋SHA-256 CAS 編集）、`JjDriver`（単一ミューテックス直列化・`--ignore-working-copy` / `--at-op` 読取・`workspace add/forget/update-stale`・多親マージ・First-Class Conflicts・`squash` / `op restore`）、`OllamaDriver` / `OpenRouterDriver` / `LlmRouter` / `LlmEnvLoader`、`ContextWindowResolver`、`WorkspacePageFreshnessChecker`、`Win32JobExecDriver`、`OllamaWebSearchBackend` / `WebFetchDriver`（`SsrfGuard` + `HtmlMarkdownExtractor`）、`McpStdioClient`、`SkillDirectoryLoader`、`AntiGitHabitGuardHook` |
-| [`packages/agent_runtime`](./packages/agent_runtime/pubspec.yaml) | ユーザー空間ランタイムとコンパイル時配線 | `LeadAgent`（ReAct ループ）、`IsolateWorkerHost` / `ChildIsolateBootstrap` / `SubAgentWorker`、`ProcessSupervisor`（自動回復・クオータ会計）、`StackedTaskManager`（`sys_task_stack`）、`GreenTaskProcessRunner`、`KernelBootstrap` |
+| [`packages/agent_runtime`](./packages/agent_runtime/pubspec.yaml) | ユーザー空間ランタイムとコンパイル時配線 | `LeadAgent`（ReAct ループ）、`IsolateWorkerHost` / `ChildIsolateBootstrap` / `SubAgentWorker`、`ProcessSupervisor`（自動回復・クオータ会計）、`StackedTaskManager`（`sys_task_stack`）、`GreenTaskProcessRunner`、`KernelBootstrap`、`AgentPrompts`（[`agent_prompts.dart`](./packages/agent_runtime/lib/src/prompts/agent_prompts.dart)） |
 | [`packages/agent_acp`](./packages/agent_acp/pubspec.yaml) | ACP v1（JSON-RPC 2.0 over `stdio`）サーバー・CLI・ローカル Web カンバン GUI | `AcpServer`（`_fm_agent_os/*` 拡張含む） / `AcpApprovalHandler` / `AcpEventMapper` / `JsonRpcPeer`（`stdout` 単一所有）、`agent_os_daemon`、`acp_cli_client`（`AcpCliRunner`）、`acp_kanban_app`（`KanbanServer` / `KanbanAcpBridge` / `KanbanCliRunner`） |
 
 ### 実装済みシステムコール（全 31 種）
@@ -78,7 +78,7 @@ mise exec -- dart pub get
 # 2. 静的解析
 mise exec -- dart analyze
 
-# 3. 全パッケージ自動テスト（41 テストファイル・計 237 件：Stage 1 101 件 + Stage 2 74 件 + Stage 3 62 件）
+# 3. 全パッケージ自動テスト（42 テストファイル・計 244 件：Stage 1 101 件 + Stage 2 74 件 + Stage 3 62 件 + AgentPrompts 7 件）
 mise exec -- dart test packages/agent_kernel/test packages/agent_drivers/test packages/agent_runtime/test packages/agent_acp/test
 
 # 4. ネイティブ実行ファイル（AOT .exe 全 3 本）ビルド

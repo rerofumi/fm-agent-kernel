@@ -561,10 +561,9 @@ class AcpServer {
     }
     if (executionMode == 'parallel_team') {
       dynamicContextParts.add(
-        '[Execution Mode: parallel_team] Decompose the request into independent subtasks, '
-        'spawn multiple WorkspaceWorker children via sys_spawn, await them with sys_wait, '
-        '${boundTask != null ? 'integrate their changes with sys_task_stack(action: "integrate_worker", taskId: "${boundTask.taskId}", workerChangeIds: [...])' : 'merge and integrate their changes with sys_jj_merge + sys_jj_integrate'}, '
-        'and verify tests pass.',
+        AgentPrompts.buildParallelTeamInstruction(
+          boundTaskId: boundTask?.taskId,
+        ),
       );
     }
     final dynamicContextSummary = dynamicContextParts.isEmpty
