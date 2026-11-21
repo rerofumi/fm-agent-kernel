@@ -1,6 +1,6 @@
 # Cheatsheet Links — 外部一次資料・出典台帳
 
-すべての URL は記載の確認日（`2026-11-19`〜`2026-11-20`）時点で最終到達先（HTTP `200 OK`）を実確認済みの正規 URL である。ローカル実測のみの項目には架空 URL を付与せず、各トピック本文にコマンドと観測結果を記録している。
+すべての URL は記載の確認日（`2026-11-19`〜`2026-11-21`）時点で最終到達先（HTTP `200 OK`）を実確認済みの正規 URL である。ローカル実測のみの項目には架空 URL を付与せず、各トピック本文にコマンドと観測結果を記録している。
 
 ## 1. Dart SDK・Pub Workspaces・Windows FFI
 
@@ -77,3 +77,20 @@
 | https://modelcontextprotocol.io/specification/2025-11-25/server/tools | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | MCP `tools/list`（`cursor` ページネーション）および `tools/call`（`CallToolResult` / `isError`）スキーマの確認 |
 | https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | MCP Modern (`2026-07-28`) と Legacy (`2025-11-25` 以前) の Dual-era 互換性マトリクス確認 |
 | https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio | 公式プロトコル仕様 | `2026-11-20` | [mcp_and_supervisor_signals.md](./mcp_and_supervisor_signals.md) | Windows での `stdio` MCP サーバー終了手順（`stdin` EOF + Win32 Job Objects / `TerminateProcess`）の確認 |
+
+## 7. 新規 LLM プロバイダ（OpenAI / Google AI Studio / Nous Portal / llama.cpp / Strata）
+
+| 出典 URL | 出典種別 | 確認日 | 関連ローカル資料 | 参照理由 |
+| --- | --- | :---: | --- | --- |
+| https://platform.openai.com/docs/api-reference/chat | 公式 API リファレンス | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | OpenAI `POST /v1/chat/completions`、`stream_options.include_usage`、`max_completion_tokens` 仕様の確認 |
+| https://platform.openai.com/docs/api-reference/models | 公式 API リファレンス | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | OpenAI `GET /v1/models` のレスポンススキーマ（capability フィールドなし・非チャットモデル混在）の確認 |
+| https://platform.openai.com/docs/guides/reasoning | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Reasoning モデル（o1/o3/gpt-5 等）の `max_completion_tokens`, `temperature`, `reasoning_effort`, `developer` ロール制約の確認 |
+| https://platform.openai.com/docs/guides/prompt-caching | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | OpenAI 自動 Prefix キャッシュと `usage.prompt_tokens_details.cached_tokens` の仕様確認 |
+| https://ai.google.dev/api/generate-content | 公式 API リファレンス | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini ネイティブ REST `:streamGenerateContent?alt=sse`、`x-goog-api-key` ヘッダ、Tool Calling 仕様の確認 |
+| https://ai.google.dev/api/models | 公式 API リファレンス | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini `GET /v1beta/models` の `inputTokenLimit`, `outputTokenLimit`, `supportedGenerationMethods` 仕様確認 |
+| https://ai.google.dev/gemini-api/docs/openai | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini OpenAI 互換エンドポイント（`/v1beta/openai/`）、Bearer 認証、`extra_content` / `cached_tokens` 挙動の確認 |
+| https://ai.google.dev/gemini-api/docs/thought-signatures | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | `thoughtSignature`（ネイティブ）および `extra_content.google.thought_signature`（OpenAI 互換）のマルチターン必須エコーバック要件の確認 |
+| https://ai.google.dev/gemini-api/docs/caching | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini 暗黙的・明示的コンテキストキャッシュと `usageMetadata.cachedContentTokenCount` の確認 |
+| https://portal.nousresearch.com/ | 公式ポータル | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Nous Research Portal（API キー発行、`inference-api.nousresearch.com/v1` の起点）の確認 |
+| https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | `llama-server` の `/v1/models` (`meta.n_ctx_train`)、`/props` (`default_generation_settings.n_ctx`)、`timings.cache_n` / `cached_tokens` 仕様の確認 |
+| https://stratallm.org/ | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Strata ローカル LLM サーバーの既定 URL（`http://127.0.0.1:8080/v1`）、OpenAI / Anthropic 互換エンドポイント、ダミー API キー接続の確認 |

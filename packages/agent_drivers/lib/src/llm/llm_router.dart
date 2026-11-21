@@ -4,8 +4,12 @@ import 'package:agent_kernel/agent_kernel.dart';
 import 'package:http/http.dart' as http;
 
 import 'context_window_resolver.dart';
+import 'gemini_driver.dart';
 import 'llm_env_loader.dart';
+import 'local_openai_compat_driver.dart';
+import 'nous_portal_driver.dart';
 import 'ollama_driver.dart';
+import 'openai_driver.dart';
 import 'openrouter_driver.dart';
 
 /// Callback notified of incremental [LlmStreamEvent] chunks emitted by `sys_llm_chat`.
@@ -35,7 +39,7 @@ class LlmRouter {
     required Map<LlmProviderId, LlmDriver> drivers,
   }) : _drivers = Map<LlmProviderId, LlmDriver>.unmodifiable(drivers);
 
-  /// Creates a router pre-configured with all 3 Stage 1 providers (`local-ollama`, `ollama-cloud`, `openrouter`).
+  /// Creates a router pre-configured with all 7 providers (`local-ollama`, `ollama-cloud`, `openrouter`, `openai`, `gemini`, `nous-portal`, `openai-compat`) ([D-402]).
   factory LlmRouter.withDefaults({
     LlmEnvLoader? envLoader,
     SecretRedactor? redactor,
@@ -43,6 +47,10 @@ class LlmRouter {
     String? localOllamaBaseUrl,
     String? ollamaCloudBaseUrl,
     String? openRouterBaseUrl,
+    String? openAiBaseUrl,
+    String? geminiBaseUrl,
+    String? nousPortalBaseUrl,
+    String? openAiCompatBaseUrl,
     String keepAlive = '15m',
     Duration requestTimeout = const Duration(seconds: 120),
   }) {
@@ -69,6 +77,34 @@ class LlmRouter {
         ),
         LlmProviderId.openRouter: OpenRouterDriver(
           baseUrl: openRouterBaseUrl,
+          envLoader: effectiveEnv,
+          redactor: effectiveRedactor,
+          httpClient: httpClient,
+          requestTimeout: requestTimeout,
+        ),
+        LlmProviderId.openai: OpenAiDriver(
+          baseUrl: openAiBaseUrl,
+          envLoader: effectiveEnv,
+          redactor: effectiveRedactor,
+          httpClient: httpClient,
+          requestTimeout: requestTimeout,
+        ),
+        LlmProviderId.gemini: GeminiDriver(
+          baseUrl: geminiBaseUrl,
+          envLoader: effectiveEnv,
+          redactor: effectiveRedactor,
+          httpClient: httpClient,
+          requestTimeout: requestTimeout,
+        ),
+        LlmProviderId.nousPortal: NousPortalDriver(
+          baseUrl: nousPortalBaseUrl,
+          envLoader: effectiveEnv,
+          redactor: effectiveRedactor,
+          httpClient: httpClient,
+          requestTimeout: requestTimeout,
+        ),
+        LlmProviderId.openaiCompat: LocalOpenAiCompatDriver(
+          baseUrl: openAiCompatBaseUrl,
           envLoader: effectiveEnv,
           redactor: effectiveRedactor,
           httpClient: httpClient,

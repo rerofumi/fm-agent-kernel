@@ -2,11 +2,15 @@ import 'cancellation.dart';
 import 'context_memory.dart';
 import 'syscall_error.dart';
 
-/// Supported Stage 1 LLM provider identifiers ([D-002], [D-008], [D-009]).
+/// Supported LLM provider identifiers ([D-002], [D-008], [D-009], [D-402]).
 enum LlmProviderId {
   localOllama('local-ollama'),
   ollamaCloud('ollama-cloud'),
-  openRouter('openrouter');
+  openRouter('openrouter'),
+  openai('openai'),
+  gemini('gemini'),
+  nousPortal('nous-portal'),
+  openaiCompat('openai-compat');
 
   const LlmProviderId(this.id);
 
@@ -48,7 +52,7 @@ class ModelIdentifier {
               'Model identifier "$raw" must follow "<providerId>/<modelName>" format.',
           recoverable: true,
           hint:
-              'Use local-ollama/<model>, ollama-cloud/<model>, or openrouter/<model>.',
+              'Use local-ollama/<model>, ollama-cloud/<model>, openrouter/<model>, openai/<model>, gemini/<model>, nous-portal/<model>, or openai-compat/<model>.',
         ),
       );
     }
@@ -63,7 +67,8 @@ class ModelIdentifier {
           reason: 'UNKNOWN_PROVIDER',
           message: 'Unknown LLM provider "$providerStr" in "$raw".',
           recoverable: true,
-          hint: 'Supported providers: local-ollama, ollama-cloud, openrouter.',
+          hint:
+              'Supported providers: local-ollama, ollama-cloud, openrouter, openai, gemini, nous-portal, openai-compat.',
         ),
       );
     }

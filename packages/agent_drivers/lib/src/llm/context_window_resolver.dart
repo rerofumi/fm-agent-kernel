@@ -6,11 +6,14 @@ import 'dart:math' as math;
 import 'package:agent_kernel/agent_kernel.dart';
 import 'package:http/http.dart' as http;
 
+import 'gemini_driver.dart';
 import 'llm_env_loader.dart';
+import 'local_openai_compat_driver.dart';
+import 'nous_portal_driver.dart';
 import 'ollama_driver.dart';
 import 'openrouter_driver.dart';
 
-/// Configuration and explicit overrides for [ContextWindowResolver] ([D-203], [D-209], [D-316]).
+/// Configuration and explicit overrides for [ContextWindowResolver] ([D-203], [D-209], [D-316], [D-405]).
 class ContextWindowConfig {
   const ContextWindowConfig({
     this.modelOverrides = const <String, int>{},
@@ -19,6 +22,10 @@ class ContextWindowConfig {
     this.defaultLocalFallback = 32768,
     this.defaultCloudFallback = 131072,
     this.defaultOpenRouterFallback = 128000,
+    this.defaultOpenAiFallback = 128000,
+    this.defaultGeminiFallback = 131072,
+    this.defaultNousPortalFallback = 131072,
+    this.defaultOpenAiCompatFallback = 32768,
     this.localProbeTimeout = const Duration(seconds: 3),
     this.remoteProbeTimeout = const Duration(seconds: 5),
   });
@@ -41,12 +48,24 @@ class ContextWindowConfig {
   /// Conservative fallback for `openrouter` when catalog lookup fails.
   final int defaultOpenRouterFallback;
 
+  /// Conservative fallback for `openai` when model family is unknown.
+  final int defaultOpenAiFallback;
+
+  /// Conservative fallback for `gemini` when `/v1beta/models` probe fails.
+  final int defaultGeminiFallback;
+
+  /// Conservative fallback for `nous-portal` when `/v1/models` probe fails.
+  final int defaultNousPortalFallback;
+
+  /// Conservative fallback for `openai-compat` when `/props` and `/v1/models` probes fail.
+  final int defaultOpenAiCompatFallback;
+
   final Duration localProbeTimeout;
   final Duration remoteProbeTimeout;
 }
 
-class _OpenRouterModelMeta {
-  const _OpenRouterModelMeta({
+class _CatalogModelMeta {
+  const _CatalogModelMeta({
     required this.contextLength,
     this.maxCompletionTokens,
   });
@@ -55,13 +74,17 @@ class _OpenRouterModelMeta {
   final int? maxCompletionTokens;
 }
 
-/// 3-provider effective context window resolver with session caching and safe fallbacks ([D-203], [D-204], [D-209]).
+/// 7-provider effective context window resolver with session caching and safe fallbacks ([D-203], [D-204], [D-209], [D-405]).
 class ContextWindowResolver implements ContextWindowSource {
   ContextWindowResolver({
     this.config = const ContextWindowConfig(),
     String? localOllamaBaseUrl,
     String? ollamaCloudBaseUrl,
     String? openRouterBaseUrl,
+    String? openAiBaseUrl,
+    String? geminiBaseUrl,
+    String? nousPortalBaseUrl,
+    String? openAiCompatBaseUrl,
     LlmEnvLoader? envLoader,
     SecretRedactor? redactor,
     http.Client? httpClient,
@@ -69,6 +92,10 @@ class ContextWindowResolver implements ContextWindowSource {
   })  : _explicitLocalBaseUrl = localOllamaBaseUrl,
         _explicitCloudBaseUrl = ollamaCloudBaseUrl,
         _explicitOpenRouterBaseUrl = openRouterBaseUrl,
+        _explicitOpenAiBaseUrl = openAiBaseUrl,
+        _explicitGeminiBaseUrl = geminiBaseUrl,
+        _explicitNousPortalBaseUrl = nousPortalBaseUrl,
+        _explicitOpenAiCompatBaseUrl = openAiCompatBaseUrl,
         _envLoader = envLoader,
         _redactor = redactor ?? envLoader?.redactor ?? SecretRedactor(),
         _httpClient = httpClient ?? http.Client(),
@@ -79,6 +106,12 @@ class ContextWindowResolver implements ContextWindowSource {
   final String? _explicitLocalBaseUrl;
   final String? _explicitCloudBaseUrl;
   final String? _explicitOpenRouterBaseUrl;
+  // Kept for symmetry with LlmRouter/KernelBootstrap DI.
+  // ignore: unused_field
+  final String? _explicitOpenAiBaseUrl;
+  final String? _explicitGeminiBaseUrl;
+  final String? _explicitNousPortalBaseUrl;
+  final String? _explicitOpenAiCompatBaseUrl;
   final LlmEnvLoader? _envLoader;
   final SecretRedactor _redactor;
   final http.Client _httpClient;
@@ -91,7 +124,11 @@ class ContextWindowResolver implements ContextWindowSource {
       <String, Map<String, dynamic>>{};
   final Map<String, ContextWindowSpec> _cloudShowCache =
       <String, ContextWindowSpec>{};
-  Map<String, _OpenRouterModelMeta>? _openRouterCatalogCache;
+  Map<String, _CatalogModelMeta>? _openRouterCatalogCache;
+  Map<String, _CatalogModelMeta>? _geminiCatalogCache;
+  Map<String, _CatalogModelMeta>? _nousPortalCatalogCache;
+  final Map<String, ContextWindowSpec> _openAiCompatCache =
+      <String, ContextWindowSpec>{};
 
   static final RegExp _numCtxPattern = RegExp(
     r'^\s*num_ctx\s+(\d+)',
@@ -138,6 +175,14 @@ class ContextWindowResolver implements ContextWindowSource {
           providerSpec = await _resolveOllamaCloud(model);
         case LlmProviderId.openRouter:
           providerSpec = await _resolveOpenRouter(model);
+        case LlmProviderId.openai:
+          providerSpec = _resolveOpenAi(model);
+        case LlmProviderId.gemini:
+          providerSpec = await _resolveGemini(model);
+        case LlmProviderId.nousPortal:
+          providerSpec = await _resolveNousPortal(model);
+        case LlmProviderId.openaiCompat:
+          providerSpec = await _resolveOpenAiCompat(model);
       }
     }
     return _applyMaxContextCap(providerSpec);
@@ -279,7 +324,10 @@ class ContextWindowResolver implements ContextWindowSource {
   Future<ContextWindowSpec> _resolveOpenRouter(ModelIdentifier model) async {
     var catalog = _openRouterCatalogCache;
     if (catalog == null) {
-      catalog = await _fetchOpenRouterCatalog();
+      catalog = await _fetchOpenRouterCompatibleCatalog(
+        uri: _resolveOpenRouterModelsUri(),
+        apiKey: _resolveEnv('OPENROUTER_API_KEY'),
+      );
       if (catalog != null) {
         _openRouterCatalogCache = catalog;
       }
@@ -301,6 +349,218 @@ class ContextWindowResolver implements ContextWindowSource {
       contextWindowTokens: config.defaultOpenRouterFallback,
       isLoadedExact: false,
       source: 'fallback:openrouter',
+    );
+  }
+
+  ContextWindowSpec _resolveOpenAi(ModelIdentifier model) {
+    final name = model.modelName.trim().toLowerCase();
+    int? knownCtx;
+    if (name.startsWith('gpt-4.1')) {
+      knownCtx = 1047576;
+    } else if (name.startsWith('o1') ||
+        name.startsWith('o3') ||
+        name.startsWith('o4')) {
+      knownCtx = 200000;
+    } else if (name.startsWith('gpt-5')) {
+      knownCtx = 200000;
+    } else if (name.startsWith('gpt-4o') || name.startsWith('gpt-4-turbo')) {
+      knownCtx = 128000;
+    }
+
+    if (knownCtx != null) {
+      return ContextWindowSpec(
+        contextWindowTokens: knownCtx,
+        isLoadedExact: false,
+        source: 'openai:static',
+      );
+    }
+
+    return ContextWindowSpec(
+      contextWindowTokens: config.defaultOpenAiFallback,
+      isLoadedExact: false,
+      source: 'fallback:openai',
+    );
+  }
+
+  Future<ContextWindowSpec> _resolveGemini(ModelIdentifier model) async {
+    var catalog = _geminiCatalogCache;
+    if (catalog == null) {
+      catalog = await _fetchGeminiCatalog();
+      if (catalog != null) {
+        _geminiCatalogCache = catalog;
+      }
+    }
+
+    if (catalog != null) {
+      var lookupKey = model.modelName.trim();
+      if (lookupKey.startsWith('models/')) {
+        lookupKey = lookupKey.substring('models/'.length);
+      }
+      final meta = catalog[lookupKey] ?? catalog[model.modelName.trim()];
+      if (meta != null && meta.contextLength > 0) {
+        return ContextWindowSpec(
+          contextWindowTokens: meta.contextLength,
+          maxCompletionTokens: meta.maxCompletionTokens,
+          isLoadedExact: true,
+          source: 'gemini:/v1beta/models',
+        );
+      }
+    }
+
+    return ContextWindowSpec(
+      contextWindowTokens: config.defaultGeminiFallback,
+      isLoadedExact: false,
+      source: 'fallback:gemini',
+    );
+  }
+
+  Future<ContextWindowSpec> _resolveNousPortal(ModelIdentifier model) async {
+    var catalog = _nousPortalCatalogCache;
+    if (catalog == null) {
+      catalog = await _fetchOpenRouterCompatibleCatalog(
+        uri: _resolveNousPortalModelsUri(),
+        apiKey: _resolveEnv('NOUS_API_KEY'),
+      );
+      if (catalog != null) {
+        _nousPortalCatalogCache = catalog;
+      }
+    }
+
+    if (catalog != null) {
+      final meta = catalog[model.modelName];
+      if (meta != null && meta.contextLength > 0) {
+        return ContextWindowSpec(
+          contextWindowTokens: meta.contextLength,
+          maxCompletionTokens: meta.maxCompletionTokens,
+          isLoadedExact: true,
+          source: 'nous-portal:/models',
+        );
+      }
+    }
+
+    return ContextWindowSpec(
+      contextWindowTokens: config.defaultNousPortalFallback,
+      isLoadedExact: false,
+      source: 'fallback:nous-portal',
+    );
+  }
+
+  Future<ContextWindowSpec> _resolveOpenAiCompat(ModelIdentifier model) async {
+    final modelKey = model.modelName;
+    final cached = _openAiCompatCache[modelKey];
+    if (cached != null) {
+      return cached;
+    }
+
+    final rawBase = _nonEmpty(_explicitOpenAiCompatBaseUrl) ??
+        _resolveEnv('OPENAI_COMPAT_BASE_URL');
+    if (rawBase == null) {
+      return ContextWindowSpec(
+        contextWindowTokens: config.defaultOpenAiCompatFallback,
+        isLoadedExact: false,
+        source: 'fallback:openai-compat',
+      );
+    }
+
+    final Uri rootUri;
+    try {
+      rootUri = LocalOpenAiCompatDriver.deriveRootUri(rawBase);
+    } on LlmDriverException {
+      return ContextWindowSpec(
+        contextWindowTokens: config.defaultOpenAiCompatFallback,
+        isLoadedExact: false,
+        source: 'fallback:openai-compat',
+      );
+    }
+
+    final apiKey = _resolveEnv('OPENAI_COMPAT_API_KEY');
+    if (apiKey != null) {
+      _redactor.registerSecret(apiKey);
+    }
+    final headers = <String, String>{
+      'Accept': 'application/json',
+      if (apiKey != null) 'Authorization': 'Bearer $apiKey',
+    };
+
+    // Step 1: Probe GET <root>/props for llama-server default_generation_settings.n_ctx ([D-405]).
+    final propsUri = _appendPath(rootUri, '/props');
+    try {
+      final response = await _httpClient
+          .get(propsUri, headers: headers)
+          .timeout(config.localProbeTimeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map) {
+          final genSettings = decoded['default_generation_settings'];
+          if (genSettings is Map) {
+            final nCtx = (genSettings['n_ctx'] as num?)?.toInt();
+            if (nCtx != null && nCtx > 0) {
+              final spec = ContextWindowSpec(
+                contextWindowTokens: nCtx,
+                isLoadedExact: true,
+                source: 'openai-compat:/props',
+              );
+              _openAiCompatCache[modelKey] = spec;
+              return spec;
+            }
+          }
+        }
+      }
+    } catch (_) {
+      // Fall through to /v1/models.
+    }
+
+    // Step 2: Probe GET <root>/v1/models for data[].meta.n_ctx_train ([D-405]).
+    final modelsUri = _appendPath(rootUri, '/v1/models');
+    try {
+      final response = await _httpClient
+          .get(modelsUri, headers: headers)
+          .timeout(config.localProbeTimeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map && decoded['data'] is List) {
+          final data = decoded['data'] as List;
+          int? matchedNCtxTrain;
+          int? firstNCtxTrain;
+          for (final item in data) {
+            if (item is! Map) {
+              continue;
+            }
+            final meta = item['meta'];
+            if (meta is! Map) {
+              continue;
+            }
+            final nCtxTrain = (meta['n_ctx_train'] as num?)?.toInt();
+            if (nCtxTrain == null || nCtxTrain <= 0) {
+              continue;
+            }
+            firstNCtxTrain ??= nCtxTrain;
+            final id = item['id'];
+            if (id is String && id.trim() == modelKey.trim()) {
+              matchedNCtxTrain = nCtxTrain;
+              break;
+            }
+          }
+          final resolved = matchedNCtxTrain ?? firstNCtxTrain;
+          if (resolved != null && resolved > 0) {
+            final spec = ContextWindowSpec(
+              contextWindowTokens: resolved,
+              isLoadedExact: false,
+              source: 'openai-compat:/v1/models',
+            );
+            _openAiCompatCache[modelKey] = spec;
+            return spec;
+          }
+        }
+      }
+    } catch (_) {
+      // Fall through to conservative fallback.
+    }
+
+    return ContextWindowSpec(
+      contextWindowTokens: config.defaultOpenAiCompatFallback,
+      isLoadedExact: false,
+      source: 'fallback:openai-compat',
     );
   }
 
@@ -375,9 +635,10 @@ class ContextWindowResolver implements ContextWindowSource {
     }
   }
 
-  Future<Map<String, _OpenRouterModelMeta>?> _fetchOpenRouterCatalog() async {
-    final uri = _resolveOpenRouterModelsUri();
-    final apiKey = _resolveEnv('OPENROUTER_API_KEY');
+  Future<Map<String, _CatalogModelMeta>?> _fetchOpenRouterCompatibleCatalog({
+    required Uri uri,
+    required String? apiKey,
+  }) async {
     if (apiKey != null) {
       _redactor.registerSecret(apiKey);
     }
@@ -400,7 +661,7 @@ class ContextWindowResolver implements ContextWindowSource {
       if (data is! List) {
         return null;
       }
-      final map = <String, _OpenRouterModelMeta>{};
+      final map = <String, _CatalogModelMeta>{};
       for (final item in data) {
         if (item is! Map) {
           continue;
@@ -420,11 +681,68 @@ class ContextWindowResolver implements ContextWindowSource {
         final resolvedCtx =
             (topCtx != null && topCtx > 0) ? topCtx : rootCtx;
         if (resolvedCtx != null && resolvedCtx > 0) {
-          map[id.trim()] = _OpenRouterModelMeta(
+          map[id.trim()] = _CatalogModelMeta(
             contextLength: resolvedCtx,
             maxCompletionTokens:
                 (topMaxComp != null && topMaxComp > 0) ? topMaxComp : null,
           );
+        }
+      }
+      return map;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, _CatalogModelMeta>?> _fetchGeminiCatalog() async {
+    final uri = _resolveGeminiModelsUri();
+    final apiKey =
+        _resolveEnv('GEMINI_API_KEY') ?? _resolveEnv('GOOGLE_API_KEY');
+    if (apiKey != null) {
+      _redactor.registerSecret(apiKey);
+    }
+    final headers = <String, String>{
+      'Accept': 'application/json',
+      'x-goog-api-key': ?apiKey,
+    };
+    try {
+      final response = await _httpClient
+          .get(uri, headers: headers)
+          .timeout(config.remoteProbeTimeout);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return null;
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) {
+        return null;
+      }
+      final models = decoded['models'];
+      if (models is! List) {
+        return null;
+      }
+      final map = <String, _CatalogModelMeta>{};
+      for (final item in models) {
+        if (item is! Map) {
+          continue;
+        }
+        final rawName = item['name'];
+        if (rawName is! String || rawName.trim().isEmpty) {
+          continue;
+        }
+        final inputLimit = (item['inputTokenLimit'] as num?)?.toInt();
+        if (inputLimit == null || inputLimit <= 0) {
+          continue;
+        }
+        final outputLimit = (item['outputTokenLimit'] as num?)?.toInt();
+        final meta = _CatalogModelMeta(
+          contextLength: inputLimit,
+          maxCompletionTokens:
+              (outputLimit != null && outputLimit > 0) ? outputLimit : null,
+        );
+        final trimmedName = rawName.trim();
+        map[trimmedName] = meta;
+        if (trimmedName.startsWith('models/')) {
+          map[trimmedName.substring('models/'.length)] = meta;
         }
       }
       return map;
@@ -459,6 +777,44 @@ class ContextWindowResolver implements ContextWindowSource {
     if (raw.isEmpty) {
       raw = OpenRouterDriver.defaultBaseUrl;
     }
+    return _normalizeModelsUri(raw, defaultApiPrefix: '/api/v1');
+  }
+
+  Uri _resolveNousPortalModelsUri() {
+    var raw = _nonEmpty(_explicitNousPortalBaseUrl) ??
+        _resolveEnv('NOUS_BASE_URL') ??
+        NousPortalDriver.defaultBaseUrl;
+    if (raw.isEmpty) {
+      raw = NousPortalDriver.defaultBaseUrl;
+    }
+    return _normalizeModelsUri(raw, defaultApiPrefix: '/v1');
+  }
+
+  Uri _resolveGeminiModelsUri() {
+    var raw = _nonEmpty(_explicitGeminiBaseUrl) ??
+        _resolveEnv('GEMINI_BASE_URL') ??
+        GeminiDriver.defaultBaseUrl;
+    if (raw.isEmpty) {
+      raw = GeminiDriver.defaultBaseUrl;
+    }
+    final uri = Uri.parse(raw);
+    var path = uri.path;
+    while (path.endsWith('/')) {
+      path = path.substring(0, path.length - 1);
+    }
+    if (path.endsWith('/models')) {
+      return uri.replace(path: path);
+    }
+    if (path.endsWith('/v1beta')) {
+      return uri.replace(path: '$path/models');
+    }
+    return uri.replace(path: '$path/v1beta/models');
+  }
+
+  static Uri _normalizeModelsUri(
+    String raw, {
+    required String defaultApiPrefix,
+  }) {
     final uri = Uri.parse(raw);
     var path = uri.path;
     while (path.endsWith('/')) {
@@ -473,7 +829,7 @@ class ContextWindowResolver implements ContextWindowSource {
     if (path.endsWith('/api/v1') || path.endsWith('/v1')) {
       return uri.replace(path: '$path/models');
     }
-    return uri.replace(path: '$path/api/v1/models');
+    return uri.replace(path: '$path$defaultApiPrefix/models');
   }
 
   String? _resolveOllamaCloudApiKey() {

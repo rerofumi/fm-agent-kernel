@@ -3,7 +3,9 @@ import 'dart:io';
 
 import 'package:agent_acp/agent_acp.dart';
 import 'package:agent_acp/src/wire/wire_command_splitter.dart';
+import 'package:agent_drivers/agent_drivers.dart';
 import 'package:agent_kernel/agent_kernel.dart';
+import 'package:agent_runtime/agent_runtime.dart';
 import 'package:args/args.dart';
 import 'package:path/path.dart' as p;
 
@@ -42,6 +44,22 @@ Future<void> _runDaemon(List<String> args) async {
     ..addOption(
       'ollama-cloud-url',
       help: 'Override Ollama Cloud base URL.',
+    )
+    ..addOption(
+      'openai-url',
+      help: 'Override OpenAI base URL.',
+    )
+    ..addOption(
+      'gemini-url',
+      help: 'Override Gemini base URL.',
+    )
+    ..addOption(
+      'nous-url',
+      help: 'Override Nous Portal base URL.',
+    )
+    ..addOption(
+      'openai-compat-url',
+      help: 'Override OpenAI-compatible local LLM base URL.',
     )
     ..addOption(
       'system-file',
@@ -137,6 +155,35 @@ Future<void> _runDaemon(List<String> args) async {
   }
 
   final redactor = SecretRedactor()..registerFromEnvironment(Platform.environment);
+  final envLoader = LlmEnvLoader(redactor: redactor);
+  final modelsLoadResult = ModelsConfigLoader().load();
+  for (final warning in modelsLoadResult.warnings) {
+    stderr.writeln('[models_config] $warning');
+  }
+
+  final openAiCompatUrl = parsed.option('openai-compat-url');
+  final startupPolicy = ModelPolicy(
+    config: modelsLoadResult.config,
+    envLoader: envLoader,
+    explicitOpenAiCompatBaseUrl: openAiCompatUrl,
+  );
+
+  final hasStartupModel = startupModel != null && startupModel.trim().isNotEmpty;
+  final targetStartupModel = hasStartupModel
+      ? ModelIdentifier.parse(startupModel).value!
+      : ModelIdentifier.parse(ModelResolver.stage1DefaultModelId).value!;
+  final startupPolicyErr = startupPolicy.validateModel(targetStartupModel);
+  if (startupPolicyErr != null) {
+    if (hasStartupModel) {
+      stderr.writeln('Invalid --model "$startupModel": ${startupPolicyErr.message}');
+    } else {
+      stderr.writeln(
+        'Default startup model "${ModelResolver.stage1DefaultModelId}" is disabled or excluded by .agent_os/models.json. Specify an allowed model via --model <providerId>/<modelName>.',
+      );
+    }
+    exitCode = 64;
+    return;
+  }
 
   int? maxContextTokens;
   final rawMaxCtx = parsed.option('max-context-tokens');
@@ -176,6 +223,18 @@ Future<void> _runDaemon(List<String> args) async {
     }
   }
 
+  final catalogService = ModelCatalogService(
+    redactor: redactor,
+    localOllamaBaseUrl: parsed.option('ollama-url'),
+    ollamaCloudBaseUrl: parsed.option('ollama-cloud-url'),
+    openRouterBaseUrl: parsed.option('openrouter-url'),
+    openAiBaseUrl: parsed.option('openai-url'),
+    geminiBaseUrl: parsed.option('gemini-url'),
+    nousPortalBaseUrl: parsed.option('nous-url'),
+    openAiCompatBaseUrl: openAiCompatUrl,
+    onWarning: (msg) => stderr.writeln('[model_catalog] $msg'),
+  );
+
   // JsonRpcPeer is the ONLY component holding `stdout` ([D-018]).
   final peer = JsonRpcPeer(
     input: stdin,
@@ -198,6 +257,11 @@ Future<void> _runDaemon(List<String> args) async {
       localOllamaBaseUrl: parsed.option('ollama-url'),
       ollamaCloudBaseUrl: parsed.option('ollama-cloud-url'),
       openRouterBaseUrl: parsed.option('openrouter-url'),
+      openAiBaseUrl: parsed.option('openai-url'),
+      geminiBaseUrl: parsed.option('gemini-url'),
+      nousPortalBaseUrl: parsed.option('nous-url'),
+      openAiCompatBaseUrl: openAiCompatUrl,
+      modelCatalogService: catalogService,
       maxStepsPerTurn: maxSteps,
       maxSyscallsPerTurn: maxSyscalls,
       skillsDirs: skillsDirs,
@@ -207,10 +271,14 @@ Future<void> _runDaemon(List<String> args) async {
     ),
   );
 
+  // Warm the in-memory model catalog once at startup after AcpServer handlers are wired.
+  await catalogService.resolveOptions(startupPolicy);
+
   await peer.done;
   server.cancelActiveTurns('stdin EOF');
   await peer.waitForInFlightHandlers();
   await server.dispose();
+  catalogService.close();
   await peer.close();
   await stdout.flush();
   await stderr.flush();

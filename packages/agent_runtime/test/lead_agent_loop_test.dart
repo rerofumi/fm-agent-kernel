@@ -50,7 +50,7 @@ void main() {
 
     test('rejects invalid model identifiers with EINVAL without overwriting valid state', () {
       final resolver = ModelResolver(startupModel: 'local-ollama/gemma4:12b');
-      final badSet = resolver.setSessionModel('openai/gpt-4o');
+      final badSet = resolver.setSessionModel('unknown-provider/gpt-4o');
       expect(badSet.ok, isFalse);
       expect(badSet.error!.code, equals(SyscallErrorCode.einval));
       expect(

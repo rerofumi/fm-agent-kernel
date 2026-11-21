@@ -6,6 +6,9 @@ import 'package:agent_kernel/agent_kernel.dart';
 
 import 'prompts/agent_prompts.dart';
 
+/// Pure callback validating a resolved [ModelIdentifier] against an external policy ([D-005], [D-407]).
+typedef ModelPolicyValidator = SyscallError? Function(ModelIdentifier model);
+
 /// Resolves `<providerId>/<modelName>` according to `[D-002]` §2.1(2) precedence:
 /// 1. `turnOverride` (per-turn only, never mutates session selection)
 /// 2. `sessionSelected` (`/model` or `session/set_config_option`)
@@ -16,12 +19,14 @@ class ModelResolver {
     String? startupModel,
     String? sessionSelectedModel,
     this.defaultModelId = stage1DefaultModelId,
+    this.modelValidator,
   })  : _startupModel = _normalizeOptional(startupModel),
         _sessionSelectedModel = _normalizeOptional(sessionSelectedModel);
 
   static const String stage1DefaultModelId = 'local-ollama/gemma4:12b';
 
   final String defaultModelId;
+  final ModelPolicyValidator? modelValidator;
   String? _startupModel;
   String? _sessionSelectedModel;
 
@@ -46,26 +51,41 @@ class ModelResolver {
     return defaultModelId;
   }
 
-  /// Resolves and validates the model for a user input turn boundary ([D-002]).
+  /// Resolves and validates the model for a user input turn boundary ([D-002], [D-407]).
   SyscallResult<ModelIdentifier> resolveForTurn({String? turnOverride}) {
     final raw = effectiveModelString(turnOverride: turnOverride);
-    return ModelIdentifier.parse(raw);
+    return _parseAndValidate(raw);
   }
 
-  /// Validates and persists Priority 2 (`sessionSelected`) model for subsequent turns.
+  /// Validates and persists Priority 2 (`sessionSelected`) model for subsequent turns ([D-407]).
   SyscallResult<ModelIdentifier> setSessionModel(String rawModel) {
-    final parsed = ModelIdentifier.parse(rawModel);
+    final parsed = _parseAndValidate(rawModel);
     if (parsed.ok) {
       _sessionSelectedModel = parsed.value!.canonicalId;
     }
     return parsed;
   }
 
-  /// Updates Priority 3 (`startupModel`) if valid.
+  /// Updates Priority 3 (`startupModel`) if valid ([D-407]).
   SyscallResult<ModelIdentifier> setStartupModel(String rawModel) {
-    final parsed = ModelIdentifier.parse(rawModel);
+    final parsed = _parseAndValidate(rawModel);
     if (parsed.ok) {
       _startupModel = parsed.value!.canonicalId;
+    }
+    return parsed;
+  }
+
+  SyscallResult<ModelIdentifier> _parseAndValidate(String rawModel) {
+    final parsed = ModelIdentifier.parse(rawModel);
+    if (!parsed.ok) {
+      return parsed;
+    }
+    final validator = modelValidator;
+    if (validator != null) {
+      final err = validator(parsed.value!);
+      if (err != null) {
+        return SyscallResult<ModelIdentifier>.failure(err);
+      }
     }
     return parsed;
   }

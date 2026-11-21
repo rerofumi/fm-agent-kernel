@@ -31,6 +31,11 @@ class KernelBootstrapConfig {
     this.localOllamaBaseUrl,
     this.ollamaCloudBaseUrl,
     this.openRouterBaseUrl,
+    this.openAiBaseUrl,
+    this.geminiBaseUrl,
+    this.nousPortalBaseUrl,
+    this.openAiCompatBaseUrl,
+    this.modelPolicy,
     this.keepAlive = '15m',
     this.requestTimeout = const Duration(seconds: 120),
     this.ioCapConfig = const IoCapConfig(),
@@ -81,6 +86,11 @@ class KernelBootstrapConfig {
   final String? localOllamaBaseUrl;
   final String? ollamaCloudBaseUrl;
   final String? openRouterBaseUrl;
+  final String? openAiBaseUrl;
+  final String? geminiBaseUrl;
+  final String? nousPortalBaseUrl;
+  final String? openAiCompatBaseUrl;
+  final ModelPolicy? modelPolicy;
   final String keepAlive;
   final Duration requestTimeout;
   final IoCapConfig ioCapConfig;
@@ -158,6 +168,7 @@ class KernelBootstrap {
     required this.leadAgent,
     required this.processRunner,
     required this.quotaLedger,
+    required this.modelPolicy,
     this.workerHost,
     this.dirtySwapBackend,
     this.mcpServerManager,
@@ -204,6 +215,7 @@ class KernelBootstrap {
   final LeadAgent leadAgent;
   final GreenTaskProcessRunner processRunner;
   final QuotaLedger quotaLedger;
+  final ModelPolicy modelPolicy;
   final IsolateWorkerHost? workerHost;
   final DirtySwapBackend? dirtySwapBackend;
   final McpServerManager? mcpServerManager;
@@ -443,6 +455,16 @@ class KernelBootstrap {
       ioCapper: ioCapper,
     );
 
+    final effectiveModelPolicy = config.modelPolicy ??
+        ModelPolicy.fromEnvironment(
+          envLoader: effectiveEnvLoader,
+          sessionCwd: namespace.workspaceHostRoot,
+          explicitOpenAiCompatBaseUrl: config.openAiCompatBaseUrl,
+        );
+    final resolvedOpenAiCompatBaseUrl =
+        _normalizeNonEmpty(config.openAiCompatBaseUrl) ??
+            effectiveModelPolicy.resolveOpenAiCompatBaseUrl();
+
     final ownedClosers = <void Function()>[];
     final LlmRouter effectiveRouter;
     if (config.llmRouter != null) {
@@ -463,7 +485,9 @@ class KernelBootstrap {
         drivers[id] = created;
         if (created is OllamaDriver) {
           ownedClosers.add(created.close);
-        } else if (created is OpenRouterDriver) {
+        } else if (created is OpenAiCompatDriver) {
+          ownedClosers.add(created.close);
+        } else if (created is GeminiDriver) {
           ownedClosers.add(created.close);
         }
       }
@@ -497,6 +521,42 @@ class KernelBootstrap {
           requestTimeout: config.requestTimeout,
         ),
       );
+      registerDefaultDriver(
+        LlmProviderId.openai,
+        () => OpenAiDriver(
+          baseUrl: config.openAiBaseUrl,
+          envLoader: effectiveEnvLoader,
+          redactor: effectiveRedactor,
+          requestTimeout: config.requestTimeout,
+        ),
+      );
+      registerDefaultDriver(
+        LlmProviderId.gemini,
+        () => GeminiDriver(
+          baseUrl: config.geminiBaseUrl,
+          envLoader: effectiveEnvLoader,
+          redactor: effectiveRedactor,
+          requestTimeout: config.requestTimeout,
+        ),
+      );
+      registerDefaultDriver(
+        LlmProviderId.nousPortal,
+        () => NousPortalDriver(
+          baseUrl: config.nousPortalBaseUrl,
+          envLoader: effectiveEnvLoader,
+          redactor: effectiveRedactor,
+          requestTimeout: config.requestTimeout,
+        ),
+      );
+      registerDefaultDriver(
+        LlmProviderId.openaiCompat,
+        () => LocalOpenAiCompatDriver(
+          baseUrl: resolvedOpenAiCompatBaseUrl,
+          envLoader: effectiveEnvLoader,
+          redactor: effectiveRedactor,
+          requestTimeout: config.requestTimeout,
+        ),
+      );
 
       effectiveRouter = LlmRouter(drivers: drivers);
     }
@@ -522,6 +582,7 @@ class KernelBootstrap {
 
     final modelResolver = ModelResolver(
       startupModel: config.startupModel,
+      modelValidator: config.modelPolicy?.validateModel,
     );
 
     late final LeadAgent leadAgent;
@@ -595,6 +656,10 @@ class KernelBootstrap {
         localOllamaBaseUrl: config.localOllamaBaseUrl,
         ollamaCloudBaseUrl: config.ollamaCloudBaseUrl,
         openRouterBaseUrl: config.openRouterBaseUrl,
+        openAiBaseUrl: config.openAiBaseUrl,
+        geminiBaseUrl: config.geminiBaseUrl,
+        nousPortalBaseUrl: config.nousPortalBaseUrl,
+        openAiCompatBaseUrl: resolvedOpenAiCompatBaseUrl,
         envLoader: effectiveEnvLoader,
         redactor: effectiveRedactor,
       );
@@ -741,6 +806,7 @@ class KernelBootstrap {
       leadAgent: leadAgent,
       processRunner: processRunner,
       quotaLedger: effectiveQuotaLedger,
+      modelPolicy: effectiveModelPolicy,
       workerHost: workerHost,
       dirtySwapBackend: effectiveDirtySwapBackend,
       mcpServerManager: effectiveMcpManager,

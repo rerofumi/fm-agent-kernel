@@ -21,7 +21,7 @@ Pub Workspaces（ルート [pubspec.yaml](./pubspec.yaml)）により以下の 4
 | パッケージ | 責務 | 主なコンポーネント |
 | :--- | :--- | :--- |
 | [`packages/agent_kernel`](./packages/agent_kernel/pubspec.yaml) | Ring 0 TCB カーネルコア（外部通信・FFI・HTML/YAML・UI 依存なし） | `SyscallGate`、`ProcessControlBlock` / `ProtectionRing`（Ring 0/2/3）・`ProcessProfile`（`WorkspaceWorker` / `ConflictResolver` / `Explorer` / `WebResearcher`）、Capability / `QuotaLedger`、`VfsNamespace`（`/workspace`・`/skills`）、`ContextPager` / `PageTable` / `DirtyPageSwapper`、`BoundedMailbox`、`SkillRegistry`、`SyscallHook` / `LlmHook` / `TxHook`、Canonical IR、`IoPayloadCapper`、`AuditLogger` / `SecretRedactor` |
-| [`packages/agent_drivers`](./packages/agent_drivers/pubspec.yaml) | OS・VCS・LLM・Web・MCP・Skill・Hook の具体ドライバ | `HostFsDriver`（探索＋SHA-256 CAS 編集）、`JjDriver`（単一ミューテックス直列化・`--ignore-working-copy` / `--at-op` 読取・`workspace add/forget/update-stale`・多親マージ・First-Class Conflicts・`squash` / `op restore`）、`OllamaDriver` / `OpenRouterDriver` / `LlmRouter` / `LlmEnvLoader`、`ContextWindowResolver`、`WorkspacePageFreshnessChecker`、`Win32JobExecDriver`、`OllamaWebSearchBackend` / `WebFetchDriver`（`SsrfGuard` + `HtmlMarkdownExtractor`）、`McpStdioClient`、`SkillDirectoryLoader`、`AntiGitHabitGuardHook` |
+| [`packages/agent_drivers`](./packages/agent_drivers/pubspec.yaml) | OS・VCS・LLM・Web・MCP・Skill・Hook の具体ドライバ | `HostFsDriver`（探索＋SHA-256 CAS 編集）、`JjDriver`（単一ミューテックス直列化・`--ignore-working-copy` / `--at-op` 読取・`workspace add/forget/update-stale`・多親マージ・First-Class Conflicts・`squash` / `op restore`）、`OllamaDriver` / `OpenRouterDriver` / `OpenAiDriver` / `GeminiDriver` / `NousPortalDriver` / `OpenAiCompatDriver` / `LlmRouter` / `LlmEnvLoader` / `ModelCatalogService` / `ModelsConfigLoader`、`ContextWindowResolver`、`WorkspacePageFreshnessChecker`、`Win32JobExecDriver`、`OllamaWebSearchBackend` / `WebFetchDriver`（`SsrfGuard` + `HtmlMarkdownExtractor`）、`McpStdioClient`、`SkillDirectoryLoader`、`AntiGitHabitGuardHook` |
 | [`packages/agent_runtime`](./packages/agent_runtime/pubspec.yaml) | ユーザー空間ランタイムとコンパイル時配線 | `LeadAgent`（ReAct ループ）、`IsolateWorkerHost` / `ChildIsolateBootstrap` / `SubAgentWorker`、`ProcessSupervisor`（自動回復・クオータ会計）、`StackedTaskManager`（`sys_task_stack`）、`GreenTaskProcessRunner`、`KernelBootstrap`、`AgentPrompts`（[`agent_prompts.dart`](./packages/agent_runtime/lib/src/prompts/agent_prompts.dart)） |
 | [`packages/agent_acp`](./packages/agent_acp/pubspec.yaml) | ACP v1（JSON-RPC 2.0 over `stdio`）サーバー・CLI・ローカル Web カンバン GUI | `AcpServer`（`_fm_agent_os/*` 拡張含む） / `AcpApprovalHandler` / `AcpEventMapper` / `JsonRpcPeer`（`stdout` 単一所有）、`agent_os_daemon`、`acp_cli_client`（`AcpCliRunner`）、`acp_kanban_app`（`KanbanServer` / `KanbanAcpBridge` / `KanbanCliRunner`） |
 
@@ -52,16 +52,36 @@ Pub Workspaces（ルート [pubspec.yaml](./pubspec.yaml)）により以下の 4
 1. **Local Ollama**
    - [mise.toml](./mise.toml) で既定値 `OLLAMA_HOST = "http://192.168.0.5:11434/v1"` が設定されています（未指定時の既定は `http://localhost:11434`、起動時 `--ollama-url` で上書き可）。
    - `OllamaDriver` は `/v1` サフィックスや `0.0.0.0` / `[::]` を自動的に正規化し、ネイティブ `/api/chat`（NDJSON ストリーム）へ接続します。実効コンテキスト窓は `/api/ps` → `/api/show` の順に解決します（`--max-context-tokens` で上限キャップ可）。
-2. **OpenRouter / Ollama Cloud / Ollama Web Search API（任意：利用する機能のみ設定）**
-   - リポジトリ配下の `.agent_os/.env`（またはプロセス環境変数）に以下を設定します。
+2. **外部 / 互換 LLM プロバイダ・Web 検索 API キー（任意：利用する機能のみ設定）**
+   - 計 7 プロバイダ（`local-ollama`, `ollama-cloud`, `openrouter`, `openai`, `gemini`, `nous-portal`, `openai-compat`）に対応しています。
+   - リポジトリ配下の `.agent_os/.env`（またはプロセス環境変数）に、利用するプロバイダの環境変数を設定します（未設定のプロバイダは自動的に無効扱いになります）。
      ```dotenv
      OPENROUTER_API_KEY=<your_openrouter_api_key>
      OLLAMA_API_KEY=<your_ollama_cloud_api_key>
+     OPENAI_API_KEY=<your_openai_api_key>
+     GEMINI_API_KEY=<your_gemini_api_key>          # または GOOGLE_API_KEY
+     NOUS_API_KEY=<your_nous_portal_api_key>
+     OPENAI_COMPAT_BASE_URL=http://127.0.0.1:8080/v1
+     OPENAI_COMPAT_API_KEY=<optional_compat_api_key> # 任意
      ```
    - `OLLAMA_API_KEY` は Ollama Cloud および `sys_web_search` の標準バックエンド（`https://ollama.com/api/web_search`）で共用されます。`sys_web_fetch` は API キー不要です。
    - `LlmEnvLoader` は **1. プロセス環境変数 → 2. `<sessionCwd>/.agent_os/.env` → 3. `<Directory.current>/.agent_os/.env`** の優先順で読み込み、登録された秘密値は `AuditLogger` / `SecretRedactor` により出力・ログ上で `<REDACTED>` へ自動マスクされます。また `sys_exec` 子プロセスおよび外部 MCP サーバー環境からは秘密環境変数が除去されます。
    - `.agent_os/.gitignore`（`*`）はセッション初期化時に自動生成され、`.env`・監査ログ・退避ファイル・一時ワークスペース（`.agent_os/ws/`）・Swap（`.agent_os/swap/`）を VCS 追跡対象から除外します。
-3. **外部 `SKILL.md` ディレクトリ（任意）**
+3. **モデル一覧の自動取得と `.agent_os/models.json` による制御（任意）**
+   - 起動時に 1 回のみ、有効なプロバイダから並列にチャット対応モデル一覧を自動取得してメモリキャッシュします（埋め込み・音声・画像等の非チャットモデルは自動除外され、一部プロバイダが未到達・タイムアウトしても他プロバイダの起動は継続します）。
+   - `<sessionCwd>/.agent_os/models.json`（不在時は `<Directory.current>/.agent_os/models.json`）でプロバイダごとの有効化・自動取得抑止・手動許可モデル・`baseUrl` を制御できます（`.agent_os/` 配下のため VFS 保護によりエージェントのファイルツールからは遮断されます）。
+     ```json
+     {
+       "providers": {
+         "local-ollama": { "enable": true, "autoFetch": true, "models": ["gemma4:12b"] },
+         "openrouter": { "enable": true, "autoFetch": false, "models": ["anthropic/claude-sonnet-4"] },
+         "openai-compat": { "enable": true, "autoFetch": true, "baseUrl": "http://127.0.0.1:8080/v1", "models": [] }
+       }
+     }
+     ```
+   - `enable: false` で当該プロバイダを無効化、`autoFetch: false` で起動時 API 呼び出しを抑止して `models` リストのみ許可します（リスト外モデルは `EINVAL` で拒否）。
+   - 既定モデル（`local-ollama/gemma4:12b`）が無効またはリスト外になった場合は他モデルへ自動フォールバックせずエラー停止するため、`--model <providerId>/<modelName>` の明示指定が必須です。
+4. **外部 `SKILL.md` ディレクトリ（任意）**
    - 起動時に **1. `--skills-dir <path>`（複数指定可・指定順） → 2. 環境変数 `AGENT_OS_SKILLS_DIR`（Windows は `;` 区切り） → 3. `<cwd>/.agent_os/skills`** の優先順で `<skill>/SKILL.md` をスキャンし、Read-Only の `/skills` へマウントします（同名スキルは先指定優先）。
    - `required_capabilities` を省略した一般的な既存 `SKILL.md` も、追加特権なし・権限昇格ゼロでそのままマウント可能です。
 
@@ -78,7 +98,7 @@ mise exec -- dart pub get
 # 2. 静的解析
 mise exec -- dart analyze
 
-# 3. 全パッケージ自動テスト（42 テストファイル・計 244 件：Stage 1 101 件 + Stage 2 74 件 + Stage 3 62 件 + AgentPrompts 7 件）
+# 3. 全パッケージ自動テスト（47 テストファイル・計 293 件）
 mise exec -- dart test packages/agent_kernel/test packages/agent_drivers/test packages/agent_runtime/test packages/agent_acp/test
 
 # 4. ネイティブ実行ファイル（AOT .exe 全 3 本）ビルド
@@ -104,7 +124,7 @@ build\acp_cli_client.exe --daemon build\agent_os_daemon.exe --cwd <jj_repo> --mo
 
 - `--daemon` を省略した場合、`acp_cli_client.exe` と同ディレクトリの `agent_os_daemon.exe` または `build\agent_os_daemon.exe` を自動探索します。
 - `agent_os_daemon.exe` 単体を Zed 等の ACP v1 クライアントから直接起動する場合も `--skills-dir <path>` / `--mcp-server <spec>` / `--max-context-tokens <n>` / `--model` / `--ollama-url` / `--max-steps` / `--system-file` を指定できます。
-- モデルは `<provider>/<model>` 形式で指定します（例：`local-ollama/qwen3.8:27b`, `local-ollama/gemma4:12b`, `openrouter/openai/gpt-4o-mini`, `openrouter/openai/gpt-4.1-mini`, `openrouter/anthropic/claude-haiku-4.5`, `ollama-cloud/gpt-oss:120b`）。
+- モデルは `<provider>/<model>` 形式で指定します（例：`local-ollama/gemma4:12b`, `openrouter/openai/gpt-4o-mini`, `ollama-cloud/gpt-oss:120b`, `openai/gpt-4o-mini`, `gemini/gemini-2.5-flash`, `nous-portal/Hermes-3-Llama-3.1-70B`, `openai-compat/<model>`）。
 
 ### ローカル Web カンバン GUI（`acp_kanban_app.exe`）の起動
 
@@ -192,6 +212,7 @@ build\acp_kanban_app.exe --daemon build\agent_os_daemon.exe --cwd <jj_repo> --po
 
 - 技術調査・実測リファレンス索引: [docs/cheatsheet/index.md](./docs/cheatsheet/index.md)
 - LLM プロバイダ・キャッシュ実測知見: [docs/cheatsheet/llm_providers_and_cache.md](./docs/cheatsheet/llm_providers_and_cache.md)
+- 拡張 LLM プロバイダ仕様・実測知見: [docs/cheatsheet/llm_providers_extended.md](./docs/cheatsheet/llm_providers_extended.md)
 - ACP プロトコル仕様・拡張境界: [docs/cheatsheet/acp_protocol.md](./docs/cheatsheet/acp_protocol.md)
 - Dart AOT `Isolate`・コンテキストページング実測知見: [docs/cheatsheet/dart_isolate_and_context_paging.md](./docs/cheatsheet/dart_isolate_and_context_paging.md)
 - Web 調査・SSRF 完全遮断・`SKILL.md` 実測知見: [docs/cheatsheet/web_research_ssrf_and_skills.md](./docs/cheatsheet/web_research_ssrf_and_skills.md)

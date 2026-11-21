@@ -180,13 +180,42 @@ void main() {
       expect(cloud.ok, isTrue);
       expect(cloud.value!.provider, equals(LlmProviderId.ollamaCloud));
       expect(cloud.value!.modelName, equals('gpt-oss:120b'));
+
+      final openai = ModelIdentifier.parse('openai/gpt-4o');
+      expect(openai.ok, isTrue);
+      expect(openai.value!.provider, equals(LlmProviderId.openai));
+      expect(openai.value!.modelName, equals('gpt-4o'));
+
+      final gemini = ModelIdentifier.parse('gemini/gemini-2.5-flash');
+      expect(gemini.ok, isTrue);
+      expect(gemini.value!.provider, equals(LlmProviderId.gemini));
+      expect(gemini.value!.modelName, equals('gemini-2.5-flash'));
+
+      final nousPortal = ModelIdentifier.parse('nous-portal/Hermes-3-Llama-3.1-70B');
+      expect(nousPortal.ok, isTrue);
+      expect(nousPortal.value!.provider, equals(LlmProviderId.nousPortal));
+      expect(nousPortal.value!.modelName, equals('Hermes-3-Llama-3.1-70B'));
+
+      final openaiCompat =
+          ModelIdentifier.parse('openai-compat/meta-llama/llama-3.3-70b');
+      expect(openaiCompat.ok, isTrue);
+      expect(openaiCompat.value!.provider, equals(LlmProviderId.openaiCompat));
+      expect(
+        openaiCompat.value!.modelName,
+        equals('meta-llama/llama-3.3-70b'),
+      );
+
+      for (final p in LlmProviderId.values) {
+        expect(LlmProviderId.tryParse(p.id), equals(p));
+      }
+      expect(LlmProviderId.tryParse('unknown-provider'), isNull);
     });
 
     test('rejects unknown provider, missing slash, or empty model with EINVAL', () {
       final invalidInputs = <String>[
         '',
         'gemma4:12b',
-        'openai/gpt-4o',
+        'unknown-provider/gpt-4o',
         'local-ollama/',
         'openrouter/   ',
         '/gemma4:12b',

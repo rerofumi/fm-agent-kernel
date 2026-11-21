@@ -213,21 +213,7 @@ class KanbanAcpBridge {
     if (rawSession is Map) {
       final sessionMap = Map<String, dynamic>.from(rawSession);
       _sessionId = sessionMap['sessionId'] as String?;
-      final configOptions = sessionMap['configOptions'];
-      if (configOptions is List) {
-        for (final opt in configOptions) {
-          if (opt is Map && opt['id'] == 'model') {
-            _currentModel = opt['currentValue'] as String?;
-            final rawOpts = opt['options'];
-            if (rawOpts is List) {
-              _availableModels = rawOpts
-                  .whereType<Map<dynamic, dynamic>>()
-                  .map((e) => Map<String, dynamic>.from(e))
-                  .toList(growable: false);
-            }
-          }
-        }
-      }
+      _applyConfigOptions(sessionMap['configOptions']);
     }
 
     if (_sessionId == null || _sessionId!.isEmpty) {
@@ -533,10 +519,34 @@ class KanbanAcpBridge {
       },
     );
     _currentModel = model;
-    _emitEvent(<String, dynamic>{'type': 'model_updated', 'model': model});
+    if (raw is Map) {
+      _applyConfigOptions(raw['configOptions']);
+    }
+    _emitEvent(<String, dynamic>{'type': 'model_updated', 'model': _currentModel ?? model});
     return raw is Map
         ? Map<String, dynamic>.from(raw)
-        : <String, dynamic>{'ok': true, 'model': model};
+        : <String, dynamic>{'ok': true, 'model': _currentModel ?? model};
+  }
+
+  void _applyConfigOptions(Object? configOptions) {
+    if (configOptions is! List) {
+      return;
+    }
+    for (final opt in configOptions) {
+      if (opt is Map && opt['id'] == 'model') {
+        final current = opt['currentValue'];
+        if (current is String && current.isNotEmpty) {
+          _currentModel = current;
+        }
+        final rawOpts = opt['options'];
+        if (rawOpts is List) {
+          _availableModels = rawOpts
+              .whereType<Map<dynamic, dynamic>>()
+              .map((e) => Map<String, dynamic>.from(e))
+              .toList(growable: false);
+        }
+      }
+    }
   }
 
   /// Sends a signal (`SIGSTOP`/`SIGCONT`/`SIGKILL`). If `SIGKILL` targets a card

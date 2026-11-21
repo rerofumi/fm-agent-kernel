@@ -272,7 +272,7 @@ class KanbanCliRunner {
       childEnv['OLLAMA_HOST'] = ollamaUrl.trim();
     }
 
-    final KanbanAcpBridge bridge;
+    KanbanAcpBridge? bridge;
     try {
       bridge = await KanbanAcpBridge.spawn(
         executable: launchSpec.executable,
@@ -287,6 +287,7 @@ class KanbanCliRunner {
       );
       await bridge.connect();
     } catch (e) {
+      await bridge?.dispose();
       _err.writeln('Failed to start/connect agent_os_daemon: ${redactor.redactString(e.toString())}');
       return 1;
     }

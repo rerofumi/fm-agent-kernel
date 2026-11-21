@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:agent_drivers/agent_drivers.dart';
 import 'package:agent_kernel/agent_kernel.dart';
 import 'package:agent_runtime/agent_runtime.dart';
 import 'package:path/path.dart' as p;
@@ -45,6 +46,12 @@ class AcpServerConfig {
     this.localOllamaBaseUrl,
     this.ollamaCloudBaseUrl,
     this.openRouterBaseUrl,
+    this.openAiBaseUrl,
+    this.geminiBaseUrl,
+    this.nousPortalBaseUrl,
+    this.openAiCompatBaseUrl,
+    this.modelPolicy,
+    this.modelCatalogService,
     this.maxStepsPerTurn = 64,
     this.maxSyscallsPerTurn,
     this.jjExecutable = 'jj',
@@ -60,6 +67,17 @@ class AcpServerConfig {
   final String? localOllamaBaseUrl;
   final String? ollamaCloudBaseUrl;
   final String? openRouterBaseUrl;
+  final String? openAiBaseUrl;
+  final String? geminiBaseUrl;
+  final String? nousPortalBaseUrl;
+  final String? openAiCompatBaseUrl;
+
+  /// Optional explicit [ModelPolicy] override (primarily for tests, [D-410]).
+  final ModelPolicy? modelPolicy;
+
+  /// Optional shared [ModelCatalogService] instance ([D-409], [D-410]).
+  final ModelCatalogService? modelCatalogService;
+
   final int maxStepsPerTurn;
   final int? maxSyscallsPerTurn;
   final String jjExecutable;
@@ -85,6 +103,22 @@ class AcpServer {
     required JsonRpcPeer peer,
     this.config = const AcpServerConfig(),
   }) : _peer = peer {
+    if (config.modelCatalogService != null) {
+      _modelCatalogService = config.modelCatalogService!;
+      _ownsModelCatalogService = false;
+    } else {
+      _modelCatalogService = ModelCatalogService(
+        localOllamaBaseUrl: config.localOllamaBaseUrl,
+        ollamaCloudBaseUrl: config.ollamaCloudBaseUrl,
+        openRouterBaseUrl: config.openRouterBaseUrl,
+        openAiBaseUrl: config.openAiBaseUrl,
+        geminiBaseUrl: config.geminiBaseUrl,
+        nousPortalBaseUrl: config.nousPortalBaseUrl,
+        openAiCompatBaseUrl: config.openAiCompatBaseUrl,
+        onWarning: (msg) => stderr.writeln('[model_catalog] $msg'),
+      );
+      _ownsModelCatalogService = true;
+    }
     _peer.onRequest = _handleRequest;
     _peer.onNotification = _handleNotification;
   }
@@ -126,6 +160,8 @@ class AcpServer {
 
   final JsonRpcPeer _peer;
   final AcpServerConfig config;
+  late final ModelCatalogService _modelCatalogService;
+  late final bool _ownsModelCatalogService;
 
   final Map<String, _AcpSession> _sessions = <String, _AcpSession>{};
   int _sessionCounter = 0;
@@ -151,6 +187,9 @@ class AcpServer {
     _sessions.clear();
     for (final session in sessions) {
       await session.dispose();
+    }
+    if (_ownsModelCatalogService) {
+      _modelCatalogService.close();
     }
   }
 
@@ -294,6 +333,58 @@ class AcpServer {
       );
     }
 
+    final ModelPolicy effectivePolicy;
+    if (config.modelPolicy != null) {
+      effectivePolicy = config.modelPolicy!;
+    } else {
+      final loadResult = ModelsConfigLoader(sessionCwd: normalizedCwd).load();
+      for (final warning in loadResult.warnings) {
+        stderr.writeln('[models_config] $warning');
+      }
+      effectivePolicy = ModelPolicy(
+        config: loadResult.config,
+        envLoader: LlmEnvLoader(sessionCwd: normalizedCwd),
+        explicitOpenAiCompatBaseUrl: config.openAiCompatBaseUrl,
+      );
+    }
+
+    final rawStartupModel = config.startupModel?.trim();
+    final hasStartupModel =
+        rawStartupModel != null && rawStartupModel.isNotEmpty;
+    final targetModelStr =
+        hasStartupModel ? rawStartupModel : ModelResolver.stage1DefaultModelId;
+    final parsedTarget = ModelIdentifier.parse(targetModelStr);
+    if (!parsedTarget.ok) {
+      throw JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        parsedTarget.error!.message,
+        data: parsedTarget.error!.toJson(),
+      );
+    }
+    final startupPolicyErr = effectivePolicy.validateModel(parsedTarget.value!);
+    if (startupPolicyErr != null) {
+      final message = hasStartupModel
+          ? startupPolicyErr.message
+          : 'Default startup model "${ModelResolver.stage1DefaultModelId}" is disabled or excluded by .agent_os/models.json. Specify an allowed model via --model <providerId>/<modelName>.';
+      throw JsonRpcException(
+        JsonRpcErrorCodes.invalidParams,
+        message,
+        data: startupPolicyErr.toJson(),
+      );
+    }
+
+    final catalogEntries =
+        await _modelCatalogService.resolveOptions(effectivePolicy);
+    final dynamicCatalog = catalogEntries
+        .map(
+          (entry) => AcpModelOption(
+            value: entry.id,
+            name: entry.displayName,
+            description: entry.description,
+          ),
+        )
+        .toList(growable: false);
+
     final sessionId = _generateSessionId();
     late final AcpEventMapper mapper;
     late final KernelBootstrap bootstrap;
@@ -323,6 +414,11 @@ class AcpServer {
       localOllamaBaseUrl: config.localOllamaBaseUrl,
       ollamaCloudBaseUrl: config.ollamaCloudBaseUrl,
       openRouterBaseUrl: config.openRouterBaseUrl,
+      openAiBaseUrl: config.openAiBaseUrl,
+      geminiBaseUrl: config.geminiBaseUrl,
+      nousPortalBaseUrl: config.nousPortalBaseUrl,
+      openAiCompatBaseUrl: config.openAiCompatBaseUrl,
+      modelPolicy: effectivePolicy,
       quota: leadQuota,
       enableStage2Multiprocess: true,
       enableStage3Team: true,
@@ -392,7 +488,8 @@ class AcpServer {
       bootstrap: bootstrap,
       mapper: mapper,
       eventSubscription: eventSubscription,
-      initialCatalog: defaultModelCatalog,
+      initialCatalog: dynamicCatalog,
+      modelPolicy: effectivePolicy,
     );
     session.ensureModelInOptions(bootstrap.modelResolver.effectiveModelString());
     _sessions[sessionId] = session;
@@ -435,6 +532,7 @@ class AcpServer {
       throw JsonRpcException(
         JsonRpcErrorCodes.invalidParams,
         res.error!.message,
+        data: res.error!.toJson(),
       );
     }
 
@@ -508,6 +606,14 @@ class AcpServer {
           throw JsonRpcException(
             JsonRpcErrorCodes.invalidParams,
             check.error!.message,
+          );
+        }
+        final policyErr = session.modelPolicy.validateModel(check.value!);
+        if (policyErr != null) {
+          throw JsonRpcException(
+            JsonRpcErrorCodes.invalidParams,
+            policyErr.message,
+            data: policyErr.toJson(),
           );
         }
         modelOverride = check.value!.canonicalId;
@@ -1510,18 +1616,24 @@ class _AcpSession {
     required this.mapper,
     required this.eventSubscription,
     required List<AcpModelOption> initialCatalog,
+    required this.modelPolicy,
   }) : _modelOptions = List<AcpModelOption>.from(initialCatalog);
 
   final String sessionId;
   final KernelBootstrap bootstrap;
   final AcpEventMapper mapper;
   final StreamSubscription<AgentLoopEvent> eventSubscription;
+  final ModelPolicy modelPolicy;
   final List<AcpModelOption> _modelOptions;
 
   String modeId = 'default';
   bool isPromptActive = false;
 
   void ensureModelInOptions(String canonicalModelId) {
+    final parsed = ModelIdentifier.parse(canonicalModelId);
+    if (!parsed.ok || modelPolicy.validateModel(parsed.value!) != null) {
+      return;
+    }
     final exists = _modelOptions.any((opt) => opt.value == canonicalModelId);
     if (!exists) {
       _modelOptions.add(

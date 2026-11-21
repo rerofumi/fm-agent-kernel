@@ -336,6 +336,14 @@ void main() {
         peer: serverPeer,
         config: AcpServerConfig(
           startupModel: 'local-ollama/qwen3.8:27b',
+          modelPolicy: ModelPolicy(
+            config: ModelsConfig.defaults(),
+            envLoader: LlmEnvLoader(
+              processEnvironment: const <String, String>{
+                'OPENROUTER_API_KEY': 'test-openrouter-key',
+              },
+            ),
+          ),
           bootstrapFactory: (cfg) => KernelBootstrap.create(
             KernelBootstrapConfig(
               workspaceHostRoot: cfg.workspaceHostRoot,
@@ -613,6 +621,14 @@ void main() {
         peer: serverPeer,
         config: AcpServerConfig(
           startupModel: 'local-ollama/qwen3.8:27b',
+          modelPolicy: ModelPolicy(
+            config: ModelsConfig.defaults(),
+            envLoader: LlmEnvLoader(
+              processEnvironment: const <String, String>{
+                'OPENROUTER_API_KEY': 'test-openrouter-key',
+              },
+            ),
+          ),
           bootstrapFactory: (cfg) => KernelBootstrap.create(
             KernelBootstrapConfig(
               workspaceHostRoot: cfg.workspaceHostRoot,
@@ -789,6 +805,14 @@ void main() {
         peer: serverPeer,
         config: AcpServerConfig(
           startupModel: 'local-ollama/qwen3.8:27b',
+          modelPolicy: ModelPolicy(
+            config: ModelsConfig.defaults(),
+            envLoader: LlmEnvLoader(
+              processEnvironment: const <String, String>{
+                'OPENROUTER_API_KEY': 'test-openrouter-key',
+              },
+            ),
+          ),
           bootstrapFactory: (cfg) => KernelBootstrap.create(
             KernelBootstrapConfig(
               workspaceHostRoot: cfg.workspaceHostRoot,
@@ -972,6 +996,14 @@ void main() {
         peer: serverPeer,
         config: AcpServerConfig(
           startupModel: 'local-ollama/qwen3.8:27b',
+          modelPolicy: ModelPolicy(
+            config: ModelsConfig.defaults(),
+            envLoader: LlmEnvLoader(
+              processEnvironment: const <String, String>{
+                'OPENROUTER_API_KEY': 'test-openrouter-key',
+              },
+            ),
+          ),
           bootstrapFactory: (cfg) => KernelBootstrap.create(
             KernelBootstrapConfig(
               workspaceHostRoot: cfg.workspaceHostRoot,
@@ -1217,6 +1249,14 @@ void main() {
         peer: serverPeer,
         config: AcpServerConfig(
           startupModel: 'local-ollama/qwen3.8:27b',
+          modelPolicy: ModelPolicy(
+            config: ModelsConfig.defaults(),
+            envLoader: LlmEnvLoader(
+              processEnvironment: const <String, String>{
+                'OPENROUTER_API_KEY': 'test-openrouter-key',
+              },
+            ),
+          ),
           bootstrapFactory: (cfg) => KernelBootstrap.create(
             KernelBootstrapConfig(
               workspaceHostRoot: cfg.workspaceHostRoot,
