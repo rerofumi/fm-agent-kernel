@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:agent_kernel/agent_kernel.dart';
@@ -455,8 +457,29 @@ class FixtureOverlayWebFetchTransport implements WebFetchTransport {
   }
 }
 
+class _CachedWebPage {
+  const _CachedWebPage({
+    required this.requestedUrl,
+    required this.finalUrl,
+    required this.statusCode,
+    required this.contentType,
+    required this.title,
+    required this.lines,
+    required this.fetchedAtUtc,
+  });
+
+  final String requestedUrl;
+  final String finalUrl;
+  final int statusCode;
+  final String contentType;
+  final String title;
+  final List<String> lines;
+  final DateTime fetchedAtUtc;
+}
+
 /// High-level `sys_web_fetch` driver applying SSRF-pinned transport,
-/// MIME filtering, binary rejection, and HTML-to-Markdown extraction ([D-205], [D-217]).
+/// MIME filtering, binary rejection, HTML-to-Markdown extraction, and
+/// bounded in-memory LRU caching with line-range paging ([D-205], [D-217]).
 class WebFetchDriver {
   WebFetchDriver({
     @visibleForTesting WebFetchTransport? transport,
@@ -464,19 +487,32 @@ class WebFetchDriver {
     this.defaultTimeout = const Duration(seconds: 20),
     this.maxRedirects = 5,
     this.maxResponseBytes = 2 * 1024 * 1024,
-  })  : _transport = transport ??
+    this.defaultChunkLines = 200,
+    this.maxCacheEntries = 16,
+    this.cacheTtl = const Duration(minutes: 5),
+    @visibleForTesting DateTime Function()? clock,
+  })  : assert(defaultChunkLines > 0),
+        assert(maxCacheEntries > 0),
+        _transport = transport ??
             PinnedHttpWebFetchTransport(
               defaultTimeout: defaultTimeout,
               defaultMaxRedirects: maxRedirects,
               defaultMaxResponseBytes: maxResponseBytes,
             ),
-        _extractor = extractor ?? const HtmlMarkdownExtractor();
+        _extractor = extractor ?? const HtmlMarkdownExtractor(),
+        _clock = clock ?? (() => DateTime.now().toUtc());
 
   final WebFetchTransport _transport;
   final HtmlMarkdownExtractor _extractor;
   final Duration defaultTimeout;
   final int maxRedirects;
   final int maxResponseBytes;
+  final int defaultChunkLines;
+  final int maxCacheEntries;
+  final Duration cacheTtl;
+  final DateTime Function() _clock;
+  final LinkedHashMap<String, _CachedWebPage> _cache =
+      LinkedHashMap<String, _CachedWebPage>();
 
   static const Set<String> _htmlMimeTypes = <String>{
     'text/html',
@@ -491,11 +527,48 @@ class WebFetchDriver {
     'text/xml',
   };
 
-  /// Fetches [url], verifies HTTP status and MIME type, and returns structured Markdown output.
+  /// Fetches [url] (or serves from the bounded in-memory LRU cache within [cacheTtl]),
+  /// verifies HTTP status and MIME type, and returns a 1-based line-range slice of
+  /// structured Markdown output.
   Future<SyscallResult<Map<String, dynamic>>> fetch({
     required String url,
+    int? startLine,
+    int? endLine,
     CancellationToken? cancelToken,
   }) async {
+    final effectiveStart = startLine ?? 1;
+    if (effectiveStart < 1) {
+      return const SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_LINE_RANGE',
+          message: 'Argument "startLine" must be a positive integer >= 1.',
+          recoverable: true,
+        ),
+      );
+    }
+    if (endLine != null && endLine < effectiveStart) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_LINE_RANGE',
+          message:
+              'Argument "endLine" ($endLine) must be >= startLine ($effectiveStart).',
+          recoverable: true,
+        ),
+      );
+    }
+
+    final cacheKey = _normalizeCacheKey(url);
+    final now = _clock().toUtc();
+    final cached = _cache.remove(cacheKey);
+    if (cached != null && now.difference(cached.fetchedAtUtc) <= cacheTtl) {
+      _cache[cacheKey] = cached;
+      return SyscallResult<Map<String, dynamic>>.success(
+        _slicePage(cached, startLine: effectiveStart, endLine: endLine),
+      );
+    }
+
     final rawRes = await _transport.fetch(
       url: url,
       timeout: defaultTimeout,
@@ -612,14 +685,77 @@ class WebFetchDriver {
       markdown = decodedText;
     }
 
-    return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
-      'url': raw.requestedUrl,
-      'finalUrl': raw.finalUrl,
-      'statusCode': raw.statusCode,
-      'contentType': mime,
-      'title': title,
-      'markdown': markdown,
-    });
+    final lines = markdown.isEmpty
+        ? const <String>[]
+        : List<String>.unmodifiable(const LineSplitter().convert(markdown));
+    final page = _CachedWebPage(
+      requestedUrl: raw.requestedUrl,
+      finalUrl: raw.finalUrl,
+      statusCode: raw.statusCode,
+      contentType: mime,
+      title: title,
+      lines: lines,
+      fetchedAtUtc: _clock().toUtc(),
+    );
+
+    _cache.remove(cacheKey);
+    while (_cache.length >= maxCacheEntries) {
+      _cache.remove(_cache.keys.first);
+    }
+    _cache[cacheKey] = page;
+
+    return SyscallResult<Map<String, dynamic>>.success(
+      _slicePage(page, startLine: effectiveStart, endLine: endLine),
+    );
+  }
+
+  Map<String, dynamic> _slicePage(
+    _CachedWebPage page, {
+    required int startLine,
+    int? endLine,
+  }) {
+    final totalLines = page.lines.length;
+    final requestedEnd = endLine ?? (startLine + defaultChunkLines - 1);
+
+    final int actualEnd;
+    final String slicedMarkdown;
+    final bool hasMore;
+    final int? nextStartLine;
+
+    if (totalLines == 0 || startLine > totalLines) {
+      actualEnd = totalLines;
+      slicedMarkdown = '';
+      hasMore = false;
+      nextStartLine = null;
+    } else {
+      actualEnd = math.min(requestedEnd, totalLines);
+      slicedMarkdown = page.lines.sublist(startLine - 1, actualEnd).join('\n');
+      hasMore = actualEnd < totalLines;
+      nextStartLine = hasMore ? actualEnd + 1 : null;
+    }
+
+    return <String, dynamic>{
+      'url': page.requestedUrl,
+      'finalUrl': page.finalUrl,
+      'statusCode': page.statusCode,
+      'contentType': page.contentType,
+      'title': page.title,
+      'markdown': slicedMarkdown,
+      'totalLines': totalLines,
+      'startLine': startLine,
+      'endLine': actualEnd,
+      'hasMore': hasMore,
+      'nextStartLine': nextStartLine,
+    };
+  }
+
+  static String _normalizeCacheKey(String rawUrl) {
+    final trimmed = rawUrl.trim();
+    final parsed = Uri.tryParse(trimmed);
+    if (parsed == null) {
+      return trimmed;
+    }
+    return parsed.normalizePath().toString();
   }
 
   static String _normalizeMimeType(String rawHeader) {
@@ -644,13 +780,25 @@ SyscallToolSchema buildWebFetchToolSchema() {
     name: 'sys_web_fetch',
     description:
         'Fetch a public http:// or https:// web page with strict SSRF protection '
-        'and extract clean Markdown text.',
+        'and extract clean Markdown text (supports incremental 1-based line paging).',
     parametersJsonSchema: const <String, dynamic>{
       'type': 'object',
       'properties': <String, dynamic>{
         'url': <String, dynamic>{
           'type': 'string',
           'description': 'Absolute public http:// or https:// URL to fetch.',
+        },
+        'startLine': <String, dynamic>{
+          'type': 'integer',
+          'minimum': 1,
+          'description':
+              'Optional 1-based start line of extracted Markdown to return (defaults to 1).',
+        },
+        'endLine': <String, dynamic>{
+          'type': 'integer',
+          'minimum': 1,
+          'description':
+              'Optional 1-based inclusive end line to return (defaults to startLine + 199).',
         },
       },
       'required': <String>['url'],
@@ -679,14 +827,38 @@ SyscallDefinition buildWebFetchSyscallDefinition({
           recoverable: true,
         );
       }
+      final rawStart = args['startLine'];
+      if (rawStart != null && (rawStart is! int || rawStart < 1)) {
+        return const SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_LINE_RANGE',
+          message: 'Argument "startLine" must be a positive integer >= 1.',
+          recoverable: true,
+        );
+      }
+      final rawEnd = args['endLine'];
+      final effectiveStart = rawStart is int ? rawStart : 1;
+      if (rawEnd != null && (rawEnd is! int || rawEnd < effectiveStart)) {
+        return SyscallError(
+          code: SyscallErrorCode.einval,
+          reason: 'INVALID_LINE_RANGE',
+          message:
+              'Argument "endLine" must be an integer >= startLine ($effectiveStart).',
+          recoverable: true,
+        );
+      }
       return null;
     },
     checkPreconditions: (pcb, _) async => checkWorkspaceXorNetPrecondition(pcb),
     evaluatePolicy: (_, _) async => RingDecision.allow,
     handler: (execContext) async {
       final url = (execContext.args['url'] as String).trim();
+      final startLine = execContext.args['startLine'] as int?;
+      final endLine = execContext.args['endLine'] as int?;
       return driver.fetch(
         url: url,
+        startLine: startLine,
+        endLine: endLine,
         cancelToken: execContext.context.cancelToken,
       );
     },

@@ -660,7 +660,12 @@ void main() {
       expect(grepPayload['truncated'], isTrue);
       expect(grepPayload['totalMatches'], equals(3000));
       expect(grepPayload['originalCount'], equals(3000));
-      expect((grepPayload['matches'] as List<dynamic>).length, equals(200));
+      final matches = grepPayload['matches'] as List<dynamic>;
+      expect(matches.length, inInclusiveRange(1, 200));
+      expect(
+        utf8.encode(jsonEncode(matches)).length,
+        lessThanOrEqualTo(16384),
+      );
 
       // Inspect step 3 narrowed read result seen by LLM.
       final step3Messages =

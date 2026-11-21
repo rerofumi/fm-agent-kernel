@@ -1046,6 +1046,248 @@ void main() {
       expect(diffBlock['oldText'], equals('hello v1'));
       expect(diffBlock['newText'], equals('hello v2'));
     });
+
+    test('AcpServer builds LeadAgent ResourceQuota with max(256, maxStepsPerTurn * 8) and honors maxSyscallsPerTurn', () async {
+      final capturedConfigs = <KernelBootstrapConfig>[];
+
+      Future<void> openSessionWithConfig(AcpServerConfig serverConfig) async {
+        final pair = createStreamPair();
+        final serverPeer = JsonRpcPeer(
+          input: pair.serverIn,
+          output: pair.serverOut,
+        );
+        final server = AcpServer(
+          peer: serverPeer,
+          config: serverConfig,
+        );
+        final clientPeer = JsonRpcPeer(
+          input: pair.clientIn,
+          output: pair.clientOut,
+        );
+        try {
+          await clientPeer.sendRequest('initialize', const <String, dynamic>{
+            'protocolVersion': 1,
+          });
+          await clientPeer.sendRequest('session/new', <String, dynamic>{
+            'cwd': repoDir.path,
+            'mcpServers': const <Object>[],
+          });
+        } finally {
+          await server.dispose();
+          await pair.close();
+        }
+      }
+
+      KernelBootstrap captureFactory(KernelBootstrapConfig cfg) {
+        capturedConfigs.add(cfg);
+        return KernelBootstrap.create(
+          KernelBootstrapConfig(
+            workspaceHostRoot: cfg.workspaceHostRoot,
+            sessionId: cfg.sessionId,
+            startupModel: cfg.startupModel,
+            approvalHandler: cfg.approvalHandler,
+            hooks: cfg.hooks,
+            quota: cfg.quota,
+            maxStepsPerTurn: cfg.maxStepsPerTurn,
+            onLlmStreamEvent: cfg.onLlmStreamEvent,
+            llmDrivers: <LlmProviderId, LlmDriver>{
+              LlmProviderId.localOllama: _ScriptedLlmDriver(
+                providerId: LlmProviderId.localOllama,
+                handler: (_, _) => const <LlmStreamEvent>[],
+              ),
+            },
+          ),
+        );
+      }
+
+      // 1. Default AcpServerConfig: maxStepsPerTurn = 64 -> maxSyscallCountPerTurn = 512.
+      await openSessionWithConfig(
+        AcpServerConfig(
+          startupModel: 'local-ollama/qwen3.8:27b',
+          bootstrapFactory: captureFactory,
+        ),
+      );
+      expect(capturedConfigs[0].maxStepsPerTurn, equals(64));
+      expect(capturedConfigs[0].quota.maxSyscallCountPerTurn, equals(512));
+      expect(
+        capturedConfigs[0].quota.maxChildProcesses,
+        equals(ResourceQuota.stage2Default.maxChildProcesses),
+      );
+
+      // 2. Small maxStepsPerTurn = 10 -> floor max(256, 80) = 256.
+      await openSessionWithConfig(
+        AcpServerConfig(
+          startupModel: 'local-ollama/qwen3.8:27b',
+          maxStepsPerTurn: 10,
+          bootstrapFactory: captureFactory,
+        ),
+      );
+      expect(capturedConfigs[1].maxStepsPerTurn, equals(10));
+      expect(capturedConfigs[1].quota.maxSyscallCountPerTurn, equals(256));
+
+      // 3. Explicit maxSyscallsPerTurn override = 777.
+      await openSessionWithConfig(
+        AcpServerConfig(
+          startupModel: 'local-ollama/qwen3.8:27b',
+          maxStepsPerTurn: 64,
+          maxSyscallsPerTurn: 777,
+          bootstrapFactory: captureFactory,
+        ),
+      );
+      expect(capturedConfigs[2].quota.maxSyscallCountPerTurn, equals(777));
+
+      // 4. ResourceQuota.stage2Default constant remains unchanged at 64.
+      expect(ResourceQuota.stage2Default.maxSyscallCountPerTurn, equals(64));
+    });
+
+    test(
+        'allow_always reuses origin-scoped signature across read-only curl calls to same origin with different paths and output files',
+        () async {
+      final fakeLocal = _ScriptedLlmDriver(
+        providerId: LlmProviderId.localOllama,
+        handler: (req, step) {
+          if (step == 0 || step == 1) {
+            final args = step == 0
+                ? const <String>[
+                    '-sL',
+                    '-o',
+                    'a.json',
+                    'https://example.invalid/page1',
+                  ]
+                : const <String>[
+                    '-sL',
+                    '-o',
+                    'b.json',
+                    'https://example.invalid/page2',
+                  ];
+            return <LlmStreamEvent>[
+              LlmToolCallEvent(
+                LlmToolCallSpec(
+                  id: 'call_curl_$step',
+                  name: 'sys_exec',
+                  arguments: <String, dynamic>{
+                    'command': 'curl.exe',
+                    'args': args,
+                  },
+                ),
+              ),
+              LlmDoneEvent(
+                LlmChatResponse(
+                  toolCalls: <LlmToolCallSpec>[
+                    LlmToolCallSpec(
+                      id: 'call_curl_$step',
+                      name: 'sys_exec',
+                      arguments: <String, dynamic>{
+                        'command': 'curl.exe',
+                        'args': args,
+                      },
+                    ),
+                  ],
+                  usage: const LlmUsageTelemetry(
+                    promptTokens: 30,
+                    completionTokens: 10,
+                    durationMs: 5,
+                  ),
+                ),
+              ),
+            ];
+          }
+          return <LlmStreamEvent>[
+            const LlmTextDelta('Curl checks complete.'),
+            LlmDoneEvent(
+              LlmChatResponse(
+                content: 'Curl checks complete.',
+                usage: const LlmUsageTelemetry(
+                  promptTokens: 30,
+                  completionTokens: 5,
+                  durationMs: 5,
+                ),
+              ),
+            ),
+          ];
+        },
+      );
+
+      final pair = createStreamPair();
+      final serverPeer = JsonRpcPeer(
+        input: pair.serverIn,
+        output: pair.serverOut,
+      );
+      final server = AcpServer(
+        peer: serverPeer,
+        config: AcpServerConfig(
+          startupModel: 'local-ollama/qwen3.8:27b',
+          bootstrapFactory: (cfg) => KernelBootstrap.create(
+            KernelBootstrapConfig(
+              workspaceHostRoot: cfg.workspaceHostRoot,
+              sessionId: cfg.sessionId,
+              startupModel: cfg.startupModel,
+              approvalHandler: cfg.approvalHandler,
+              hooks: cfg.hooks,
+              onLlmStreamEvent: cfg.onLlmStreamEvent,
+              llmDrivers: <LlmProviderId, LlmDriver>{
+                LlmProviderId.localOllama: fakeLocal,
+              },
+            ),
+          ),
+        ),
+      );
+      addTearDown(() async {
+        await server.dispose();
+        await pair.close();
+      });
+
+      var permCount = 0;
+      final permParams = <Map<String, dynamic>>[];
+      final clientPeer = JsonRpcPeer(
+        input: pair.clientIn,
+        output: pair.clientOut,
+        onRequest: (method, params) async {
+          if (method == 'session/request_permission') {
+            permCount += 1;
+            permParams.add(Map<String, dynamic>.from(params as Map));
+            return <String, dynamic>{
+              'outcome': <String, dynamic>{
+                'outcome': 'selected',
+                'optionId': 'allow_always',
+              },
+            };
+          }
+          throw JsonRpcException(JsonRpcErrorCodes.methodNotFound, method);
+        },
+      );
+
+      await clientPeer.sendRequest('initialize', const <String, dynamic>{
+        'protocolVersion': 1,
+      });
+      final newRes = await clientPeer.sendRequest('session/new', <String, dynamic>{
+        'cwd': repoDir.path,
+        'mcpServers': const <Object>[],
+      }) as Map<String, dynamic>;
+      final sessionId = newRes['sessionId'] as String;
+
+      final res = await clientPeer.sendRequest('session/prompt', <String, dynamic>{
+        'sessionId': sessionId,
+        'prompt': <Map<String, dynamic>>[
+          <String, dynamic>{'type': 'text', 'text': 'Fetch two pages'},
+        ],
+      }) as Map<String, dynamic>;
+      expect(res['stopReason'], equals('end_turn'));
+      // First curl prompts with allow_always; second curl to same origin hits cache!
+      expect(permCount, equals(1));
+      final toolCall = permParams.single['toolCall'] as Map<String, dynamic>;
+      final content = toolCall['content'] as List<dynamic>;
+      final previewText =
+          ((content.first as Map<String, dynamic>)['content'] as Map<String, dynamic>)['text']
+              as String;
+      expect(previewText, contains('EXTERNAL_NETWORK_COMMAND'));
+      expect(
+        previewText,
+        contains(
+          'Session allow_always scope: Read-only curl requests to https://example.invalid (in /workspace)',
+        ),
+      );
+    });
   });
 }
 

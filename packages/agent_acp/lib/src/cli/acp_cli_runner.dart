@@ -142,6 +142,7 @@ class AcpCliRunner {
     String? model,
     String? ollamaUrl,
     int? maxSteps,
+    int? maxSyscalls,
     List<String> skillsDirs = const <String>[],
     int? maxContextTokens,
     List<String> mcpServerArgs = const <String>[],
@@ -156,6 +157,7 @@ class AcpCliRunner {
         ollamaUrl.trim(),
       ],
       if (maxSteps != null) ...<String>['--max-steps', '$maxSteps'],
+      if (maxSyscalls != null) ...<String>['--max-syscalls', '$maxSyscalls'],
       for (final dir in skillsDirs)
         if (dir.trim().isNotEmpty) ...<String>['--skills-dir', dir.trim()],
       if (maxContextTokens != null) ...<String>[
@@ -231,8 +233,13 @@ class AcpCliRunner {
       )
       ..addOption(
         'max-steps',
-        defaultsTo: '32',
+        defaultsTo: '64',
         help: 'Maximum ReAct steps per user turn.',
+      )
+      ..addOption(
+        'max-syscalls',
+        help:
+            'Maximum total syscalls per LeadAgent turn (positive integer; defaults to max(256, maxSteps * 8)).',
       )
       ..addMultiOption(
         'skills-dir',
@@ -322,10 +329,20 @@ class AcpCliRunner {
       }
     }
 
-    final maxSteps = int.tryParse(parsed.option('max-steps') ?? '32');
+    final maxSteps = int.tryParse(parsed.option('max-steps') ?? '64');
     if (maxSteps == null || maxSteps < 1) {
       _err.writeln('Invalid --max-steps: ${parsed.option('max-steps')}');
       return 64;
+    }
+
+    int? maxSyscalls;
+    final rawMaxSyscalls = parsed.option('max-syscalls');
+    if (rawMaxSyscalls != null && rawMaxSyscalls.trim().isNotEmpty) {
+      maxSyscalls = int.tryParse(rawMaxSyscalls.trim());
+      if (maxSyscalls == null || maxSyscalls < 1) {
+        _err.writeln('Invalid --max-syscalls: $rawMaxSyscalls');
+        return 64;
+      }
     }
 
     int? maxContextTokens;
@@ -404,6 +421,7 @@ class AcpCliRunner {
       model: startupModel,
       ollamaUrl: ollamaUrl,
       maxSteps: maxSteps,
+      maxSyscalls: maxSyscalls,
       skillsDirs: skillsDirs,
       maxContextTokens: maxContextTokens,
       mcpServerArgs: mcpServerArgs,
@@ -865,7 +883,7 @@ class AcpCliRunner {
             (summary['totalTokensUsed'] as num?)?.toInt() ?? state.totalTokensUsed;
       }
       if (stopReason != 'end_turn') {
-        _out.writeln('[Turn ended: stopReason=$stopReason]');
+        writeTurnEndedSummary(stopReason, summary);
       }
       final ok = (summary['ok'] as bool?) ?? (stopReason == 'end_turn');
       return _LineAction(failed: !ok);
@@ -876,6 +894,34 @@ class AcpCliRunner {
     } finally {
       state.turnActive = false;
       state.stdinRouter?.setMidTurnCommandHandler(null);
+    }
+  }
+
+  /// Writes `[Turn ended: stopReason=...]` and any structured `turnSummary.error`
+  /// details to `_out` when `stopReason != 'end_turn'` ([D-001]).
+  void writeTurnEndedSummary(String stopReason, Map<String, dynamic> summary) {
+    if (stopReason == 'end_turn') {
+      return;
+    }
+    _out.writeln('[Turn ended: stopReason=$stopReason]');
+    final errMap = _asStringMap(summary['error']);
+    if (errMap.isNotEmpty) {
+      final code = (errMap['code'] as String?)?.trim() ?? '';
+      final reason = (errMap['reason'] as String?)?.trim() ?? '';
+      final message = (errMap['message'] as String?)?.trim() ?? '';
+      final hint = (errMap['hint'] as String?)?.trim() ?? '';
+      if (reason.isNotEmpty || code.isNotEmpty) {
+        final tag = (reason.isNotEmpty && code.isNotEmpty)
+            ? '$reason ($code)'
+            : (reason.isNotEmpty ? reason : code);
+        _out.writeln('  reason: $tag');
+      }
+      if (message.isNotEmpty) {
+        _out.writeln('  detail: $message');
+      }
+      if (hint.isNotEmpty) {
+        _out.writeln('  hint: $hint');
+      }
     }
   }
 

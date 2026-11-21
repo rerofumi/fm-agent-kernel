@@ -625,5 +625,266 @@ Start-Sleep -Seconds 60
       expect(res.value!['truncatedStderr'], isFalse);
       expect(res.value!['stdout'] as String, contains('KERNEL I/O CAP'));
     });
+
+    test(
+        'SysExecApprovalScope builds origin-scoped signature only for safe read-only curl/wget',
+        () {
+      final scope1 = SysExecApprovalScope.build(
+        command: 'curl.exe',
+        args: const <String>[
+          '-sL',
+          '-o',
+          'research/a.json',
+          'https://en.wikipedia.org/api/rest_v1/page/summary/Dart',
+        ],
+        workingDir: '/workspace',
+      );
+      final scope2 = SysExecApprovalScope.build(
+        command: 'CURL.EXE',
+        args: const <String>[
+          '-sL',
+          '-X',
+          'get',
+          '-o',
+          'research/b.json',
+          'https://en.wikipedia.org/wiki/Operating_system',
+        ],
+        workingDir: '/workspace',
+      );
+      expect(scope1.isOriginScoped, isTrue);
+      expect(scope2.isOriginScoped, isTrue);
+      expect(scope1.signature, equals(scope2.signature));
+      expect(
+        scope1.signature,
+        equals('exec:net_read:curl\u0000https://en.wikipedia.org\u0000/workspace'),
+      );
+      expect(
+        scope1.scopeDescription,
+        equals('Read-only curl requests to https://en.wikipedia.org (in /workspace)'),
+      );
+
+      // Single-string args: null normalization also works.
+      final scopeSingleStr = SysExecApprovalScope.build(
+        command: 'curl -sL -XHEAD https://en.wikipedia.org/wiki/Plan_9',
+      );
+      expect(scopeSingleStr.isOriginScoped, isTrue);
+      expect(scopeSingleStr.signature, equals(scope1.signature));
+
+      // wget read-only also shares origin-scoped signature.
+      final wget1 = SysExecApprovalScope.build(
+        command: 'wget.exe',
+        args: const <String>['--method=HEAD', '-O', 'a.html', 'https://example.org/a'],
+      );
+      final wget2 = SysExecApprovalScope.build(
+        command: 'wget',
+        args: const <String>['-O', 'b.html', 'https://example.org/b'],
+      );
+      expect(wget1.isOriginScoped, isTrue);
+      expect(wget1.signature, equals(wget2.signature));
+
+      // Different origin or workingDir produces different signature.
+      final diffOrigin = SysExecApprovalScope.build(
+        command: 'curl.exe',
+        args: const <String>['https://example.com/a'],
+      );
+      final diffWd = SysExecApprovalScope.build(
+        command: 'curl.exe',
+        args: const <String>['https://en.wikipedia.org/a'],
+        workingDir: '/workspace/sub',
+      );
+      expect(diffOrigin.isOriginScoped, isTrue);
+      expect(diffOrigin.signature, isNot(equals(scope1.signature)));
+      expect(diffWd.signature, isNot(equals(scope1.signature)));
+    });
+
+    test(
+        'SysExecApprovalScope falls back to exact match on mutating flags, attached forms, shell meta, path-qualified exe, userInfo, multi-URL, and localhost/private IPs',
+        () {
+      final fallbackCases = <({String command, List<String>? args})>[
+        // Shell metacharacters (with args and args: null)
+        (
+          command: 'curl.exe',
+          args: const <String>['https://en.wikipedia.org/a', '|', 'findstr', 'x'],
+        ),
+        (
+          command: 'curl.exe https://en.wikipedia.org/a && echo hi',
+          args: null,
+        ),
+        // Path-qualified exe
+        (
+          command: r'C:\Windows\System32\curl.exe',
+          args: const <String>['https://en.wikipedia.org/a'],
+        ),
+        (
+          command: '/usr/bin/curl',
+          args: const <String>['https://en.wikipedia.org/a'],
+        ),
+        // Mutating / upload / config / chaining curl options (including attached & = forms)
+        (command: 'curl', args: const <String>['-d', 'x=1', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-dx=1', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--data=x=1', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--data-raw', 'x', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--json', '{}', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--json={}', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-F', 'f=@a', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-Ff=@a', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--form=f=a', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-T', 'a.txt', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-Ta.txt', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--upload-file=a.txt', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-K', 'cfg', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-Kcfg', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--config=cfg', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--next', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-:', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--url=https://example.com/a']),
+        (command: 'curl', args: const <String>['--url', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-X', 'post', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-XPOST', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['--request=DELETE', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['https://example.com/a', '-X']),
+        (command: 'curl', args: const <String>['-sXd', 'https://example.com/a']),
+        (command: 'curl', args: const <String>['-sX', 'GET', 'https://example.com/a']),
+        // wget mutating / input-file options
+        (command: 'wget', args: const <String>['--post-data=a=1', 'https://example.com/a']),
+        (command: 'wget', args: const <String>['--post-file=a.txt', 'https://example.com/a']),
+        (command: 'wget', args: const <String>['--body-data=a', 'https://example.com/a']),
+        (command: 'wget', args: const <String>['--body-file=a.txt', 'https://example.com/a']),
+        (command: 'wget', args: const <String>['--method=POST', 'https://example.com/a']),
+        (command: 'wget', args: const <String>['--method', 'PUT', 'https://example.com/a']),
+        (command: 'wget', args: const <String>['https://example.com/a', '--method']),
+        (command: 'wget', args: const <String>['-i', 'urls.txt']),
+        (command: 'wget', args: const <String>['-qi', 'urls.txt']),
+        (command: 'wget', args: const <String>['--input-file=urls.txt']),
+        // Multiple URLs, zero URLs, userInfo, non-http scheme
+        (command: 'curl', args: const <String>['https://example.com/a', 'https://example.com/b']),
+        (command: 'curl', args: const <String>['--version']),
+        (command: 'curl', args: const <String>['https://user:pass@example.com/a']),
+        (command: 'curl', args: const <String>['ftp://example.com/a']),
+        // Localhost, private, link-local, loopback IPv4 & IPv6
+        (command: 'curl', args: const <String>['http://localhost/a']),
+        (command: 'curl', args: const <String>['http://sub.localhost:8080/a']),
+        (command: 'curl', args: const <String>['http://localhost./a']),
+        (command: 'curl', args: const <String>['http://127.0.0.1:8080/a']),
+        (command: 'curl', args: const <String>['http://127.1.2.3/a']),
+        (command: 'curl', args: const <String>['http://10.0.0.5/a']),
+        (command: 'curl', args: const <String>['http://172.16.0.1/a']),
+        (command: 'curl', args: const <String>['http://192.168.1.10/a']),
+        (command: 'curl', args: const <String>['http://169.254.169.254/latest']),
+        (command: 'curl', args: const <String>['http://0.0.0.0/a']),
+        (command: 'curl', args: const <String>['http://[::1]:8080/a']),
+        (command: 'curl', args: const <String>['http://[::]/a']),
+        (command: 'curl', args: const <String>['http://[fc00::1]/a']),
+        (command: 'curl', args: const <String>['http://[fe80::1]/a']),
+        (command: 'curl', args: const <String>['http://[::ffff:127.0.0.1]/a']),
+        (command: 'curl', args: const <String>['http://[::ffff:192.168.1.1]/a']),
+        // Non-network command
+        (command: 'dart', args: const <String>['--version']),
+      ];
+
+      for (final c in fallbackCases) {
+        final scope = SysExecApprovalScope.build(
+          command: c.command,
+          args: c.args,
+        );
+        expect(
+          scope.isOriginScoped,
+          isFalse,
+          reason: 'Expected exact-match fallback for ${c.command} ${c.args}',
+        );
+        final expectedArgs = (c.args ?? const <String>[]).join('\u0000');
+        expect(
+          scope.signature,
+          equals('${c.command}\u0000$expectedArgs\u0000/workspace'),
+        );
+        expect(scope.scopeDescription, equals('Exact command in /workspace'));
+      }
+    });
+
+    test(
+        'SysExecClassifier flags external network commands and ApprovalPreview includes scope & reason',
+        () async {
+      final classifier = SysExecClassifier(namespace: namespace);
+      for (final exe in const <String>[
+        'curl',
+        'curl.exe',
+        'wget',
+        'wget.exe',
+        'Invoke-WebRequest',
+        'iwr',
+        'Invoke-RestMethod',
+        'irm',
+      ]) {
+        final cls = classifier.classify(
+          command: exe,
+          args: const <String>['https://en.wikipedia.org/wiki/Dart'],
+        );
+        expect(cls.decision, equals(RingDecision.askUser));
+        expect(
+          cls.reason,
+          equals(
+            'EXTERNAL_NETWORK_COMMAND: Direct network command via sys_exec (prefer delegating web lookup to web_researcher).',
+          ),
+        );
+      }
+
+      // Existing rules remain intact.
+      expect(
+        classifier.classify(command: 'dart', args: const <String>['test']).decision,
+        equals(RingDecision.allow),
+      );
+      expect(
+        classifier
+            .classify(command: r'C:\Windows\System32\curl.exe', args: const <String>[])
+            .reason,
+        equals('EXECUTABLE_PATH_NOT_ALLOWLISTED'),
+      );
+
+      // ApprovalPreview through SyscallGate includes EXTERNAL_NETWORK_COMMAND and Session allow_always scope.
+      final rejectHandler = PolicyApprovalHandler.alwaysReject();
+      final gate = createGate(approvalHandler: rejectHandler);
+      final denied = await gate.invoke(
+        ctx,
+        SyscallRequest(
+          name: 'sys_exec',
+          args: const <String, dynamic>{
+            'command': 'curl.exe',
+            'args': <String>['-sL', '-o', 'out.json', 'https://en.wikipedia.org/wiki/Dart'],
+          },
+        ),
+      );
+      expect(denied.ok, isFalse);
+      expect(rejectHandler.recordedRequests, hasLength(1));
+      final approvalReq = rejectHandler.recordedRequests.single;
+      final previewText =
+          ((approvalReq.content.first['content'] as Map<String, dynamic>)['text'])
+              as String;
+      expect(previewText, contains('EXTERNAL_NETWORK_COMMAND'));
+      expect(
+        previewText,
+        contains(
+          'Session allow_always scope: Read-only curl requests to https://en.wikipedia.org (in /workspace)',
+        ),
+      );
+      final def = execDriver.buildSyscallDefinition();
+      final builtPreview = await def.approvalPreviewBuilder!(
+        SyscallHookContext(
+          pid: 1,
+          ring: ProtectionRing.ring2,
+          sessionId: sessionId,
+          syscallName: 'sys_exec',
+          args: const <String, dynamic>{
+            'command': 'curl.exe',
+            'args': <String>['-sL', '-o', 'out.json', 'https://en.wikipedia.org/wiki/Dart'],
+            'workingDir': '/workspace',
+          },
+          jjContext: jjContext,
+        ),
+      );
+      expect(
+        builtPreview!.metadata!['approvalScope'],
+        equals('Read-only curl requests to https://en.wikipedia.org (in /workspace)'),
+      );
+    });
   });
 }

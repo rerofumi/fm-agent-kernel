@@ -829,6 +829,11 @@ class Win32JobExecDriver {
           workingDir: workingDir,
           timeoutMs: timeoutMs,
         );
+        final scope = SysExecApprovalScope.build(
+          command: command,
+          args: argsList,
+          workingDir: workingDir,
+        );
         return ApprovalPreview(
           title: 'Execute external command: $fullCmd',
           kind: 'execute',
@@ -838,7 +843,7 @@ class Win32JobExecDriver {
               'content': <String, dynamic>{
                 'type': 'text',
                 'text':
-                    'Command: $fullCmd\nWorkingDir: $workingDir\nTimeout: ${timeoutMs}ms\nReason: ${classification.reason}',
+                    'Command: $fullCmd\nWorkingDir: $workingDir\nTimeout: ${timeoutMs}ms\nReason: ${classification.reason}\nSession allow_always scope: ${scope.scopeDescription}',
               },
             },
           ],
@@ -848,6 +853,7 @@ class Win32JobExecDriver {
             'workingDir': workingDir,
             'timeoutMs': timeoutMs,
             'classificationReason': classification.reason,
+            'approvalScope': scope.scopeDescription,
           },
         );
       },
@@ -857,7 +863,11 @@ class Win32JobExecDriver {
             (args['args'] as List<dynamic>?)?.cast<String>() ?? const <String>[];
         final workingDir =
             (args['workingDir'] as String?) ?? VfsNamespace.virtualRoot;
-        return '$command\u0000${argsList.join('\u0000')}\u0000$workingDir';
+        return SysExecApprovalScope.build(
+          command: command,
+          args: argsList,
+          workingDir: workingDir,
+        ).signature;
       },
       handler: (exec) {
         final rawArgs = exec.args['args'] as List<dynamic>?;

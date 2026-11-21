@@ -539,6 +539,118 @@ void main() {
       expect(ssrfRes.error!.code, SyscallErrorCode.eacces);
       expect(ssrfRes.error!.reason, 'SSRF_BLOCKED_ADDRESS');
     });
+
+    test('WebFetchDriver supports startLine/endLine paging, in-memory LRU+TTL cache, and EINVAL validation', () async {
+      final lines500 = List<String>.generate(500, (i) => 'Line ${i + 1}: body').join('\n');
+      var transportCalls = 0;
+      var currentNow = DateTime.utc(2026, 11, 21, 12, 0, 0);
+
+      final countingTransport = _CountingWebFetchTransport(
+        onFetch: (url) {
+          transportCalls++;
+          return SyscallResult<WebFetchRawResponse>.success(
+            WebFetchRawResponse(
+              requestedUrl: url,
+              finalUrl: url,
+              statusCode: 200,
+              contentType: 'text/markdown',
+              bodyBytes: Uint8List.fromList(utf8.encode(lines500)),
+            ),
+          );
+        },
+      );
+
+      final driver = WebFetchDriver(
+        transport: countingTransport,
+        clock: () => currentNow,
+      );
+
+      // 1. Default fetch returns lines 1..200 with paging metadata.
+      final page1 = await driver.fetch(url: 'https://example.org/long.md');
+      expect(page1.ok, isTrue);
+      expect(transportCalls, 1);
+      expect(page1.value!['totalLines'], 500);
+      expect(page1.value!['startLine'], 1);
+      expect(page1.value!['endLine'], 200);
+      expect(page1.value!['hasMore'], isTrue);
+      expect(page1.value!['nextStartLine'], 201);
+      expect(page1.value!['markdown'], contains('Line 1: body'));
+      expect(page1.value!['markdown'], contains('Line 200: body'));
+      expect(page1.value!['markdown'], isNot(contains('Line 201: body')));
+
+      // 2. Subsequent range hits in-memory cache without re-fetching.
+      final page2 = await driver.fetch(
+        url: 'https://example.org/long.md',
+        startLine: 201,
+        endLine: 400,
+      );
+      expect(page2.ok, isTrue);
+      expect(transportCalls, 1);
+      expect(page2.value!['startLine'], 201);
+      expect(page2.value!['endLine'], 400);
+      expect(page2.value!['hasMore'], isTrue);
+      expect(page2.value!['nextStartLine'], 401);
+      expect(page2.value!['markdown'], contains('Line 201: body'));
+      expect(page2.value!['markdown'], contains('Line 400: body'));
+
+      // 3. Final partial chunk.
+      final page3 = await driver.fetch(
+        url: 'https://example.org/long.md',
+        startLine: 401,
+      );
+      expect(page3.ok, isTrue);
+      expect(transportCalls, 1);
+      expect(page3.value!['startLine'], 401);
+      expect(page3.value!['endLine'], 500);
+      expect(page3.value!['hasMore'], isFalse);
+      expect(page3.value!['nextStartLine'], isNull);
+
+      // 4. Out-of-range startLine > totalLines returns empty markdown without crashing.
+      final pastEnd = await driver.fetch(
+        url: 'https://example.org/long.md',
+        startLine: 600,
+      );
+      expect(pastEnd.ok, isTrue);
+      expect(pastEnd.value!['markdown'], isEmpty);
+      expect(pastEnd.value!['hasMore'], isFalse);
+      expect(pastEnd.value!['nextStartLine'], isNull);
+
+      // 5. TTL expiration (> 5 minutes) triggers a fresh transport fetch.
+      currentNow = currentNow.add(const Duration(minutes: 6));
+      final afterTtl = await driver.fetch(url: 'https://example.org/long.md');
+      expect(afterTtl.ok, isTrue);
+      expect(transportCalls, 2);
+
+      // 6. Invalid startLine / endLine return EINVAL (recoverable).
+      final badStart = await driver.fetch(
+        url: 'https://example.org/long.md',
+        startLine: 0,
+      );
+      expect(badStart.ok, isFalse);
+      expect(badStart.error!.code, SyscallErrorCode.einval);
+      expect(badStart.error!.reason, 'INVALID_LINE_RANGE');
+      expect(badStart.error!.recoverable, isTrue);
+
+      final badEnd = await driver.fetch(
+        url: 'https://example.org/long.md',
+        startLine: 50,
+        endLine: 10,
+      );
+      expect(badEnd.ok, isFalse);
+      expect(badEnd.error!.code, SyscallErrorCode.einval);
+      expect(badEnd.error!.reason, 'INVALID_LINE_RANGE');
+
+      // 7. SyscallDefinition validateArgs also rejects invalid line ranges.
+      final def = buildWebFetchSyscallDefinition(driver: driver);
+      final schemaErr = def.validateArgs!(<String, dynamic>{
+        'url': 'https://example.org/long.md',
+        'startLine': 10,
+        'endLine': 5,
+      });
+      expect(schemaErr, isNotNull);
+      expect(schemaErr!.code, SyscallErrorCode.einval);
+      expect(schemaErr.reason, 'INVALID_LINE_RANGE');
+    });
   });
 
   group('OllamaWebSearchBackend ([D-203], [D-216])', () {
@@ -617,6 +729,54 @@ void main() {
         res.value!.results.first.url,
         'https://api.dart.dev/dart-isolate/Isolate/spawn.html',
       );
+      expect(res.value!.results.first.contentTruncated, isFalse);
+      expect(res.value!.results.first.toJson().containsKey('contentTruncated'), isFalse);
+    });
+
+    test('truncates oversized result content to maxSnippetChars (800) with contentTruncated metadata', () async {
+      final hugeContent = 'A' * 2000;
+      final client = MockClient((_) async {
+        return http.Response(
+          jsonEncode(<String, dynamic>{
+            'results': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'title': 'Huge Page',
+                'url': 'https://example.org/huge',
+                'content': hugeContent,
+              },
+              <String, dynamic>{
+                'title': 'Short Page',
+                'url': 'https://example.org/short',
+                'content': 'Short snippet',
+              },
+            ],
+          }),
+          200,
+          headers: <String, String>{'content-type': 'application/json'},
+        );
+      });
+
+      final backend = OllamaWebSearchBackend(
+        apiKey: 'test-key',
+        httpClient: client,
+      );
+
+      final res = await backend.search(query: 'huge');
+      expect(res.ok, isTrue);
+      expect(res.value!.results, hasLength(2));
+
+      final first = res.value!.results[0];
+      expect(first.content, equals('${'A' * 800}...'));
+      expect(first.contentTruncated, isTrue);
+      expect(first.originalContentChars, 2000);
+      expect(first.toJson()['contentTruncated'], isTrue);
+      expect(first.toJson()['originalContentChars'], 2000);
+
+      final second = res.value!.results[1];
+      expect(second.content, equals('Short snippet'));
+      expect(second.contentTruncated, isFalse);
+      expect(second.toJson().containsKey('contentTruncated'), isFalse);
+      expect(second.toJson().containsKey('originalContentChars'), isFalse);
     });
 
     test('normalizes 401/429 and redacts API key to <REDACTED> in error messages', () async {
@@ -937,4 +1097,21 @@ void main() {
       expect(source, isNot(contains('DISABLE_SSRF')));
     });
   });
+}
+
+class _CountingWebFetchTransport implements WebFetchTransport {
+  _CountingWebFetchTransport({required this.onFetch});
+
+  final SyscallResult<WebFetchRawResponse> Function(String url) onFetch;
+
+  @override
+  Future<SyscallResult<WebFetchRawResponse>> fetch({
+    required String url,
+    Duration? timeout,
+    int? maxRedirects,
+    int? maxResponseBytes,
+    CancellationToken? cancelToken,
+  }) async {
+    return onFetch(url);
+  }
 }

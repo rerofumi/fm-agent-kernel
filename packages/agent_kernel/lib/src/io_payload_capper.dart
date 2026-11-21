@@ -240,20 +240,51 @@ class IoPayloadCapper {
             config.tailLines,
             math.max(0, rawValue.length - keptHead),
           );
-          final sliced = <dynamic>[
+          final candidateItems = <dynamic>[
             ...rawValue.take(keptHead),
             if (keptTail > 0) ...rawValue.skip(rawValue.length - keptTail),
           ];
+
+          // Step A: Bound oversized String fields/elements within each candidate item.
+          final perItemFieldBudget = math.max(
+            64,
+            config.maxUtf8Bytes ~/
+                math.max(1, math.min(candidateItems.length, 4)),
+          );
+          final normalizedItems = candidateItems
+              .map((item) => _capListItemForBudget(item, perItemFieldBudget))
+              .toList(growable: false);
+
+          // Step B: Accumulate UTF-8 JSON bytes and keep at least 1 truncated item.
+          final sliced = <dynamic>[];
+          var accumulatedBytes = 2; // JSON array `[]`
+          for (final item in normalizedItems) {
+            final itemBytes = utf8.encode(jsonEncode(item)).length;
+            final commaBytes = sliced.isEmpty ? 0 : 1;
+            if (sliced.isNotEmpty &&
+                accumulatedBytes + commaBytes + itemBytes >
+                    config.maxUtf8Bytes) {
+              break;
+            }
+            sliced.add(item);
+            accumulatedBytes += commaBytes + itemBytes;
+          }
+
+          final originalJsonBytes = utf8.encode(jsonEncode(rawValue)).length;
+          final retainedJsonBytes = utf8.encode(jsonEncode(sliced)).length;
+          final omittedCount = math.max(0, rawValue.length - sliced.length);
+          final omittedBytes =
+              math.max(0, originalJsonBytes - retainedJsonBytes);
+
           updated[field] = sliced;
           updated['truncated'] = true;
           updated['originalCount'] = rawValue.length;
-          updated['omittedCount'] =
-              math.max(0, rawValue.length - sliced.length);
-          updated['originalBytes'] = capped.originalBytes;
-          updated['omittedBytes'] = capped.omittedBytes;
+          updated['omittedCount'] = omittedCount;
+          updated['originalBytes'] = originalJsonBytes;
+          updated['omittedBytes'] = omittedBytes;
           updated['capNotice'] =
-              '... [KERNEL I/O CAP: omitted ${rawValue.length - sliced.length} items '
-              '(${capped.omittedBytes} bytes) out of ${rawValue.length} items.] ...';
+              '... [KERNEL I/O CAP: omitted $omittedCount items '
+              '($omittedBytes bytes) out of ${rawValue.length} items.] ...';
           if (capped.spillPath != null) {
             updated['spillPath'] = capped.spillPath;
           }
@@ -337,5 +368,45 @@ class IoPayloadCapper {
       start++;
     }
     return utf8.decode(bytes.sublist(start), allowMalformed: false);
+  }
+
+  static dynamic _capListItemForBudget(dynamic item, int maxFieldBytes) {
+    if (item is String) {
+      return _truncateStringUtf8(item, maxFieldBytes);
+    }
+    if (item is Map<dynamic, dynamic>) {
+      final result = <String, dynamic>{};
+      for (final entry in item.entries) {
+        final key = entry.key.toString();
+        final value = entry.value;
+        if (value is String) {
+          result[key] = _truncateStringUtf8(value, maxFieldBytes);
+        } else if (value is Map<dynamic, dynamic> || value is List<dynamic>) {
+          final encoded = jsonEncode(value);
+          if (utf8.encode(encoded).length > maxFieldBytes) {
+            result[key] = _truncateStringUtf8(encoded, maxFieldBytes);
+          } else {
+            result[key] = value;
+          }
+        } else {
+          result[key] = value;
+        }
+      }
+      return result;
+    }
+    return item;
+  }
+
+  static String _truncateStringUtf8(String text, int maxBytes) {
+    if (utf8.encode(text).length <= maxBytes) {
+      return text;
+    }
+    const suffix = '... [truncated]';
+    final suffixBytes = utf8.encode(suffix).length;
+    final headBudget = math.max(0, maxBytes - suffixBytes);
+    if (headBudget == 0) {
+      return _sliceUtf8Head(text, maxBytes);
+    }
+    return '${_sliceUtf8Head(text, headBudget)}$suffix';
   }
 }

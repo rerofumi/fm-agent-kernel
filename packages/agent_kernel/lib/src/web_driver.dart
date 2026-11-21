@@ -7,17 +7,24 @@ class WebSearchResultItem {
     required this.title,
     required this.url,
     required this.content,
+    this.contentTruncated = false,
+    this.originalContentChars,
   });
 
   final String title;
   final String url;
   final String content;
+  final bool contentTruncated;
+  final int? originalContentChars;
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
       'title': title,
       'url': url,
       'content': content,
+      if (contentTruncated) 'contentTruncated': true,
+      if (contentTruncated && originalContentChars != null)
+        'originalContentChars': originalContentChars,
     };
   }
 }

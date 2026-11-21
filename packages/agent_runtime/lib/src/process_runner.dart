@@ -259,7 +259,7 @@ class LeadAgent {
     required this.capHandle,
     required this.modelResolver,
     String? sessionUuid,
-    this.maxStepsPerTurn = 32,
+    this.maxStepsPerTurn = 64,
     this.onTurnExitCleanup,
   }) : sessionUuid = sessionUuid ?? _generateUuidV4();
 
@@ -492,6 +492,21 @@ class LeadAgent {
             error: quotaCheck,
             steps: steps,
             toolCallsExecuted: toolCallsExecuted,
+          );
+        }
+
+        if (userTurnCommitted &&
+            (steps / maxStepsPerTurn >= 0.85 ||
+                (pcb.quota.maxSyscallCountPerTurn > 0 &&
+                    pcb.quotaUsage.syscallCountInTurn /
+                            pcb.quota.maxSyscallCountPerTurn >=
+                        0.85))) {
+          pcb.memory.ephemeralSegment.dynamicContextSummary =
+              AgentPrompts.formatBudgetWarning(
+            stepsUsed: steps,
+            maxSteps: maxStepsPerTurn,
+            syscallsUsed: pcb.quotaUsage.syscallCountInTurn,
+            maxSyscalls: pcb.quota.maxSyscallCountPerTurn,
           );
         }
 

@@ -35,7 +35,7 @@ class KernelBootstrapConfig {
     this.requestTimeout = const Duration(seconds: 120),
     this.ioCapConfig = const IoCapConfig(),
     this.quota = ResourceQuota.stage1Default,
-    this.maxStepsPerTurn = 32,
+    this.maxStepsPerTurn = 64,
     this.jjExecutable = 'jj',
     this.projector = const CanonicalIrProjector(),
     this.extraSyscalls = const <SyscallDefinition>[],

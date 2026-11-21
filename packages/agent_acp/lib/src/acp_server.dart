@@ -45,7 +45,8 @@ class AcpServerConfig {
     this.localOllamaBaseUrl,
     this.ollamaCloudBaseUrl,
     this.openRouterBaseUrl,
-    this.maxStepsPerTurn = 32,
+    this.maxStepsPerTurn = 64,
+    this.maxSyscallsPerTurn,
     this.jjExecutable = 'jj',
     this.skillsDirs = const <String>[],
     this.skillsDirEnv,
@@ -60,6 +61,7 @@ class AcpServerConfig {
   final String? ollamaCloudBaseUrl;
   final String? openRouterBaseUrl;
   final int maxStepsPerTurn;
+  final int? maxSyscallsPerTurn;
   final String jjExecutable;
 
   /// Repeatable `--skills-dir <path>` directories in priority order ([D-203], [D-219]).
@@ -304,6 +306,12 @@ class AcpServer {
     );
 
     final observerHook = _DeferredAcpObserverHook(() => mapper);
+    final effectiveMaxSyscalls =
+        config.maxSyscallsPerTurn ?? max(256, config.maxStepsPerTurn * 8);
+    final leadQuota = ResourceQuota(
+      maxChildProcesses: ResourceQuota.stage2Default.maxChildProcesses,
+      maxSyscallCountPerTurn: effectiveMaxSyscalls,
+    );
 
     final bootstrapConfig = KernelBootstrapConfig(
       workspaceHostRoot: normalizedCwd,
@@ -315,7 +323,7 @@ class AcpServer {
       localOllamaBaseUrl: config.localOllamaBaseUrl,
       ollamaCloudBaseUrl: config.ollamaCloudBaseUrl,
       openRouterBaseUrl: config.openRouterBaseUrl,
-      quota: ResourceQuota.stage2Default,
+      quota: leadQuota,
       enableStage2Multiprocess: true,
       enableStage3Team: true,
       maxContextTokens: effectiveMaxContextTokens,

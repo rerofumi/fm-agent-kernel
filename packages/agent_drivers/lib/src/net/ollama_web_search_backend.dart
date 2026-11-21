@@ -48,7 +48,9 @@ class OllamaWebSearchBackend implements WebSearchBackend {
     SecretRedactor? redactor,
     http.Client? httpClient,
     this.requestTimeout = const Duration(milliseconds: 20000),
-  })  : _explicitApiKey = apiKey,
+    this.maxSnippetChars = 800,
+  })  : assert(maxSnippetChars > 0),
+        _explicitApiKey = apiKey,
         _explicitBaseUrl = baseUrl,
         _envLoader = envLoader,
         _redactor = redactor ?? envLoader?.redactor ?? SecretRedactor(),
@@ -76,6 +78,9 @@ class OllamaWebSearchBackend implements WebSearchBackend {
 
   /// Timeout for a single web search HTTP request (default 20,000 ms).
   final Duration requestTimeout;
+
+  /// Maximum character length of each search result's `content` snippet (default 800).
+  final int maxSnippetChars;
 
   @override
   String get providerName => 'ollama-web-search';
@@ -312,16 +317,30 @@ class OllamaWebSearchBackend implements WebSearchBackend {
         }
         final title = _redactor.redactString((entry['title']?.toString() ?? '').trim());
         final url = _redactor.redactString((entry['url']?.toString() ?? '').trim());
-        final content =
+        final rawContent =
             _redactor.redactString((entry['content']?.toString() ?? '').trim());
-        if (url.isEmpty && title.isEmpty && content.isEmpty) {
+        if (url.isEmpty && title.isEmpty && rawContent.isEmpty) {
           continue;
+        }
+        final bool contentTruncated;
+        final int? originalContentChars;
+        final String content;
+        if (rawContent.length > maxSnippetChars) {
+          content = '${rawContent.substring(0, maxSnippetChars)}...';
+          contentTruncated = true;
+          originalContentChars = rawContent.length;
+        } else {
+          content = rawContent;
+          contentTruncated = false;
+          originalContentChars = null;
         }
         items.add(
           WebSearchResultItem(
             title: title,
             url: url,
             content: content,
+            contentTruncated: contentTruncated,
+            originalContentChars: originalContentChars,
           ),
         );
       }

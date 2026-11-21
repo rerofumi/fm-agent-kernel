@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:agent_acp/agent_acp.dart';
+import 'package:agent_acp/src/kanban/kanban_cli_runner.dart';
 import 'package:agent_acp/src/wire/wire_command_splitter.dart';
 import 'package:agent_acp/src/wire/wire_redactor.dart';
 import 'package:agent_drivers/agent_drivers.dart';
@@ -726,6 +727,132 @@ void main() {
       expect(shortSpec.name, equals('demo'));
       expect(shortSpec.command, equals(r'C:\Program Files\tool\mcp.exe'));
       expect(shortSpec.args, equals(<String>['--flag', 'hello world']));
+    });
+
+    test('AcpCliRunner and KanbanCliRunner default --max-steps to 64, forward --max-syscalls, and validate invalid values', () async {
+      final cliParsed = AcpCliRunner.buildArgParser().parse(const <String>[]);
+      expect(cliParsed.option('max-steps'), equals('64'));
+      expect(cliParsed.option('max-syscalls'), isNull);
+
+      final kanbanParsed =
+          KanbanCliRunner.buildArgParser().parse(const <String>[]);
+      expect(kanbanParsed.option('max-steps'), equals('64'));
+      expect(kanbanParsed.option('max-syscalls'), isNull);
+
+      final tempDir = Directory.systemTemp.createTempSync('acp_cli_opts_');
+      addTearDown(() => tempDir.deleteSync(recursive: true));
+      Directory('${tempDir.path}/.jj').createSync();
+      final fakeDaemon = File('${tempDir.path}/fake_daemon.exe')
+        ..writeAsBytesSync(const <int>[0]);
+
+      final cliLaunch = AcpCliRunner.resolveDaemonLaunch(
+        explicitDaemonPath: fakeDaemon.path,
+        maxSteps: 64,
+        maxSyscalls: 300,
+      );
+      expect(cliLaunch, isNotNull);
+      expect(
+        cliLaunch!.arguments,
+        containsAllInOrder(<String>['--max-steps', '64', '--max-syscalls', '300']),
+      );
+
+      final kanbanLaunch = KanbanCliRunner.resolveDaemonLaunch(
+        explicitDaemonPath: fakeDaemon.path,
+        maxSteps: 64,
+        maxSyscalls: 300,
+      );
+      expect(kanbanLaunch, isNotNull);
+      expect(
+        kanbanLaunch!.arguments,
+        containsAllInOrder(<String>['--max-steps', '64', '--max-syscalls', '300']),
+      );
+
+      final cliErr = StringBuffer();
+      final cliRunner = AcpCliRunner(
+        out: StringBuffer(),
+        err: cliErr,
+        useAnsiColor: false,
+        stdinHasTerminal: false,
+      );
+      expect(
+        await cliRunner.run(<String>['--cwd', tempDir.path, '--max-syscalls', '0']),
+        equals(64),
+      );
+      expect(cliErr.toString(), contains('Invalid --max-syscalls: 0'));
+
+      final cliErr2 = StringBuffer();
+      final cliRunner2 = AcpCliRunner(
+        out: StringBuffer(),
+        err: cliErr2,
+        useAnsiColor: false,
+        stdinHasTerminal: false,
+      );
+      expect(
+        await cliRunner2
+            .run(<String>['--cwd', tempDir.path, '--max-syscalls', 'abc']),
+        equals(64),
+      );
+      expect(cliErr2.toString(), contains('Invalid --max-syscalls: abc'));
+
+      final kanbanErr = StringBuffer();
+      final kanbanRunner = KanbanCliRunner(
+        out: StringBuffer(),
+        err: kanbanErr,
+      );
+      expect(
+        await kanbanRunner
+            .run(<String>['--cwd', tempDir.path, '--max-syscalls', '-5']),
+        equals(64),
+      );
+      expect(kanbanErr.toString(), contains('Invalid --max-syscalls: -5'));
+    });
+
+    test('AcpCliRunner.writeTurnEndedSummary prints structured error details when present and preserves fallback', () {
+      final outFull = StringBuffer();
+      final runnerFull = AcpCliRunner(
+        out: outFull,
+        err: StringBuffer(),
+        useAnsiColor: false,
+        stdinHasTerminal: false,
+      );
+      runnerFull.writeTurnEndedSummary('max_tokens', <String, dynamic>{
+        'ok': false,
+        'error': <String, dynamic>{
+          'code': 'EDQUOT',
+          'reason': 'SYSCALL_QUOTA_EXCEEDED',
+          'message': 'Syscall quota exceeded (64/64).',
+          'hint': 'Increase --max-syscalls or split the task.',
+        },
+      });
+      expect(
+        outFull.toString(),
+        equals(
+          '[Turn ended: stopReason=max_tokens]\n'
+          '  reason: SYSCALL_QUOTA_EXCEEDED (EDQUOT)\n'
+          '  detail: Syscall quota exceeded (64/64).\n'
+          '  hint: Increase --max-syscalls or split the task.\n',
+        ),
+      );
+
+      final outNoErr = StringBuffer();
+      final runnerNoErr = AcpCliRunner(
+        out: outNoErr,
+        err: StringBuffer(),
+        useAnsiColor: false,
+        stdinHasTerminal: false,
+      );
+      runnerNoErr.writeTurnEndedSummary('cancelled', const <String, dynamic>{});
+      expect(outNoErr.toString(), equals('[Turn ended: stopReason=cancelled]\n'));
+
+      final outEndTurn = StringBuffer();
+      final runnerEndTurn = AcpCliRunner(
+        out: outEndTurn,
+        err: StringBuffer(),
+        useAnsiColor: false,
+        stdinHasTerminal: false,
+      );
+      runnerEndTurn.writeTurnEndedSummary('end_turn', const <String, dynamic>{});
+      expect(outEndTurn.toString(), isEmpty);
     });
   });
 }

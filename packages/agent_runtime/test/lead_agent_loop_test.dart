@@ -639,5 +639,199 @@ void main() {
       expect(cleanupCompletedBeforeReturn, isTrue);
       expect(cleanupCount, equals(1));
     });
+
+    test('injects Segment 2 budget warning at >=85% step or syscall threshold without mutating Segment 0/1 and clears on exit', () async {
+      // Case A: Step threshold (maxStepsPerTurn = 10 -> steps 0..8 are < 0.85, step 9 is 0.90 >= 0.85).
+      final observedDynamicSummaries = <String?>[];
+      final initialPinned = pcb.memory.systemSegment.pinned;
+      final stepPcb = ProcessControlBlock(
+        pid: 1,
+        name: 'lead-agent',
+        ring: ProtectionRing.ring2,
+        cspace: CapabilityTable.stage1LeadAgent(),
+        quota: const ResourceQuota(
+          maxChildProcesses: 0,
+          maxSyscallCountPerTurn: 100,
+        ),
+        namespace: pcb.namespace,
+        memory: VirtualContextMemory(
+          sessionId: 'sess_loop_step',
+          systemInstruction: initialPinned,
+        ),
+      );
+      final stepTable = KernelProcessTable()..registerProcess(stepPcb);
+      final stepGate = SyscallGate(
+        processTable: stepTable,
+        approvalGate: ApprovalGate(handler: PolicyApprovalHandler.alwaysAllow()),
+        ioCapper: IoPayloadCapper(
+          workspaceHostRoot: tempRoot.path,
+          config: const IoCapConfig(),
+        ),
+        auditLogger: auditLogger,
+      );
+      var callIdx = 0;
+
+      stepGate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_llm_chat',
+          requiredRight: CapRight.llmInfer,
+          kind: 'other',
+          applyIoCap: false,
+          handler: (_) async {
+            observedDynamicSummaries.add(
+              stepPcb.memory.ephemeralSegment.dynamicContextSummary,
+            );
+            callIdx += 1;
+            if (callIdx < 10) {
+              return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+                'content': '',
+                'toolCalls': <Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'id': 'tc_$callIdx',
+                    'name': 'sys_read_lines',
+                    'arguments': const <String, dynamic>{'path': '/workspace/a.dart'},
+                  },
+                ],
+              });
+            }
+            return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'content': 'Wrapped up before limit.',
+              'toolCalls': <Map<String, dynamic>>[],
+            });
+          },
+        ),
+      );
+      stepGate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_read_lines',
+          requiredRight: CapRight.read,
+          kind: 'read',
+          handler: (_) async => const SyscallResult<Map<String, dynamic>>.success(
+            <String, dynamic>{'content': 'ok'},
+          ),
+        ),
+      );
+
+      final stepAgent = LeadAgent(
+        pcb: stepPcb,
+        syscallGate: stepGate,
+        capHandle: const CapHandle('cap_workspace_rw'),
+        modelResolver: modelResolver,
+        maxStepsPerTurn: 10,
+      );
+      addTearDown(stepAgent.dispose);
+
+      final stepRes = await stepAgent.runTurn(userInput: 'Do 10 steps');
+      expect(stepRes.ok, isTrue);
+      expect(stepRes.finalText, equals('Wrapped up before limit.'));
+      expect(observedDynamicSummaries.length, equals(10));
+      for (var i = 0; i < 9; i++) {
+        expect(observedDynamicSummaries[i], isNull);
+      }
+      expect(
+        observedDynamicSummaries[9],
+        contains('[Runtime Budget Warning] Approaching turn execution limit (steps: 9/10, syscalls: 18/100).'),
+      );
+      expect(stepPcb.memory.ephemeralSegment.dynamicContextSummary, isNull);
+      expect(
+        stepPcb.memory.systemSegment.pinned.instruction,
+        equals(initialPinned.instruction),
+      );
+      expect(
+        stepPcb.memory.historySegment.turns
+            .whereType<CanonicalUserTurn>()
+            .any((t) => t.text.contains('[Runtime Budget Warning]')),
+        isFalse,
+      );
+
+      // Case B: Syscall threshold (maxStepsPerTurn = 64, maxSyscallCountPerTurn = 10).
+      final syscallPcb = ProcessControlBlock(
+        pid: 1,
+        name: 'lead-agent',
+        ring: ProtectionRing.ring2,
+        cspace: CapabilityTable.stage1LeadAgent(),
+        quota: const ResourceQuota(
+          maxChildProcesses: 0,
+          maxSyscallCountPerTurn: 10,
+        ),
+        namespace: pcb.namespace,
+        memory: VirtualContextMemory(
+          sessionId: 'sess_loop_syscall',
+          systemInstruction: initialPinned,
+        ),
+      );
+      final syscallTable = KernelProcessTable()..registerProcess(syscallPcb);
+      final syscallGate2 = SyscallGate(
+        processTable: syscallTable,
+        approvalGate: ApprovalGate(handler: PolicyApprovalHandler.alwaysAllow()),
+        ioCapper: IoPayloadCapper(
+          workspaceHostRoot: tempRoot.path,
+          config: const IoCapConfig(),
+        ),
+        auditLogger: auditLogger,
+      );
+      final syscallSummaries = <String?>[];
+      var syscallStep = 0;
+      syscallGate2.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_llm_chat',
+          requiredRight: CapRight.llmInfer,
+          kind: 'other',
+          applyIoCap: false,
+          handler: (_) async {
+            syscallSummaries.add(
+              syscallPcb.memory.ephemeralSegment.dynamicContextSummary,
+            );
+            syscallStep += 1;
+            if (syscallStep == 1) {
+              // 1 llm_chat + 8 read_lines = 9/10 syscalls (90% >= 85%).
+              return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+                'content': '',
+                'toolCalls': List<Map<String, dynamic>>.generate(
+                  8,
+                  (i) => <String, dynamic>{
+                    'id': 'sc_$i',
+                    'name': 'sys_read_lines',
+                    'arguments': const <String, dynamic>{'path': '/workspace/a.dart'},
+                  },
+                ),
+              });
+            }
+            return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'content': 'Done after syscall warning.',
+              'toolCalls': <Map<String, dynamic>>[],
+            });
+          },
+        ),
+      );
+      syscallGate2.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_read_lines',
+          requiredRight: CapRight.read,
+          kind: 'read',
+          handler: (_) async => const SyscallResult<Map<String, dynamic>>.success(
+            <String, dynamic>{'content': 'ok'},
+          ),
+        ),
+      );
+
+      final syscallAgent = LeadAgent(
+        pcb: syscallPcb,
+        syscallGate: syscallGate2,
+        capHandle: const CapHandle('cap_workspace_rw'),
+        modelResolver: modelResolver,
+      );
+      addTearDown(syscallAgent.dispose);
+
+      final syscallRes = await syscallAgent.runTurn(userInput: 'Burst syscalls');
+      expect(syscallRes.ok, isTrue);
+      expect(syscallSummaries.length, equals(2));
+      expect(syscallSummaries[0], isNull);
+      expect(
+        syscallSummaries[1],
+        contains('[Runtime Budget Warning] Approaching turn execution limit (steps: 1/64, syscalls: 9/10).'),
+      );
+      expect(syscallPcb.memory.ephemeralSegment.dynamicContextSummary, isNull);
+    });
   });
 }

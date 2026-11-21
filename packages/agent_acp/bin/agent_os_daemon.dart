@@ -49,8 +49,13 @@ Future<void> _runDaemon(List<String> args) async {
     )
     ..addOption(
       'max-steps',
-      defaultsTo: '32',
+      defaultsTo: '64',
       help: 'Maximum ReAct steps per turn.',
+    )
+    ..addOption(
+      'max-syscalls',
+      help:
+          'Maximum total syscalls per LeadAgent turn (positive integer; defaults to max(256, maxSteps * 8)).',
     )
     ..addMultiOption(
       'skills-dir',
@@ -91,11 +96,22 @@ Future<void> _runDaemon(List<String> args) async {
     return;
   }
 
-  final maxSteps = int.tryParse(parsed.option('max-steps') ?? '32');
+  final maxSteps = int.tryParse(parsed.option('max-steps') ?? '64');
   if (maxSteps == null || maxSteps < 1) {
     stderr.writeln('Invalid --max-steps: ${parsed.option('max-steps')}');
     exitCode = 64;
     return;
+  }
+
+  int? maxSyscalls;
+  final rawMaxSyscalls = parsed.option('max-syscalls');
+  if (rawMaxSyscalls != null && rawMaxSyscalls.trim().isNotEmpty) {
+    maxSyscalls = int.tryParse(rawMaxSyscalls.trim());
+    if (maxSyscalls == null || maxSyscalls < 1) {
+      stderr.writeln('Invalid --max-syscalls: $rawMaxSyscalls');
+      exitCode = 64;
+      return;
+    }
   }
 
   final startupModel = parsed.option('model');
@@ -183,6 +199,7 @@ Future<void> _runDaemon(List<String> args) async {
       ollamaCloudBaseUrl: parsed.option('ollama-cloud-url'),
       openRouterBaseUrl: parsed.option('openrouter-url'),
       maxStepsPerTurn: maxSteps,
+      maxSyscallsPerTurn: maxSyscalls,
       skillsDirs: skillsDirs,
       skillsDirEnv: Platform.environment['AGENT_OS_SKILLS_DIR'],
       maxContextTokens: maxContextTokens,

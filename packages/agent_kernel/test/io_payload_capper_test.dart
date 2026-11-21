@@ -160,5 +160,52 @@ void main() {
       expect(cappedExec.payload['truncatedStderr'], isFalse);
       expect(cappedExec.payload['stderr'], equals('small error'));
     });
+
+    test('capStructuredPayload enforces maxUtf8Bytes on List<Map> even when length <= headLines', () async {
+      final largeList = List<Map<String, dynamic>>.generate(
+        5,
+        (i) => <String, dynamic>{
+          'title': 'Result $i',
+          'url': 'https://example.com/$i',
+          'content': 'x' * 50000,
+        },
+      );
+      final originalJsonBytes = utf8.encode(jsonEncode(largeList)).length;
+
+      final res = await capper.capStructuredPayload(
+        payload: <String, dynamic>{
+          'query': 'large search',
+          'results': largeList,
+        },
+        textFields: const <String>['results'],
+        sessionId: 'sess_list_bytes',
+        syscallSeq: 12,
+        syscallName: 'sys_web_search',
+      );
+
+      expect(res.truncated, isTrue);
+      expect(res.payload['truncated'], isTrue);
+      expect(res.payload['originalCount'], equals(5));
+      expect(res.payload['spillPath'], equals('/workspace/.agent_os/io_spill/sess_list_bytes/12_sys_web_search.txt'));
+
+      final retained = res.payload['results'] as List<dynamic>;
+      expect(retained, isNotEmpty);
+      final retainedJsonBytes = utf8.encode(jsonEncode(retained)).length;
+      expect(retainedJsonBytes, lessThanOrEqualTo(capper.config.maxUtf8Bytes));
+
+      expect(res.payload['originalBytes'], equals(originalJsonBytes));
+      expect(
+        res.payload['omittedBytes'],
+        equals(originalJsonBytes - retainedJsonBytes),
+      );
+      expect(
+        res.payload['omittedCount'],
+        equals(5 - retained.length),
+      );
+      expect(
+        res.payload['capNotice'],
+        contains('(${originalJsonBytes - retainedJsonBytes} bytes)'),
+      );
+    });
   });
 }

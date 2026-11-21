@@ -42,6 +42,7 @@ class KanbanCliRunner {
     String? model,
     String? ollamaUrl,
     int? maxSteps,
+    int? maxSyscalls,
     List<String> skillsDirs = const <String>[],
   }) {
     final extraArgs = <String>[
@@ -54,6 +55,7 @@ class KanbanCliRunner {
         ollamaUrl.trim(),
       ],
       if (maxSteps != null) ...<String>['--max-steps', '$maxSteps'],
+      if (maxSyscalls != null) ...<String>['--max-syscalls', '$maxSyscalls'],
       for (final dir in skillsDirs)
         if (dir.trim().isNotEmpty) ...<String>['--skills-dir', dir.trim()],
     ];
@@ -134,8 +136,13 @@ class KanbanCliRunner {
       )
       ..addOption(
         'max-steps',
-        defaultsTo: '32',
+        defaultsTo: '64',
         help: 'Maximum ReAct steps per turn.',
+      )
+      ..addOption(
+        'max-syscalls',
+        help:
+            'Maximum total syscalls per LeadAgent turn (positive integer; defaults to max(256, maxSteps * 8)).',
       )
       ..addMultiOption(
         'skills-dir',
@@ -198,10 +205,20 @@ class KanbanCliRunner {
       return 64;
     }
 
-    final maxSteps = int.tryParse(parsed.option('max-steps') ?? '32');
+    final maxSteps = int.tryParse(parsed.option('max-steps') ?? '64');
     if (maxSteps == null || maxSteps < 1) {
       _err.writeln('Invalid --max-steps: ${parsed.option('max-steps')}');
       return 64;
+    }
+
+    int? maxSyscalls;
+    final rawMaxSyscalls = parsed.option('max-syscalls');
+    if (rawMaxSyscalls != null && rawMaxSyscalls.trim().isNotEmpty) {
+      maxSyscalls = int.tryParse(rawMaxSyscalls.trim());
+      if (maxSyscalls == null || maxSyscalls < 1) {
+        _err.writeln('Invalid --max-syscalls: $rawMaxSyscalls');
+        return 64;
+      }
     }
 
     int? maxContextTokens;
@@ -240,6 +257,7 @@ class KanbanCliRunner {
       model: startupModel,
       ollamaUrl: ollamaUrl,
       maxSteps: maxSteps,
+      maxSyscalls: maxSyscalls,
       skillsDirs: skillsDirs,
     );
     if (launchSpec == null) {
