@@ -532,9 +532,11 @@ class SyscallGate {
             cancelToken: context.cancelToken,
           );
         } finally {
-          pcb.state = prevState == ProcessState.ready
-              ? ProcessState.running
-              : prevState;
+          if (pcb.state == ProcessState.waitingApproval) {
+            pcb.state = prevState == ProcessState.ready
+                ? ProcessState.running
+                : prevState;
+          }
         }
 
         if (approvalDecision.cancelled) {
@@ -604,8 +606,12 @@ class SyscallGate {
           ),
         );
       } finally {
-        pcb.state =
-            prevState == ProcessState.ready ? ProcessState.running : prevState;
+        // Restore only our temporary wait state. sys_exit or a concurrent
+        // signal may have terminated or stopped the process while awaiting.
+        if (pcb.state == ProcessState.waitingSyscall) {
+          pcb.state =
+              prevState == ProcessState.ready ? ProcessState.running : prevState;
+        }
       }
 
       if (!result.ok && result.error != null) {

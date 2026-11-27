@@ -300,6 +300,116 @@ void main() {
       );
     });
 
+    test(
+      'releases process slots across repeated normal child exits (issue #2)',
+      () async {
+        final exits = _ChildExitObserver();
+        var childRequests = 0;
+        final bootstrap = KernelBootstrap.create(
+          KernelBootstrapConfig(
+            workspaceHostRoot: repoDir.path,
+            startupModel: 'local-ollama/gemma4:12b',
+            quota: ResourceQuota.stage2Default,
+            enableStage2Multiprocess: true,
+            childWorkerBackend: const IsolateChildWorkerBackend(),
+            contextWindowSource: _StaticWindowSource(32768),
+            hooks: <SyscallHook>[exits],
+            llmDrivers: <LlmProviderId, LlmDriver>{
+              LlmProviderId.localOllama: _RoutingFakeLlmDriver(
+                onRequest: (_) {
+                  childRequests += 1;
+                  // Exercise both explicit sys_exit and the implicit sys_exit
+                  // issued for a final text response.
+                  final explicitExit = childRequests.isOdd;
+                  return LlmChatResponse(
+                    content: explicitExit ? '' : 'Finished normally.',
+                    toolCalls: explicitExit
+                        ? <LlmToolCallSpec>[
+                            LlmToolCallSpec(
+                              id: 'exit',
+                              name: 'sys_exit',
+                              arguments: const <String, dynamic>{
+                                'exitCode': 0,
+                                'summary': 'Finished normally.',
+                              },
+                            ),
+                          ]
+                        : const <LlmToolCallSpec>[],
+                    usage: const LlmUsageTelemetry(
+                      promptTokens: 10,
+                      completionTokens: 5,
+                      durationMs: 1,
+                    ),
+                  );
+                },
+              ),
+            },
+          ),
+        );
+        addTearDown(bootstrap.dispose);
+        final parentCtx = SyscallContext(
+          pid: 1,
+          capHandle: bootstrap.capHandle,
+          sessionId: bootstrap.sessionId,
+        );
+
+        // Exceed the process table's capacity cumulatively while keeping only
+        // one child alive at a time. A leaked PCB used to reject child #16.
+        final iterations = bootstrap.processTable.maxActiveProcesses + 4;
+        for (var i = 0; i < iterations; i++) {
+          final spawn = await bootstrap.syscallGate.invoke(
+            parentCtx,
+            SyscallRequest(
+              name: 'sys_spawn',
+              args: const <String, dynamic>{
+                'profile': 'explorer',
+                'taskPrompt': 'Finish immediately.',
+              },
+            ),
+          );
+          expect(spawn.ok, isTrue, reason: 'Child #${i + 1}: ${spawn.error}');
+          final pid = spawn.value!['childPid'] as int;
+          final wait = await bootstrap.syscallGate.invoke(
+            parentCtx,
+            SyscallRequest(
+              name: 'sys_wait',
+              args: <String, dynamic>{
+                'pids': <int>[pid],
+                'timeoutMs': 5000,
+              },
+            ),
+          );
+          expect(wait.ok, isTrue, reason: '${wait.error}');
+          final status = (wait.value!['children'] as List).single as Map;
+          expect(status['ok'], isTrue);
+          expect(status['reason'], 'EXITED_NORMALLY');
+          // sys_wait can observe completion before sys_exit unwinds through
+          // SyscallGate. Synchronize on Stage 6 rather than a timing delay.
+          await exits.observed(pid).timeout(const Duration(seconds: 5));
+          expect(
+            bootstrap.processTable.getProcess(pid)!.state,
+            ProcessState.terminated,
+          );
+          expect(bootstrap.pcb.quotaUsage.activeChildProcesses, 0);
+          expect(bootstrap.workerHost!.activeChildCount, 0);
+          expect(bootstrap.processTable.activeChildrenOf(1), isEmpty);
+          expect(
+            bootstrap.processTable.processes.values
+                .where((pcb) => pcb.state != ProcessState.terminated)
+                .map((pcb) => pcb.pid),
+            <int>[1],
+          );
+        }
+        expect(bootstrap.workerHost!.spawnedChildrenCount, iterations);
+        final reaped = await bootstrap.syscallGate.invoke(
+          parentCtx,
+          SyscallRequest(name: 'sys_wait'),
+        );
+        expect(reaped.ok, isTrue);
+        expect(reaped.value!['children'], isEmpty);
+      },
+    );
+
     test('enforces BoundedMailbox limits (32 -> MAILBOX_FULL recoverable, >64KiB -> EINVAL, sibling -> EPERM, control priority)', () async {
       final bootstrap = KernelBootstrap.create(
         KernelBootstrapConfig(
@@ -639,6 +749,26 @@ void main() {
       expect(cancelBootstrap.workerHost!.activeChildCount, equals(0));
     });
   });
+}
+
+class _ChildExitObserver extends BaseSyscallHook {
+  final Map<int, Completer<void>> _exits = <int, Completer<void>>{};
+
+  @override
+  String get name => 'child_exit_observer';
+
+  Future<void> observed(int pid) =>
+      _exits.putIfAbsent(pid, Completer<void>.new).future;
+
+  @override
+  Future<void> afterSyscall(
+    SyscallHookContext context,
+    SyscallResult<Map<String, dynamic>> result,
+  ) async {
+    if (context.syscallName == 'sys_exit' && result.ok) {
+      _exits.putIfAbsent(context.pid, Completer<void>.new).complete();
+    }
+  }
 }
 
 class _StaticWindowSource implements ContextWindowSource {
