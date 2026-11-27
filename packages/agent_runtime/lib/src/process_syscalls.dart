@@ -189,10 +189,22 @@ List<SyscallDefinition> buildProcessSyscallDefinitions({
             taskIds.add(entry['logicalTaskId']);
           }
         }
+        final running = result.value!['running'];
+        final runningPids = <Object?>[];
+        if (running is List) {
+          for (final entry in running) {
+            if (entry is Map) {
+              runningPids.add(entry['pid']);
+            }
+          }
+        }
         return <String, dynamic>{
           'childCount': children.length,
           'pids': pids,
           'logicalTaskIds': taskIds,
+          'timedOut': result.value!['timedOut'] == true,
+          'runningCount': running is List ? running.length : 0,
+          'runningPids': runningPids,
         };
       },
       handler: (exec) {
@@ -380,7 +392,7 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
               'conflict_resolver',
             ],
             'description':
-                'Sandbox profile: "explorer" (read-only /workspace), "web_researcher" (sterile public web), "workspace_worker" (isolated jj workspace editing & dart test/analyze), or "conflict_resolver" (isolated jj conflict resolution).',
+                'Sandbox profile: "explorer" (read-only /workspace), "web_researcher" (sterile public web), "workspace_worker" (isolated jj workspace editing & allowlisted sys_exec commands), or "conflict_resolver" (isolated jj conflict resolution).',
           },
           'taskPrompt': <String, dynamic>{
             'type': 'string',
@@ -422,11 +434,16 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
           },
           'maxWallTimeMs': <String, dynamic>{
             'type': 'integer',
-            'description': 'Wall-clock time limit in ms (default 90000, max 300000).',
+            'description': 'Wall-clock time limit in ms (default 600000, max 3600000).',
           },
           'maxSteps': <String, dynamic>{
             'type': 'integer',
-            'description': 'Maximum ReAct steps for the child (default 16, max 32).',
+            'description': 'Maximum ReAct steps for the child (default 32, max 128).',
+          },
+          'heartbeatTimeoutMs': <String, dynamic>{
+            'type': 'integer',
+            'description':
+                'No-progress heartbeat stall timeout in ms (default 300000, max 600000; paused during SIGSTOP).',
           },
           'requestedRights': <String, dynamic>{
             'type': 'array',
@@ -460,7 +477,7 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
     SyscallToolSchema(
       name: 'sys_wait',
       description:
-          'Wait for spawned Ring 3 child processes to finish and collect their concise exit summaries without importing raw child context.',
+          'Wait for spawned Ring 3 child processes to finish and collect their concise exit summaries without importing raw child context. Non-destructive on timeout: unfinished children continue running and are returned with live heartbeat snapshots in "running" alongside "timedOut": true so you can re-wait or send sys_kill.',
       parametersJsonSchema: const <String, dynamic>{
         'type': 'object',
         'properties': <String, dynamic>{
@@ -472,7 +489,7 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
           },
           'timeoutMs': <String, dynamic>{
             'type': 'integer',
-            'description': 'Maximum wait time in ms (default 120000, max 300000).',
+            'description': 'Maximum wait time in ms (default 120000, max 600000).',
           },
         },
       },
@@ -693,6 +710,19 @@ SyscallError? _validateSpawnArgs(Map<String, dynamic> args) {
       recoverable: true,
     );
   }
+  final heartbeatTimeoutMs = args['heartbeatTimeoutMs'];
+  if (heartbeatTimeoutMs != null &&
+      (heartbeatTimeoutMs is! int ||
+          heartbeatTimeoutMs <= 0 ||
+          heartbeatTimeoutMs > SpawnSpec.maxAllowedHeartbeatTimeoutMs)) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_QUOTA_ARG',
+      message:
+          'Argument "heartbeatTimeoutMs" must be an integer between 1 and ${SpawnSpec.maxAllowedHeartbeatTimeoutMs}.',
+      recoverable: true,
+    );
+  }
   final maxTotalSyscalls = args['maxTotalSyscalls'];
   if (maxTotalSyscalls != null &&
       (maxTotalSyscalls is! int || maxTotalSyscalls <= 0)) {
@@ -819,6 +849,8 @@ SyscallResult<SpawnSpec> _parseSpawnSpec(Map<String, dynamic> args) {
       maxWallTimeMs:
           (args['maxWallTimeMs'] as int?) ?? SpawnSpec.defaultMaxWallTimeMs,
       maxSteps: (args['maxSteps'] as int?) ?? SpawnSpec.defaultMaxSteps,
+      heartbeatTimeoutMs: (args['heartbeatTimeoutMs'] as int?) ??
+          SpawnSpec.defaultHeartbeatTimeoutMs,
       requestedRights: requestedRights,
       baseChangeId: (args['baseChangeId'] as String?)?.trim(),
       logicalTaskId: (args['logicalTaskId'] as String?)?.trim(),
@@ -890,11 +922,11 @@ SyscallError? _validateWaitArgs(Map<String, dynamic> args) {
   }
   final timeoutMs = args['timeoutMs'];
   if (timeoutMs != null &&
-      (timeoutMs is! int || timeoutMs <= 0 || timeoutMs > 300000)) {
+      (timeoutMs is! int || timeoutMs <= 0 || timeoutMs > 600000)) {
     return const SyscallError(
       code: SyscallErrorCode.einval,
       reason: 'INVALID_ARGS',
-      message: 'Argument "timeoutMs" must be an integer between 1 and 300000.',
+      message: 'Argument "timeoutMs" must be an integer between 1 and 600000.',
       recoverable: true,
     );
   }

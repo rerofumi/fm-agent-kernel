@@ -262,6 +262,80 @@ void main() {
         ),
       );
     });
+
+    test('injects prompt_cache_key for non-empty sessionUuid across normal and reasoning models, and omits when blank [D-605]', () {
+      final driver = OpenAiDriver(apiKey: 'sk-test');
+      addTearDown(driver.close);
+
+      // Normal model with non-empty sessionUuid
+      final normalBody = driver.buildRequestBody(
+        LlmChatRequest(
+          sessionId: 's1',
+          sessionUuid: 'openai-session-uuid-1',
+          model: const ModelIdentifier(
+            provider: LlmProviderId.openai,
+            modelName: 'gpt-4o-mini',
+          ),
+          prompt: _simplePrompt(),
+          temperature: 0.4,
+          maxTokens: 300,
+        ),
+      );
+      expect(normalBody['prompt_cache_key'], equals('openai-session-uuid-1'));
+      expect(normalBody['temperature'], equals(0.4));
+      expect(normalBody['max_tokens'], equals(300));
+      expect(normalBody.containsKey('max_completion_tokens'), isFalse);
+
+      // Reasoning model with non-empty sessionUuid
+      final reasoningBody = driver.buildRequestBody(
+        LlmChatRequest(
+          sessionId: 's1',
+          sessionUuid: 'openai-session-uuid-2',
+          model: const ModelIdentifier(
+            provider: LlmProviderId.openai,
+            modelName: 'gpt-5-mini',
+          ),
+          prompt: _simplePrompt(),
+          temperature: 0.7,
+          maxTokens: 1024,
+        ),
+      );
+      expect(reasoningBody['prompt_cache_key'], equals('openai-session-uuid-2'));
+      expect(reasoningBody.containsKey('temperature'), isFalse);
+      expect(reasoningBody.containsKey('max_tokens'), isFalse);
+      expect(reasoningBody['max_completion_tokens'], equals(1024));
+
+      // Empty and whitespace-only sessionUuid must omit prompt_cache_key
+      for (final blankUuid in const <String>['', '   ']) {
+        final blankNormal = driver.buildRequestBody(
+          LlmChatRequest(
+            sessionId: 's1',
+            sessionUuid: blankUuid,
+            model: const ModelIdentifier(
+              provider: LlmProviderId.openai,
+              modelName: 'gpt-4o-mini',
+            ),
+            prompt: _simplePrompt(),
+          ),
+        );
+        expect(blankNormal.containsKey('prompt_cache_key'), isFalse);
+
+        final blankReasoning = driver.buildRequestBody(
+          LlmChatRequest(
+            sessionId: 's1',
+            sessionUuid: blankUuid,
+            model: const ModelIdentifier(
+              provider: LlmProviderId.openai,
+              modelName: 'gpt-5-mini',
+            ),
+            prompt: _simplePrompt(),
+            maxTokens: 512,
+          ),
+        );
+        expect(blankReasoning.containsKey('prompt_cache_key'), isFalse);
+        expect(blankReasoning['max_completion_tokens'], equals(512));
+      }
+    });
   });
 
   group('GeminiDriver [D-402], [D-404]', () {
@@ -650,6 +724,144 @@ void main() {
       final echoMsgs = client.requests.last.jsonBody['messages'] as List;
       expect(echoMsgs.last['reasoning_content'], equals('Step 1. '));
       expect(echoMsgs.last['reasoning_details'], isA<List<dynamic>>());
+    });
+
+    test('injects x-session-id, session_id, and top-level cache_control per GatewayExplicitCachePolicy [D-603]', () async {
+      final client = _MockHttpClient((req, body) async {
+        return _sseResponse(<String>[
+          'data: ${jsonEncode(<String, dynamic>{
+                'choices': <Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'delta': <String, dynamic>{
+                      'reasoning_content': 'Part1 ',
+                      'reasoning_details': <Map<String, dynamic>>[
+                        <String, dynamic>{
+                          'index': 0,
+                          'type': 'reasoning.summary',
+                          'summary': 'Sum1 ',
+                        },
+                      ],
+                    },
+                  },
+                ],
+              })}',
+          'data: ${jsonEncode(<String, dynamic>{
+                'choices': <Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'delta': <String, dynamic>{
+                      'reasoning_content': 'Part2',
+                      'reasoning_details': <Map<String, dynamic>>[
+                        <String, dynamic>{
+                          'index': 0,
+                          'type': 'reasoning.summary',
+                          'summary': 'Sum2',
+                        },
+                      ],
+                      'content': 'OK',
+                    },
+                    'finish_reason': 'stop',
+                  },
+                ],
+              })}',
+        ]);
+      });
+
+      final driver = NousPortalDriver(
+        apiKey: 'nous-secret-key',
+        httpClient: client,
+      );
+
+      // 1) anthropic/claude-haiku-4.5 -> x-session-id + session_id + top-level cache_control
+      final anthropicDone = await _collectDone(
+        driver.chatStream(
+          LlmChatRequest(
+            sessionId: 's_nous',
+            sessionUuid: 'nous-sticky-uuid-1',
+            model: const ModelIdentifier(
+              provider: LlmProviderId.nousPortal,
+              modelName: 'anthropic/claude-haiku-4.5',
+            ),
+            prompt: _simplePrompt(),
+          ),
+        ),
+      );
+      final anthropicReq = client.requests.last;
+      expect(anthropicReq.headers['x-session-id'], equals('nous-sticky-uuid-1'));
+      expect(anthropicReq.jsonBody['session_id'], equals('nous-sticky-uuid-1'));
+      expect(
+        anthropicReq.jsonBody['cache_control'],
+        equals(<String, dynamic>{'type': 'ephemeral'}),
+      );
+      for (final m in anthropicReq.jsonBody['messages'] as List<dynamic>) {
+        expect((m as Map<String, dynamic>)['content'], isA<String>());
+      }
+      // Verify normalized reasoning_details alongside reasoning_content ([D-604] compat)
+      final rawMap = anthropicDone.rawReasoningDetails as Map<String, dynamic>;
+      expect(rawMap['reasoning_content'], equals('Part1 Part2'));
+      expect(
+        rawMap['reasoning_details'],
+        equals(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'index': 0,
+            'type': 'reasoning.summary',
+            'summary': 'Sum1 Sum2',
+          },
+        ]),
+      );
+
+      // 2) qwen/qwen3-coder-flash -> top-level cache_control
+      final qwenReq = LlmChatRequest(
+        sessionId: 's_nous',
+        sessionUuid: 'nous-sticky-uuid-2',
+        model: const ModelIdentifier(
+          provider: LlmProviderId.nousPortal,
+          modelName: 'qwen/qwen3-coder-flash',
+        ),
+        prompt: _simplePrompt(),
+      );
+      final qwenBody = driver.buildRequestBody(qwenReq);
+      expect(qwenBody['session_id'], equals('nous-sticky-uuid-2'));
+      expect(
+        qwenBody['cache_control'],
+        equals(<String, dynamic>{'type': 'ephemeral'}),
+      );
+
+      // 3) deepseek/deepseek-v3.2 -> NO cache_control, keeps Sticky Session
+      final deepseekReq = LlmChatRequest(
+        sessionId: 's_nous',
+        sessionUuid: 'nous-sticky-uuid-3',
+        model: const ModelIdentifier(
+          provider: LlmProviderId.nousPortal,
+          modelName: 'deepseek/deepseek-v3.2',
+        ),
+        prompt: _simplePrompt(),
+      );
+      final deepseekHeaders = driver.buildHeaders(deepseekReq, apiKey: 'k');
+      final deepseekBody = driver.buildRequestBody(deepseekReq);
+      expect(deepseekHeaders['x-session-id'], equals('nous-sticky-uuid-3'));
+      expect(deepseekBody['session_id'], equals('nous-sticky-uuid-3'));
+      expect(deepseekBody.containsKey('cache_control'), isFalse);
+
+      // 4) Empty / whitespace sessionUuid omits x-session-id and session_id
+      for (final blankUuid in const <String>['', '   ']) {
+        final blankReq = LlmChatRequest(
+          sessionId: 's_nous',
+          sessionUuid: blankUuid,
+          model: const ModelIdentifier(
+            provider: LlmProviderId.nousPortal,
+            modelName: 'anthropic/claude-haiku-4.5',
+          ),
+          prompt: _simplePrompt(),
+        );
+        final blankHeaders = driver.buildHeaders(blankReq, apiKey: 'k');
+        final blankBody = driver.buildRequestBody(blankReq);
+        expect(blankHeaders.containsKey('x-session-id'), isFalse);
+        expect(blankBody.containsKey('session_id'), isFalse);
+        expect(
+          blankBody['cache_control'],
+          equals(<String, dynamic>{'type': 'ephemeral'}),
+        );
+      }
     });
   });
 

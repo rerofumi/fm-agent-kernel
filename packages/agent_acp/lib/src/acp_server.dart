@@ -51,6 +51,7 @@ class AcpServerConfig {
     this.nousPortalBaseUrl,
     this.openAiCompatBaseUrl,
     this.modelPolicy,
+    this.execPolicy,
     this.modelCatalogService,
     this.maxStepsPerTurn = 64,
     this.maxSyscallsPerTurn,
@@ -74,6 +75,9 @@ class AcpServerConfig {
 
   /// Optional explicit [ModelPolicy] override (primarily for tests, [D-410]).
   final ModelPolicy? modelPolicy;
+
+  /// Optional explicit [ExecPolicyConfig] override (primarily for tests, [D-510]).
+  final ExecPolicyConfig? execPolicy;
 
   /// Optional shared [ModelCatalogService] instance ([D-409], [D-410]).
   final ModelCatalogService? modelCatalogService;
@@ -419,6 +423,7 @@ class AcpServer {
       nousPortalBaseUrl: config.nousPortalBaseUrl,
       openAiCompatBaseUrl: config.openAiCompatBaseUrl,
       modelPolicy: effectivePolicy,
+      execPolicy: config.execPolicy,
       quota: leadQuota,
       enableStage2Multiprocess: true,
       enableStage3Team: true,

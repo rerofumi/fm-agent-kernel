@@ -1,6 +1,6 @@
 # Cheatsheet Links — 外部一次資料・出典台帳
 
-すべての URL は記載の確認日（`2026-11-19`〜`2026-11-21`）時点で最終到達先（HTTP `200 OK`）を実確認済みの正規 URL である。ローカル実測のみの項目には架空 URL を付与せず、各トピック本文にコマンドと観測結果を記録している。
+すべての URL は記載の確認日（`2026-11-19`〜`2026-11-28`）時点で最終到達先（HTTP `200 OK`）を実確認済みの正規 URL である。ローカル実測のみの項目には架空 URL を付与せず、各トピック本文にコマンドと観測結果を記録している。
 
 ## 1. Dart SDK・Pub Workspaces・Windows FFI
 
@@ -30,9 +30,9 @@
 | https://docs.ollama.com/cloud | 公式ドキュメント | `2026-11-19` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | Ollama Cloud エンドポイント（`https://ollama.com/api/chat`, `https://ollama.com/v1`）と `OLLAMA_API_KEY` Bearer 認証の確認 |
 | https://docs.ollama.com/api/openai-compatibility | 公式ドキュメント | `2026-11-19` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | Ollama `/v1/chat/completions` の対応パラメータ（`tools`, `stream_options`）の確認 |
 | https://docs.ollama.com/capabilities/tool-calling | 公式ドキュメント | `2026-11-19` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | Ollama における Tool Calling（ストリーミング併用・`role: "tool"` 応答形式）の確認 |
-| https://openrouter.ai/docs/guides/best-practices/prompt-caching | 公式ドキュメント | `2026-11-19` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | OpenRouter の Prompt Caching、Provider Sticky Routing（`session_id` / `x-session-id`）、Anthropic `cache_control` 要否の確認 |
+| https://openrouter.ai/docs/guides/best-practices/prompt-caching | 公式ドキュメント | `2026-11-28` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | OpenRouter の Prompt Caching、Provider Sticky Routing（`session_id` / `x-session-id`）、トップレベル・ブロック単位 `cache_control` 仕様の確認 |
 | https://openrouter.ai/docs/cookbook/administration/usage-accounting | 公式ドキュメント | `2026-11-19` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | OpenRouter `usage` オブジェクト（`cached_tokens`, `cache_write_tokens`, `cache_discount`, `cost`）の自動返却仕様確認 |
-| https://openrouter.ai/docs/guides/best-practices/reasoning-tokens | 公式ドキュメント | `2026-11-19` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | Gemini 3 `thought_signature` / Anthropic Thinking 等の `reasoning_details` 保存要件とモデル切替時の扱い確認 |
+| https://openrouter.ai/docs/guides/best-practices/reasoning-tokens | 公式ドキュメント | `2026-11-28` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | `reasoning_details`（`reasoning.text` / `reasoning.summary` / `reasoning.encrypted`、`signature` / `data`）の SSE 構造・保存要件とモデル切替時の扱い確認 |
 
 ## 4. ACP (Agent Client Protocol)
 
@@ -90,7 +90,8 @@
 | https://ai.google.dev/api/models | 公式 API リファレンス | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini `GET /v1beta/models` の `inputTokenLimit`, `outputTokenLimit`, `supportedGenerationMethods` 仕様確認 |
 | https://ai.google.dev/gemini-api/docs/openai | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini OpenAI 互換エンドポイント（`/v1beta/openai/`）、Bearer 認証、`extra_content` / `cached_tokens` 挙動の確認 |
 | https://ai.google.dev/gemini-api/docs/thought-signatures | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | `thoughtSignature`（ネイティブ）および `extra_content.google.thought_signature`（OpenAI 互換）のマルチターン必須エコーバック要件の確認 |
-| https://ai.google.dev/gemini-api/docs/caching | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Gemini 暗黙的・明示的コンテキストキャッシュと `usageMetadata.cachedContentTokenCount` の確認 |
+| https://ai.google.dev/api/caching | 公式 API リファレンス | `2026-11-28` | [llm_providers_and_cache.md](./llm_providers_and_cache.md) | Gemini `v1beta/cachedContents` の REST API（`POST` 作成・`PATCH` TTL 延長・`DELETE` 削除、`x-goog-api-key` 認証、重複指定禁止制約）の確認 |
+| https://ai.google.dev/gemini-api/docs/caching | 公式ドキュメント | `2026-11-28` | [llm_providers_extended.md](./llm_providers_extended.md), [llm_providers_and_cache.md](./llm_providers_and_cache.md) | Gemini 暗黙的・明示的コンテキストキャッシュと `usageMetadata.cachedContentTokenCount`・最小トークン閾値の確認 |
 | https://portal.nousresearch.com/ | 公式ポータル | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Nous Research Portal（API キー発行、`inference-api.nousresearch.com/v1` の起点）の確認 |
 | https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | `llama-server` の `/v1/models` (`meta.n_ctx_train`)、`/props` (`default_generation_settings.n_ctx`)、`timings.cache_n` / `cached_tokens` 仕様の確認 |
 | https://stratallm.org/ | 公式ドキュメント | `2026-11-21` | [llm_providers_extended.md](./llm_providers_extended.md) | Strata ローカル LLM サーバーの既定 URL（`http://127.0.0.1:8080/v1`）、OpenAI / Anthropic 互換エンドポイント、ダミー API キー接続の確認 |

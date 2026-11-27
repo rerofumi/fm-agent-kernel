@@ -1,6 +1,6 @@
 # 3 LLM プロバイダ仕様・KV キャッシュ監視・モデル切替互換性
 
-- **確認日**: `2026-11-19`（Stage 1 `WP-4` / `WP-9` / `AT-01` 実機検証結果を追記反映）
+- **確認日**: `2026-11-28`（Stage 1 `WP-4`/`WP-9`/`AT-01` 実機検証結果に続き、`plan_20261128_prompt_cache_improve` `PT-02` として Gemini `v1beta/cachedContents`・OpenRouter/Nous Portal `cache_control` 互換性・`reasoning_details` SSE 構造の実機検証結果を追記）
 - **対象プロバイダ**:
   1. **Local Ollama**: `ollama 0.40.16`（`http://localhost:11434` および `http://192.168.0.5:11434/v1` → `/api/chat` 正規化 — **実機 API・Tool Call・KV キャッシュ上昇確認済み**）
   2. **Ollama Cloud**: `https://ollama.com`（`OLLAMA_API_KEY` 設定環境にて `gpt-oss:120b` で **実機 API・Tool Call・連続ターン `prompt_eval_cached_count` 上昇確認済み**）
@@ -123,3 +123,80 @@
 > **残る運用上の注意**:
 > - 短プロンプト（1,024〜2,048 tokens 未満）時は OpenRouter 側仕様により `cached_tokens: 0` のままとなる（実機でも小規模リポジトリ単発ターンでは `0`、Prefix 2,048 tokens 以上では一貫して上昇することを確認）。
 > - OpenRouter / Ollama Cloud を別リポジトリ（`--cwd <target_repo>`）で運用する場合は、子デーモンが `<target_repo>` で起動されるため、プロセス環境変数または `<target_repo>/.agent_os/.env` へ API キーを設定すること。
+
+---
+
+## 6. Google AI Studio Gemini `v1beta/cachedContents` 明示的 Context Caching（`2026-11-28` 検証）
+
+Google AI Studio の暗黙的キャッシュ（Implicit Caching）は完全一致 Prefix でもサーバー分散により `cachedContentTokenCount: null` が頻発するため、安定したキャッシュヒットが必要な場合は明示的 Context Caching（`cachedContents`）を使用する。
+
+### 6.1 外部一次資料の事実
+- **出典**: Google AI for Developers 公式ドキュメント（`https://ai.google.dev/api/caching` [リダイレクト先 `https://aistudio.google.com/api-reference/caching`], `https://ai.google.dev/gemini-api/docs/caching` [リダイレクト先 `https://aistudio.google.com/docs/caching`]、確認日 `2026-11-28`）。
+- **主要エンドポイント（認証は `x-goog-api-key: <GEMINI_API_KEY>` ヘッダのみ使用、`?key=` 禁止）**:
+  - 作成: `POST https://generativelanguage.googleapis.com/v1beta/cachedContents`
+  - 期限延長: `PATCH https://generativelanguage.googleapis.com/v1beta/{name}`（更新可能フィールドは `ttl` / `expireTime` のみ、キャッシュ本体は変更不可）
+  - 削除: `DELETE https://generativelanguage.googleapis.com/v1beta/{name}`
+- **TTL と課金**: `ttl` は `"300s"` 等の秒サフィックス文字列、または RFC 3339 `expireTime`（省略時既定 60 分）。トークン数 × 保持時間のストレージ課金が発生するため、セッション終了・破棄時の明示 `DELETE` が推奨される。
+
+### 6.2 実機 API 観測結果（`2026-11-28`, `GEMINI_API_KEY` 使用）
+`.agent_os/.env` の `GEMINI_API_KEY`（`x-goog-api-key` ヘッダ認証）を用いて最小リクエストで以下を実測確認した（作成キャッシュは全件テスト終了時に `DELETE` 済み）。
+
+| 確認項目 | 実行条件・リクエスト | 実測結果 |
+| --- | --- | --- |
+| **`contents` なしでの作成可否** | `systemInstruction` + `tools`（`functionDeclarations`）のみ、`contents` フィールド完全省略、`ttl: "300s"` | **`HTTP 200` で作成成功**（`gemini-2.5-flash` `totalTokenCount: 1148 / 2478`、`gemini-2.5-pro` `totalTokenCount: 2478`）。ダミー `contents` は不要。 |
+| **最小トークン閾値（実測）** | 短プロンプトで `POST /v1beta/cachedContents` を送信しエラーの `min_total_token_count` を確認 | - `models/gemini-2.5-flash`: **`1,024` tokens**（426 tokens → `400 min_total_token_count=1024`、1,148 tokens → `200`）<br>- `models/gemini-2.5-pro`: **`2,048` tokens**（4 tokens → `400 min_total_token_count=2048`、2,478 tokens → `200`）<br>- `models/gemini-3-flash-preview`: **`1,024` tokens**（4 tokens → `400 min_total_token_count=1024`）<br>（※一部ドキュメントに 2,048 と記載があるが、実機 Flash 系は `1,024` で受理） |
+| **生成時の重複指定制約** | `:streamGenerateContent?alt=sse` に `cachedContent` と `systemInstruction` を同時指定 / `cachedContent` と `tools` を同時指定 | **両方とも `HTTP 400 INVALID_ARGUMENT`**:<br>`CachedContent can not be used with GenerateContent request setting system_instruction, tools or tool_config. Proposed fix: move those values to CachedContent from GenerateContent request.` |
+| **キャッシュヒット確実性** | `cachedContent` のみ指定（`systemInstruction` / `tools` / `toolConfig` 除外）で `gemini-2.5-flash:streamGenerateContent?alt=sse` を 2 連続実行 | **2 回とも `HTTP 200`・100% ヒット**：<br>Run 1 / Run 2 ともに `promptTokenCount: 2486`, **`cachedContentTokenCount: 2478`（99.68%）**, `cacheTokensDetails: [{"modality": "TEXT", "tokenCount": 2478}]` を確認。 |
+| **TTL 延長 (`PATCH`)** | `PATCH /v1beta/{name}` に `{"ttl": "600s"}`（`updateMask` 省略） | **`HTTP 200`**。`expireTime` が +5 分延長されることを確認。 |
+| **削除 (`DELETE`)** | 作成した 3 件すべてに `DELETE /v1beta/{name}` | 全件 **`HTTP 200`**（ボディ `{}`）でクリーンアップ成功。 |
+
+### 6.3 設計への示唆（判断・経験則）
+- **Segment 0 単独キャッシュが最適**: `contents` なしで `systemInstruction` + `tools` のみをキャッシュできるため、会話履歴を含めず Segment 0 のみをハッシュ管理でキャッシュ化するとライフサイクル管理が単純になる。
+- **生成リクエスト時の必須除外**: `cachedContent` を付与する場合、生成リクエストから **`systemInstruction`・`tools`・`toolConfig` の 3 項目を必ず省略**すること。
+- **失効・閾値未満フォールバック**: 最小トークン閾値未満、TTL 失効（`404` / `400`）、または作成失敗時は、通常の非キャッシュ経路（`systemInstruction` + `tools` 付与）へ安全にフォールバックする設計が必要。
+
+---
+
+## 7. OpenRouter / Nous Portal トップレベル `cache_control` 互換性と `reasoning_details` SSE 構造（`2026-11-28` 検証）
+
+### 7.1 トップレベル `cache_control: {"type": "ephemeral"}` の非対応・暗黙モデル互換性（実機 API 観測）
+- **外部一次資料の事実**: OpenRouter 公式（`https://openrouter.ai/docs/guides/best-practices/prompt-caching`, 確認日 `2026-11-28`）では、トップレベル `cache_control: {"type": "ephemeral"}` により対応モデル（Anthropic / Alibaba Qwen 等）で自動ブレークポイントが配置される。
+- **実機 API 観測結果（`2026-11-28`, `OPENROUTER_API_KEY` / `NOUS_API_KEY` 使用、`stream: false`, `max_tokens: 16`）**:
+
+| ゲートウェイ | モデル | キャッシュ種別 | 結果 |
+| --- | --- | --- | --- |
+| **OpenRouter** | `openai/gpt-4o-mini` (Provider: OpenAI) | 暗黙キャッシュ | **`HTTP 200`**（無害受理） |
+| **OpenRouter** | `deepseek/deepseek-v3.2` (Provider: Venice) | 暗黙キャッシュ | **`HTTP 200`**（無害受理） |
+| **OpenRouter** | `z-ai/glm-4.7-flash` (Provider: Cloudflare) | キャッシュ非対応 | **`HTTP 200`**（無害受理） |
+| **Nous Portal** | `deepseek/deepseek-v3.2` | 暗黙キャッシュ | **`HTTP 200`**（無害受理） |
+| **Nous Portal** | `openai/gpt-4o-mini` | 暗黙キャッシュ | **`HTTP 200`**（無害受理） |
+| **Nous Portal** | `z-ai/glm-4.7-flash` | キャッシュ非対応 | **`HTTP 200`**（無害受理、`cached_tokens: 0, cache_write_tokens: 0`） |
+
+- **判断・経験則**: 両ゲートウェイとも、検証した暗黙キャッシュモデル・キャッシュ非対応モデルに対してトップレベル `cache_control: {"type": "ephemeral"}` は `400` にならず無害に無視された。ただし、全 400+ モデル・全上流プロバイダの網羅検証ではないため、将来の厳格バリデーション導入リスクを避けるには、明示キャッシュ系モデル（`anthropic/`・`qwen/` 等）への対象絞り込み、または非対応エラー時のフォールバック方針を設計で明確にしておくのが安全である。
+
+### 7.2 `reasoning_details` の SSE チャンク構造（一次資料 + 実機観測）
+- **外部一次資料の事実**: OpenRouter 公式（`https://openrouter.ai/docs/guides/best-practices/reasoning-tokens`, 確認日 `2026-11-28`）では、`choices[].delta.reasoning_details` 配列に以下の `type` が現れる。
+  - `reasoning.text`: 平文思考テキスト（`text`、プロバイダにより末尾チャンク等に `signature` 付与）。
+  - `reasoning.summary`: 要約思考テキスト（`summary`）。
+  - `reasoning.encrypted`: 暗号化・不透明データブロック（`data`、base64 等の不透明文字列。改変せずそのまま次ターンへ返送必須）。
+  - 共通メタデータ: `type`, `index`, `id`（省略される場合あり）, `format`（例: `openai-responses-v1`, `google-gemini-v1`, `anthropic-claude-v1`）。
+- **実機 SSE 観測結果（`2026-11-28`, OpenRouter, `stream: true`, `reasoning: {"effort": "low"}`）**:
+  - **`openai/gpt-5-mini`**（`total_events=88`, `events_with_rd=85`）:
+    - `reasoning.summary`: キー `['format', 'index', 'summary', 'type']`（`id` なし、`format: "openai-responses-v1"`, `index: 0`）。細切れの `summary` 文字列デルタが多数チャンクで配信される。
+    - `reasoning.encrypted`: キー `['data', 'format', 'id', 'index', 'type']`（`format: "openai-responses-v1"`, `index: 1`, `id: "rs_..."`, `data: "gAAAAAB..."` [約 2.3 KB]）。不透明ブロックとして配信される。
+  - **`google/gemini-2.5-flash`**（`total_events=6`, `events_with_rd=1`）:
+    - `reasoning.text`: キー `['format', 'index', 'text', 'type']`（`id` なし、`format: "google-gemini-v1"`, `index: 0`）。
+- **判断・経験則（SSE マージ規則）**:
+  - `delta.reasoning_details` を単純 `addAll` せず、`(index, type, id, format)`（欠落時は `null`）をキーにして出現順を保ちながら集約すること。
+  - 同一キーに対して `reasoning.text` は `text` を連結（`signature` が出現したら保持）、`reasoning.summary` は `summary` を連結、`reasoning.encrypted` は `data` を破損なく保持（同一キーで分割配信された場合は連結、別 `index`/`id` は別要素として保持）する。
+
+### 7.3 未確認事項・再確認条件
+- OpenRouter / Nous Portal の全上流プロバイダに対するトップレベル `cache_control` 受理可否は代表 3 系統のみ確認（全モデル網羅は未実施）。
+- Anthropic 系の `reasoning.text` における末尾の署名のみチャンク（`signature` フィールド）は一次資料ベースであり、今回スクリプトでは未実観測。
+- 再確認トリガー: Gemini API / OpenRouter / Nous Portal のキャッシュ仕様改訂時、または未知の上流プロバイダで `cache_control` / `reasoning_details` 起因の `400` が発生した時。
+
+### 7.4 本番ドライバ統合後の実 API 観測サマリー（`2026-11-28` 確定）
+- **OpenRouter（トップレベル `cache_control` + `x-session-id`/`session_id`）**: `anthropic/claude-haiku-4.5` で 2 ターン目合算 97.32%（Step 2〜4: 95.35〜99.12%）、`qwen/qwen3-coder-flash` で 2 ターン目合算 94.48%（Step 3〜4: 93.84〜95.09%）を確認。推論モデル `openai/gpt-5-mini` では SSE `delta.reasoning_details` 正規化マージ（`reasoning.summary` 1 要素＋`reasoning.encrypted` 1 要素）により細切れ増殖なく 88.21〜95.42% ヒットを確認。
+- **Nous Portal（`x-session-id`/`session_id` + トップレベル `cache_control`）**: `anthropic/claude-haiku-4.5` で Step 1 `cacheWriteTokens: 9,711` → Step 2〜4 で 95.35〜99.15%（改善前 0.00%）を確認。
+- **OpenAI 直接 API（`prompt_cache_key`）**: `gpt-4o-mini` で HTTP 200 受理・Turn 2 合算 96.72%（Step 2〜4: 94.64〜98.88%）を確認。
+- **Gemini 直接 API（`v1beta/cachedContents` 自動運用）**: `gemini-2.5-flash` で `POST /v1beta/cachedContents` → 4 ステップ連続 `cachedContentTokenCount: 8,015` 安定ヒット → `dispose()` による `DELETE` HTTP 200（全通信 `?key=` なし・`x-goog-api-key` のみ）を確認。

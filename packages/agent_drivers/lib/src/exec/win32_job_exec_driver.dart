@@ -7,6 +7,7 @@ import 'package:agent_kernel/agent_kernel.dart';
 import 'package:ffi/ffi.dart';
 
 import '../fs/host_fs_driver.dart';
+import 'exec_policy_config.dart';
 import 'sys_exec_classifier.dart';
 
 const int _jobObjectExtendedLimitInformationClass = 9;
@@ -248,6 +249,7 @@ class Win32JobExecDriver {
     EnsureActiveTransactionForPcbCallback? ensureActiveTransactionForPcb,
     SyncWorkingCopySnapshotForPcbCallback? syncWorkingCopySnapshotForPcb,
     IoPayloadCapper? ioCapper,
+    ExecPolicyConfig? execPolicy,
   }) {
     final ns = VfsNamespace(workspaceHostRoot: workspaceHostRoot);
     return Win32JobExecDriver(
@@ -257,12 +259,13 @@ class Win32JobExecDriver {
       ensureActiveTransactionForPcb: ensureActiveTransactionForPcb,
       syncWorkingCopySnapshotForPcb: syncWorkingCopySnapshotForPcb,
       ioCapper: ioCapper,
+      classifier: SysExecClassifier(namespace: ns, policy: execPolicy),
     );
   }
 
   static const int defaultTimeoutMs = 60000;
   static const int minTimeoutMs = 100;
-  static const int maxTimeoutMs = 300000;
+  static const int maxTimeoutMs = 600000;
   static const int jobExtendedLimitInfoStructBytes = 144;
   static const int jobLimitFlagsByteOffset = 16;
   static const int killOnJobCloseFlag = _jobObjectLimitKillOnJobClose;
@@ -272,16 +275,7 @@ class Win32JobExecDriver {
     caseSensitive: false,
   );
 
-  static const Set<String> _shellExecutables = <String>{
-    'cmd',
-    'powershell',
-    'pwsh',
-    'sh',
-    'bash',
-    'wsl',
-    'zsh',
-    'fish',
-  };
+  static const Set<String> _shellExecutables = ExecPolicyConfig.shellWrappers;
 
   final VfsNamespace namespace;
   final EnsureActiveTransactionCallback? _ensureActiveTransaction;
@@ -596,7 +590,7 @@ class Win32JobExecDriver {
                 'Command "${normalized.command}" timed out after ${effectiveTimeoutMs}ms and its Job Object process tree was terminated.',
             recoverable: true,
             hint:
-                'Inspect partial stdout/stderr in details, optimize or narrow the command, or increase timeoutMs (up to 300000ms).',
+                'Inspect partial stdout/stderr in details, optimize or narrow the command, or increase timeoutMs (up to ${maxTimeoutMs}ms).',
             details: <String, dynamic>{
               'exitCode': exitCode,
               'stdout': cappedOut.text,
@@ -717,7 +711,7 @@ class Win32JobExecDriver {
       );
     }
 
-    final resolvedArgs = exeBase == 'dart'
+    final resolvedArgs = !_shellExecutables.contains(exeBase)
         ? normalized.args
             .map((a) => SysExecClassifier.resolveHostCommandArg(
                   ns,
@@ -886,13 +880,19 @@ class Win32JobExecDriver {
     );
   }
 
-  /// Canonical tool schema for `sys_exec` ([D-007], [D-016]).
-  static List<SyscallToolSchema> toolSchemas() {
+  /// Canonical tool schema for `sys_exec` ([D-007], [D-016], [D-509]).
+  static List<SyscallToolSchema> toolSchemas({ExecPolicyConfig? policy}) {
+    const baseDescription =
+        'Execute an external command inside a Win32 Job Object within /workspace. Safe `dart test`, `dart analyze`, and `dart format --output=none` run immediately; other commands require user approval. Raw git/jj CLI commands are blocked by kernel policy.';
+    final summaries = policy?.toPromptRuleSummaries() ?? const <String>[];
+    final description = summaries.isEmpty
+        ? baseDescription
+        : '$baseDescription Additional auto-allowed direct commands (.agent_os/exec_policy.json): ${summaries.join('; ')}.';
+
     return <SyscallToolSchema>[
       SyscallToolSchema(
         name: 'sys_exec',
-        description:
-            'Execute an external command inside a Win32 Job Object within /workspace. Safe `dart test`, `dart analyze`, and `dart format --output=none` run immediately; other commands require user approval. Raw git/jj CLI commands are blocked by kernel policy.',
+        description: description,
         parametersJsonSchema: const <String, dynamic>{
           'type': 'object',
           'properties': <String, dynamic>{
@@ -914,7 +914,7 @@ class Win32JobExecDriver {
             'timeoutMs': <String, dynamic>{
               'type': 'integer',
               'description':
-                  'Timeout in milliseconds (100..300000, default 60000).',
+                  'Timeout in milliseconds (100..600000, default 60000).',
             },
           },
           'required': <String>['command'],
@@ -1018,18 +1018,8 @@ class Win32JobExecDriver {
     return out;
   }
 
-  static String _normalizeExeBase(String rawExe) {
-    final normalized = rawExe.trim().replaceAll('/', r'\');
-    final slashIdx = normalized.lastIndexOf(r'\');
-    final base = slashIdx >= 0 ? normalized.substring(slashIdx + 1) : normalized;
-    final lower = base.toLowerCase();
-    for (final ext in const <String>['.exe', '.cmd', '.bat']) {
-      if (lower.endsWith(ext)) {
-        return lower.substring(0, lower.length - ext.length);
-      }
-    }
-    return lower;
-  }
+  static String _normalizeExeBase(String rawExe) =>
+      ExecAllowRule.normalizeCommandBasename(rawExe);
 
   static String _quotePowerShellArg(String arg) {
     if (arg.isEmpty) {

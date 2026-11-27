@@ -65,6 +65,7 @@ class SubAgentWorker {
     required this.taskPrompt,
     required this.maxSteps,
     required this.invoker,
+    this.sessionUuid,
     this.cancelToken,
   });
 
@@ -74,7 +75,18 @@ class SubAgentWorker {
   final String taskPrompt;
   final int maxSteps;
   final RemoteSyscallInvoker invoker;
+  final String? sessionUuid;
   final CancellationToken? cancelToken;
+
+  /// Deterministically derives a child-specific Sticky Session UUID from [parentSessionId] and [pid] ([D-606]).
+  static String deriveChildSessionUuid({
+    required String parentSessionId,
+    required Pid pid,
+  }) {
+    final normalizedParent = parentSessionId.trim();
+    final prefix = normalizedParent.isEmpty ? 'session' : normalizedParent;
+    return '$prefix:child:$pid';
+  }
 
   /// Runs the Ring 3 ReAct loop until `sys_exit`, final text response, fatal `EDQUOT`, or cancellation.
   Future<ChildWorkerExitReport> run() async {
@@ -101,6 +113,8 @@ class SubAgentWorker {
         <String, dynamic>{
           'model': model,
           'turnIndex': step,
+          if (sessionUuid != null && sessionUuid!.trim().isNotEmpty)
+            'sessionUuid': sessionUuid!.trim(),
           'stream': false,
         },
       );
@@ -472,6 +486,10 @@ Future<void> runSubAgentIsolateWorker(Map<String, Object?> rawInit) async {
   });
 
   try {
+    final childSessionUuid = SubAgentWorker.deriveChildSessionUuid(
+      parentSessionId: sessionId,
+      pid: pid,
+    );
     final worker = SubAgentWorker(
       pid: pid,
       profile: profile,
@@ -479,6 +497,7 @@ Future<void> runSubAgentIsolateWorker(Map<String, Object?> rawInit) async {
       taskPrompt: taskPrompt,
       maxSteps: maxSteps,
       invoker: invoker,
+      sessionUuid: childSessionUuid,
       cancelToken: cancelSource.token,
     );
     final report = await worker.run();
@@ -673,6 +692,10 @@ class GreenTaskChildWorkerBackend implements ChildWorkerBackend {
             return;
           }
 
+          final childSessionUuid = SubAgentWorker.deriveChildSessionUuid(
+            parentSessionId: config.sessionId,
+            pid: config.pid,
+          );
           final worker = SubAgentWorker(
             pid: config.pid,
             profile: config.profile,
@@ -680,6 +703,7 @@ class GreenTaskChildWorkerBackend implements ChildWorkerBackend {
             taskPrompt: config.taskPrompt,
             maxSteps: config.maxSteps,
             invoker: config.directInvoker,
+            sessionUuid: childSessionUuid,
             cancelToken: cancelSource.token,
           );
           final report = await worker.run();

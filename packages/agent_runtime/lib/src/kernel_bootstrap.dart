@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
@@ -36,6 +37,8 @@ class KernelBootstrapConfig {
     this.nousPortalBaseUrl,
     this.openAiCompatBaseUrl,
     this.modelPolicy,
+    this.execPolicy,
+    this.onExecPolicyWarning,
     this.keepAlive = '15m',
     this.requestTimeout = const Duration(seconds: 120),
     this.ioCapConfig = const IoCapConfig(),
@@ -91,6 +94,8 @@ class KernelBootstrapConfig {
   final String? nousPortalBaseUrl;
   final String? openAiCompatBaseUrl;
   final ModelPolicy? modelPolicy;
+  final ExecPolicyConfig? execPolicy;
+  final void Function(String message)? onExecPolicyWarning;
   final String keepAlive;
   final Duration requestTimeout;
   final IoCapConfig ioCapConfig;
@@ -169,12 +174,13 @@ class KernelBootstrap {
     required this.processRunner,
     required this.quotaLedger,
     required this.modelPolicy,
+    required this.execPolicy,
     this.workerHost,
     this.dirtySwapBackend,
     this.mcpServerManager,
     this.stackedTaskManager,
     List<McpServerSpec> initialMcpServers = const <McpServerSpec>[],
-    required List<void Function()> ownedClosers,
+    required List<FutureOr<void> Function()> ownedClosers,
   })  : _initialMcpServers = initialMcpServers,
         _ownedClosers = ownedClosers;
 
@@ -216,12 +222,13 @@ class KernelBootstrap {
   final GreenTaskProcessRunner processRunner;
   final QuotaLedger quotaLedger;
   final ModelPolicy modelPolicy;
+  final ExecPolicyConfig execPolicy;
   final IsolateWorkerHost? workerHost;
   final DirtySwapBackend? dirtySwapBackend;
   final McpServerManager? mcpServerManager;
   final StackedTaskManager? stackedTaskManager;
   final List<McpServerSpec> _initialMcpServers;
-  final List<void Function()> _ownedClosers;
+  final List<FutureOr<void> Function()> _ownedClosers;
 
   ContextPagingReport? _lastPagingReport;
 
@@ -282,6 +289,22 @@ class KernelBootstrap {
           redactor: effectiveRedactor,
         );
 
+    final ExecPolicyConfig effectiveExecPolicy;
+    if (config.execPolicy != null) {
+      effectiveExecPolicy = config.execPolicy!;
+    } else {
+      final execPolicyLoadResult = ExecPolicyConfigLoader(
+        sessionCwd: namespace.workspaceHostRoot,
+      ).load();
+      final warnSink = config.onExecPolicyWarning ??
+          ((String msg) => stderr.writeln('[exec_policy] $msg'));
+      for (final warning in execPolicyLoadResult.warnings) {
+        warnSink(effectiveRedactor.redactString(warning));
+      }
+      effectiveExecPolicy = execPolicyLoadResult.config;
+    }
+    final execRuleSummaries = effectiveExecPolicy.toPromptRuleSummaries();
+
     final ioCapper = IoPayloadCapper(
       config: config.ioCapConfig,
       workspaceHostRoot: namespace.workspaceHostRoot,
@@ -332,7 +355,7 @@ class KernelBootstrap {
     final allToolSchemas = <SyscallToolSchema>[
       ...HostFsDriver.allToolSchemas(),
       ...jjSchemas,
-      ...Win32JobExecDriver.toolSchemas(),
+      ...Win32JobExecDriver.toolSchemas(policy: effectiveExecPolicy),
       buildMemPageinToolSchema(),
       if (isStage2Multiprocess) ...buildProcessToolSchemas(),
       if (isStage2Multiprocess) buildWebSearchToolSchema(),
@@ -397,11 +420,10 @@ class KernelBootstrap {
 
     final pinnedSystem = PinnedSystemInstruction(
       instruction: config.systemInstruction ??
-          (isStage3Team
-              ? defaultStage3Instruction
-              : (isStage2Multiprocess
-                  ? defaultStage2Instruction
-                  : defaultStep1Instruction)),
+          AgentPrompts.buildLeadInstruction(
+            stage: isStage3Team ? 3 : (isStage2Multiprocess ? 2 : 1),
+            additionalExecRuleSummaries: execRuleSummaries,
+          ),
       tools: leadToolSchemas,
     );
 
@@ -453,6 +475,10 @@ class KernelBootstrap {
       ensureActiveTransactionForPcb: jjDriver.ensureActiveTransactionForPcb,
       syncWorkingCopySnapshotForPcb: jjDriver.syncWorkingCopySnapshotForPcb,
       ioCapper: ioCapper,
+      classifier: SysExecClassifier(
+        namespace: namespace,
+        policy: effectiveExecPolicy,
+      ),
     );
 
     final effectiveModelPolicy = config.modelPolicy ??
@@ -465,7 +491,7 @@ class KernelBootstrap {
         _normalizeNonEmpty(config.openAiCompatBaseUrl) ??
             effectiveModelPolicy.resolveOpenAiCompatBaseUrl();
 
-    final ownedClosers = <void Function()>[];
+    final ownedClosers = <FutureOr<void> Function()>[];
     final LlmRouter effectiveRouter;
     if (config.llmRouter != null) {
       effectiveRouter = config.llmRouter!;
@@ -488,7 +514,7 @@ class KernelBootstrap {
         } else if (created is OpenAiCompatDriver) {
           ownedClosers.add(created.close);
         } else if (created is GeminiDriver) {
-          ownedClosers.add(created.close);
+          ownedClosers.add(created.dispose);
         }
       }
 
@@ -601,6 +627,7 @@ class KernelBootstrap {
             modelResolver.effectiveModelString(),
         jjDriver: jjDriver,
         backend: config.childWorkerBackend ?? const IsolateChildWorkerBackend(),
+        additionalExecRuleSummaries: execRuleSummaries,
       );
     }
 
@@ -807,6 +834,7 @@ class KernelBootstrap {
       processRunner: processRunner,
       quotaLedger: effectiveQuotaLedger,
       modelPolicy: effectiveModelPolicy,
+      execPolicy: effectiveExecPolicy,
       workerHost: workerHost,
       dirtySwapBackend: effectiveDirtySwapBackend,
       mcpServerManager: effectiveMcpManager,
@@ -857,7 +885,7 @@ class KernelBootstrap {
     await auditLogger.flush();
     for (final closer in _ownedClosers) {
       try {
-        closer();
+        await closer();
       } catch (_) {
         // Best-effort resource cleanup on shutdown.
       }

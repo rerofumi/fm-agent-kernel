@@ -407,23 +407,16 @@ void main() {
 
       final claudeBody = capturedBodies.first;
       expect(claudeBody['session_id'], equals('sticky-uuid-42'));
-      final claudeMsgs =
-          (claudeBody['messages'] as List<dynamic>).cast<Map<String, dynamic>>();
-      // Segment 0 system message has cache_control.
-      expect(claudeMsgs.first['content'], isA<List<dynamic>>());
       expect(
-        claudeMsgs.first['content'][0]['cache_control'],
+        claudeBody['cache_control'],
         equals(<String, dynamic>{'type': 'ephemeral'}),
       );
-      // Last Segment 1 message (tool turn) has cache_control; Segment 2 tail user message does not.
-      final cacheMarkedIndices = <int>[];
-      for (var i = 0; i < claudeMsgs.length; i++) {
-        if (claudeMsgs[i]['content'] is List) {
-          cacheMarkedIndices.add(i);
-        }
+      final claudeMsgs =
+          (claudeBody['messages'] as List<dynamic>).cast<Map<String, dynamic>>();
+      // Top-level cache_control keeps all message contents as plain Strings.
+      for (final m in claudeMsgs) {
+        expect(m['content'], isA<String>());
       }
-      expect(cacheMarkedIndices.length, equals(2));
-      expect(cacheMarkedIndices, equals(<int>[0, claudeMsgs.length - 2]));
 
       // Non-anthropic model must NOT inject cache_control.
       final openaiPrompt = const CanonicalIrProjector().project(
@@ -442,6 +435,7 @@ void main() {
           prompt: openaiPrompt,
         ),
       );
+      expect(openaiBody.containsKey('cache_control'), isFalse);
       for (final m in openaiBody['messages'] as List<dynamic>) {
         expect((m as Map<String, dynamic>)['content'], isA<String>());
       }
@@ -575,6 +569,131 @@ void main() {
               .having((e) => e.error.code, 'code', SyscallErrorCode.etimedout),
         ),
       );
+    });
+
+    test('applies GatewayExplicitCachePolicy top-level cache_control and sessionUuid boundaries [D-602]', () {
+      // Policy whitelist boundary checks
+      const expectedTrue = <String>[
+        'anthropic/claude-haiku-4.5',
+        'anthropic/claude-sonnet-4',
+        'qwen/qwen3-coder-flash',
+        'qwen/qwen3-coder-flash:free',
+        'qwen/qwen3.7-plus',
+        'qwen/qwen3.5-plus',
+        'qwen/qwen3-max',
+        'qwen/qwen-plus',
+        'qwen/qwen-turbo',
+      ];
+      for (final model in expectedTrue) {
+        expect(
+          GatewayExplicitCachePolicy.supportsTopLevelCacheControl(model),
+          isTrue,
+          reason: 'Expected top-level cache_control for $model',
+        );
+      }
+
+      const expectedFalse = <String>[
+        'qwen/qwen3-coder',
+        'openai/gpt-4o-mini',
+        'openai/gpt-5-mini',
+        'deepseek/deepseek-v3.2',
+        'google/gemini-2.5-flash',
+        'google/gemini-2.5-pro',
+        'z-ai/glm-4.7-flash',
+        'moonshotai/kimi-k2.5',
+        '',
+        '   ',
+      ];
+      for (final model in expectedFalse) {
+        expect(
+          GatewayExplicitCachePolicy.supportsTopLevelCacheControl(model),
+          isFalse,
+          reason: 'Expected NO cache_control for $model',
+        );
+      }
+
+      final driver = OpenRouterDriver(
+        baseUrl: baseUrl,
+        apiKey: 'sk-or-v1-policy-test',
+      );
+      addTearDown(driver.close);
+
+      final memory = _buildMemoryWithToolHistory();
+
+      // Explicit cache models get top-level cache_control and plain String content.
+      for (final modelName in const <String>[
+        'anthropic/claude-haiku-4.5',
+        'qwen/qwen3-coder-flash',
+        'qwen/qwen3.7-plus',
+      ]) {
+        final prompt = const CanonicalIrProjector().project(
+          memory,
+          targetProvider: 'openrouter',
+          targetModel: modelName,
+        );
+        final req = LlmChatRequest(
+          sessionId: 'sess_or',
+          sessionUuid: 'sticky-uuid-100',
+          model: ModelIdentifier(
+            provider: LlmProviderId.openRouter,
+            modelName: modelName,
+          ),
+          prompt: prompt,
+        );
+        final headers = driver.buildHeaders(req, apiKey: 'sk-or-v1-policy-test');
+        final body = driver.buildRequestBody(req);
+        expect(headers['x-session-id'], equals('sticky-uuid-100'));
+        expect(body['session_id'], equals('sticky-uuid-100'));
+        expect(
+          body['cache_control'],
+          equals(<String, dynamic>{'type': 'ephemeral'}),
+        );
+        for (final msg in body['messages'] as List<dynamic>) {
+          expect((msg as Map<String, dynamic>)['content'], isA<String>());
+        }
+      }
+
+      // Implicit / unsupported models do NOT get cache_control.
+      for (final modelName in const <String>[
+        'openai/gpt-4o-mini',
+        'deepseek/deepseek-v3.2',
+        'qwen/qwen3-coder',
+        'google/gemini-2.5-flash',
+        'z-ai/glm-4.7-flash',
+      ]) {
+        final req = LlmChatRequest(
+          sessionId: 'sess_or',
+          sessionUuid: 'sticky-uuid-100',
+          model: ModelIdentifier(
+            provider: LlmProviderId.openRouter,
+            modelName: modelName,
+          ),
+          prompt: _simplePrompt(),
+        );
+        final body = driver.buildRequestBody(req);
+        expect(body.containsKey('cache_control'), isFalse);
+      }
+
+      // Empty or whitespace-only sessionUuid omits x-session-id and session_id.
+      for (final blankUuid in const <String>['', '   ']) {
+        final req = LlmChatRequest(
+          sessionId: 'sess_or',
+          sessionUuid: blankUuid,
+          model: const ModelIdentifier(
+            provider: LlmProviderId.openRouter,
+            modelName: 'anthropic/claude-haiku-4.5',
+          ),
+          prompt: _simplePrompt(),
+        );
+        final headers = driver.buildHeaders(req, apiKey: 'sk-or-v1-policy-test');
+        final body = driver.buildRequestBody(req);
+        expect(headers.containsKey('x-session-id'), isFalse);
+        expect(body.containsKey('session_id'), isFalse);
+        expect(
+          body['cache_control'],
+          equals(<String, dynamic>{'type': 'ephemeral'}),
+        );
+      }
     });
   });
 

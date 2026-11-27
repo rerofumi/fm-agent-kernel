@@ -638,6 +638,221 @@ void main() {
       expect(cancelBootstrap.pcb.quotaUsage.activeChildProcesses, equals(0));
       expect(cancelBootstrap.workerHost!.activeChildCount, equals(0));
     });
+
+    test('derives deterministic child-specific sessionUuid across GreenTask and Isolate backends without parent/sibling collision [D-606]', () async {
+      // Unit checks for deriveChildSessionUuid helper.
+      expect(
+        SubAgentWorker.deriveChildSessionUuid(
+          parentSessionId: 'sess_parent_1',
+          pid: 2,
+        ),
+        equals('sess_parent_1:child:2'),
+      );
+      expect(
+        SubAgentWorker.deriveChildSessionUuid(
+          parentSessionId: '  sess_trimmed  ',
+          pid: 5,
+        ),
+        equals('sess_trimmed:child:5'),
+      );
+      expect(
+        SubAgentWorker.deriveChildSessionUuid(
+          parentSessionId: '   ',
+          pid: 3,
+        ),
+        equals('session:child:3'),
+      );
+
+      for (final backendEntry in <({String name, ChildWorkerBackend backend})>[
+        (name: 'GreenTask', backend: const GreenTaskChildWorkerBackend()),
+        (name: 'Isolate', backend: const IsolateChildWorkerBackend()),
+      ]) {
+        var leadStep = 0;
+        final parentSessionUuids = <String>[];
+        final childSessionUuidsByPkg = <String, List<String>>{
+          'pkg_a': <String>[],
+          'pkg_b': <String>[],
+        };
+
+        final fakeLlm = _RoutingFakeLlmDriver(
+          onRequest: (req) {
+            final isChild =
+                req.prompt.messages.first.content.contains('Ring 3 Explorer');
+            if (!isChild) {
+              parentSessionUuids.add(req.sessionUuid);
+              leadStep += 1;
+              if (leadStep == 1) {
+                return LlmChatResponse(
+                  content: '',
+                  toolCalls: <LlmToolCallSpec>[
+                    LlmToolCallSpec(
+                      id: 'sp_a',
+                      name: 'sys_spawn',
+                      arguments: const <String, dynamic>{
+                        'profile': 'explorer',
+                        'name': 'exp-a',
+                        'taskPrompt': 'Inspect pkg_a',
+                        'allowedSubpaths': <String>['/workspace/packages/pkg_a'],
+                      },
+                    ),
+                    LlmToolCallSpec(
+                      id: 'sp_b',
+                      name: 'sys_spawn',
+                      arguments: const <String, dynamic>{
+                        'profile': 'explorer',
+                        'name': 'exp-b',
+                        'taskPrompt': 'Inspect pkg_b',
+                        'allowedSubpaths': <String>['/workspace/packages/pkg_b'],
+                      },
+                    ),
+                  ],
+                  usage: const LlmUsageTelemetry(
+                    promptTokens: 100,
+                    completionTokens: 20,
+                    durationMs: 5,
+                  ),
+                );
+              }
+              if (leadStep == 2) {
+                return LlmChatResponse(
+                  content: '',
+                  toolCalls: <LlmToolCallSpec>[
+                    LlmToolCallSpec(
+                      id: 'wt_all',
+                      name: 'sys_wait',
+                      arguments: const <String, dynamic>{'timeoutMs': 15000},
+                    ),
+                  ],
+                  usage: const LlmUsageTelemetry(
+                    promptTokens: 120,
+                    completionTokens: 10,
+                    durationMs: 5,
+                  ),
+                );
+              }
+              return LlmChatResponse(
+                content: 'Completed ${backendEntry.name} child sessionUuid test.',
+                usage: const LlmUsageTelemetry(
+                  promptTokens: 140,
+                  completionTokens: 10,
+                  durationMs: 5,
+                ),
+              );
+            }
+
+            // Child Explorer: 2-step ReAct (Step 1: sys_read_lines, Step 2: sys_exit).
+            final userMsg = req.prompt.messages
+                .firstWhere((m) => m.role == ProjectedRole.user)
+                .content;
+            final pkg = userMsg.contains('pkg_a') ? 'pkg_a' : 'pkg_b';
+            childSessionUuidsByPkg[pkg]!.add(req.sessionUuid);
+
+            final toolResults = req.prompt.messages
+                .where((m) => m.role == ProjectedRole.tool)
+                .toList();
+            if (toolResults.isEmpty) {
+              return LlmChatResponse(
+                content: '',
+                toolCalls: <LlmToolCallSpec>[
+                  LlmToolCallSpec(
+                    id: 'r_$pkg',
+                    name: 'sys_read_lines',
+                    arguments: <String, dynamic>{
+                      'path': '/workspace/packages/$pkg/info.txt',
+                    },
+                  ),
+                ],
+                usage: const LlmUsageTelemetry(
+                  promptTokens: 80,
+                  completionTokens: 15,
+                  durationMs: 5,
+                ),
+              );
+            }
+            return LlmChatResponse(
+              content: '',
+              toolCalls: <LlmToolCallSpec>[
+                LlmToolCallSpec(
+                  id: 'e_$pkg',
+                  name: 'sys_exit',
+                  arguments: <String, dynamic>{
+                    'exitCode': 0,
+                    'summary': 'Done $pkg',
+                  },
+                ),
+              ],
+              usage: const LlmUsageTelemetry(
+                promptTokens: 110,
+                completionTokens: 10,
+                durationMs: 5,
+              ),
+            );
+          },
+        );
+
+        final bootstrap = KernelBootstrap.create(
+          KernelBootstrapConfig(
+            workspaceHostRoot: repoDir.path,
+            sessionId: 'sess_d606_${backendEntry.name.toLowerCase()}',
+            startupModel: 'local-ollama/gemma4:12b',
+            quota: ResourceQuota.stage2Default,
+            enableStage2Multiprocess: true,
+            childWorkerBackend: backendEntry.backend,
+            contextWindowSource: _StaticWindowSource(32768),
+            llmDrivers: <LlmProviderId, LlmDriver>{
+              LlmProviderId.localOllama: fakeLlm,
+            },
+          ),
+        );
+        addTearDown(bootstrap.dispose);
+
+        final turnRes = await bootstrap.processRunner.submitPrompt(
+          userInput: 'Run parallel children for ${backendEntry.name}',
+        );
+        expect(
+          turnRes.ok,
+          isTrue,
+          reason: '${backendEntry.name}: ${turnRes.error}',
+        );
+
+        expect(parentSessionUuids, isNotEmpty);
+        final parentUuidSet = parentSessionUuids.toSet();
+        final parentSessionId = bootstrap.sessionId;
+
+        final pkgAUuids = childSessionUuidsByPkg['pkg_a']!;
+        final pkgBUuids = childSessionUuidsByPkg['pkg_b']!;
+
+        // Each child executed 2 LLM steps (Step 1 tool call + Step 2 sys_exit).
+        expect(
+          pkgAUuids.length,
+          equals(2),
+          reason: '${backendEntry.name} pkg_a step count',
+        );
+        expect(
+          pkgBUuids.length,
+          equals(2),
+          reason: '${backendEntry.name} pkg_b step count',
+        );
+
+        // (c) Consistent across multiple steps of the same child process.
+        expect(pkgAUuids.toSet().length, equals(1));
+        expect(pkgBUuids.toSet().length, equals(1));
+
+        final childAUuid = pkgAUuids.first;
+        final childBUuid = pkgBUuids.first;
+
+        // (a) Distinct from parent sessionId and parent sessionUuid.
+        expect(childAUuid, isNot(equals(parentSessionId)));
+        expect(childBUuid, isNot(equals(parentSessionId)));
+        expect(parentUuidSet.contains(childAUuid), isFalse);
+        expect(parentUuidSet.contains(childBUuid), isFalse);
+
+        // (b) Distinct between sibling child processes and follow deterministic format.
+        expect(childAUuid, isNot(equals(childBUuid)));
+        expect(childAUuid, startsWith('$parentSessionId:child:'));
+        expect(childBUuid, startsWith('$parentSessionId:child:'));
+      }
+    });
   });
 }
 

@@ -897,6 +897,30 @@ class AcpCliRunner {
     }
   }
 
+  /// Writes formatted `/ps` output from a `_fm_agent_os/processes` response ([D-018], [D-504]).
+  void writeProcessesSnapshot(Map<String, dynamic> map) {
+    final lead = _asStringMap(map['lead']);
+    final procs = map['processes'] is List
+        ? (map['processes'] as List).whereType<Map<dynamic, dynamic>>()
+        : const Iterable<Map<dynamic, dynamic>>.empty();
+    _out.writeln(
+      '[PS] lead pid=${lead['pid']} state=${lead['state']} '
+      'suspended=${lead['isSuspended']} change=${lead['jjChangeId']}',
+    );
+    for (final pItem in procs) {
+      final hb = pItem['heartbeat'];
+      final hbSuffix = hb is Map
+          ? ' step=${hb['currentStep']}/${hb['maxSteps']} idle=${hb['idleMs']}ms'
+          : '';
+      _out.writeln(
+        '  pid=${pItem['pid']} profile=${pItem['profile']} '
+        'state=${pItem['state']} model=${pItem['model']} '
+        'ws=${pItem['workspaceName'] ?? '(none)'} '
+        'change=${pItem['workingChangeId'] ?? '(none)'}$hbSuffix',
+      );
+    }
+  }
+
   /// Writes `[Turn ended: stopReason=...]` and any structured `turnSummary.error`
   /// details to `_out` when `stopReason != 'end_turn'` ([D-001]).
   void writeTurnEndedSummary(String stopReason, Map<String, dynamic> summary) {
@@ -1012,23 +1036,7 @@ class AcpCliRunner {
         final raw = await peer.sendRequest('_fm_agent_os/processes', <String, dynamic>{
           'sessionId': state.sessionId,
         });
-        final map = _asStringMap(raw);
-        final lead = _asStringMap(map['lead']);
-        final procs = map['processes'] is List
-            ? (map['processes'] as List).whereType<Map<dynamic, dynamic>>()
-            : const Iterable<Map<dynamic, dynamic>>.empty();
-        _out.writeln(
-          '[PS] lead pid=${lead['pid']} state=${lead['state']} '
-          'suspended=${lead['isSuspended']} change=${lead['jjChangeId']}',
-        );
-        for (final pItem in procs) {
-          _out.writeln(
-            '  pid=${pItem['pid']} profile=${pItem['profile']} '
-            'state=${pItem['state']} model=${pItem['model']} '
-            'ws=${pItem['workspaceName'] ?? '(none)'} '
-            'change=${pItem['workingChangeId'] ?? '(none)'}',
-          );
-        }
+        writeProcessesSnapshot(_asStringMap(raw));
         return const _LineAction();
       } on JsonRpcException catch (e) {
         _out.writeln('[PS Error] (${e.code}) ${e.message}');

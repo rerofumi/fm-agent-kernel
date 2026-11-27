@@ -4,10 +4,11 @@ import 'package:agent_kernel/agent_kernel.dart';
 
 import 'open_ai_compat_driver.dart';
 
-/// OpenAI `/v1/chat/completions` SSE streaming driver ([D-402], [D-403]).
+/// OpenAI `/v1/chat/completions` SSE streaming driver ([D-402], [D-403], [D-605]).
 ///
 /// Implements:
 /// - `OPENAI_API_KEY` Bearer authentication
+/// - `prompt_cache_key` injection from non-empty `sessionUuid`
 /// - `stream_options: {"include_usage": true}` during streaming
 /// - Reasoning model (`o1`, `o3`, `o4`, `gpt-5` families) parameter constraints:
 ///   converts `max_tokens` to `max_completion_tokens` and omits `temperature`
@@ -90,6 +91,9 @@ class OpenAiDriver extends OpenAiCompatDriver {
   @override
   Map<String, dynamic> buildRequestBody(LlmChatRequest request) {
     final body = super.buildRequestBody(request);
+    if (request.sessionUuid.trim().isNotEmpty) {
+      body['prompt_cache_key'] = request.sessionUuid;
+    }
     if (isReasoningModel(request.model.modelName)) {
       body.remove('temperature');
       final maxTokens = body.remove('max_tokens');

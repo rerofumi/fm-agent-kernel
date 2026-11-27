@@ -833,5 +833,278 @@ void main() {
       );
       expect(syscallPcb.memory.ephemeralSegment.dynamicContextSummary, isNull);
     });
+
+    test('aggregates cachedTokens and cacheWriteTokens across all ReAct steps [D-601]', () async {
+      Future<AgentTurnResult> runScenario(
+        List<({int prompt, int? cached, int? cacheWrite})> stepUsages,
+      ) async {
+        final testPcb = ProcessControlBlock(
+          pid: 1,
+          name: 'lead-agent',
+          ring: ProtectionRing.ring2,
+          cspace: CapabilityTable.stage1LeadAgent(),
+          quota: const ResourceQuota(
+            maxChildProcesses: 0,
+            maxSyscallCountPerTurn: 20,
+          ),
+          namespace: pcb.namespace,
+          memory: VirtualContextMemory(
+            sessionId: 'sess_d601',
+            systemInstruction: pcb.memory.systemSegment.pinned,
+          ),
+        );
+        final table = KernelProcessTable()..registerProcess(testPcb);
+        final localGate = SyscallGate(
+          processTable: table,
+          approvalGate: ApprovalGate(handler: PolicyApprovalHandler.alwaysAllow()),
+          ioCapper: IoPayloadCapper(
+            workspaceHostRoot: tempRoot.path,
+            config: const IoCapConfig(),
+          ),
+          auditLogger: auditLogger,
+        );
+        var stepIdx = 0;
+        localGate.registerSyscall(
+          SyscallDefinition(
+            name: 'sys_llm_chat',
+            requiredRight: CapRight.llmInfer,
+            kind: 'other',
+            applyIoCap: false,
+            handler: (_) async {
+              final u = stepUsages[stepIdx];
+              stepIdx += 1;
+              final isLast = stepIdx >= stepUsages.length;
+              return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+                'content': isLast ? 'Final answer' : '',
+                'toolCalls': isLast
+                    ? const <dynamic>[]
+                    : <Map<String, dynamic>>[
+                        <String, dynamic>{
+                          'id': 'tc_$stepIdx',
+                          'name': 'sys_read_lines',
+                          'arguments': const <String, dynamic>{
+                            'path': '/workspace/a.dart',
+                          },
+                        },
+                      ],
+                'usage': <String, dynamic>{
+                  'promptTokens': u.prompt,
+                  'completionTokens': 10,
+                  if (u.cached != null) 'cachedTokens': u.cached,
+                  if (u.cacheWrite != null) 'cacheWriteTokens': u.cacheWrite,
+                  'durationMs': 15,
+                },
+              });
+            },
+          ),
+        );
+        localGate.registerSyscall(
+          SyscallDefinition(
+            name: 'sys_read_lines',
+            requiredRight: CapRight.read,
+            kind: 'read',
+            handler: (_) async =>
+                const SyscallResult<Map<String, dynamic>>.success(
+              <String, dynamic>{'content': 'ok'},
+            ),
+          ),
+        );
+        final agent = LeadAgent(
+          pcb: testPcb,
+          syscallGate: localGate,
+          capHandle: const CapHandle('cap_workspace_rw'),
+          modelResolver: modelResolver,
+        );
+        addTearDown(agent.dispose);
+        return agent.runTurn(userInput: 'Run telemetry scenario');
+      }
+
+      // Case 1: Single step (non-null)
+      final single = await runScenario(const [
+        (prompt: 1000, cached: 800, cacheWrite: 0),
+      ]);
+      expect(single.ok, isTrue);
+      expect(single.usage!.promptTokens, equals(1000));
+      expect(single.usage!.cachedTokens, equals(800));
+      expect(single.usage!.cacheWriteTokens, equals(0));
+      expect(single.usage!.cacheHitRate, equals(0.8));
+
+      // Case 2: Multi-step (all non-null)
+      final multi = await runScenario(const [
+        (prompt: 5000, cached: 0, cacheWrite: 4800),
+        (prompt: 6000, cached: 4800, cacheWrite: 0),
+        (prompt: 7000, cached: 5800, cacheWrite: 0),
+      ]);
+      expect(multi.ok, isTrue);
+      expect(multi.usage!.promptTokens, equals(18000));
+      expect(multi.usage!.cachedTokens, equals(10600));
+      expect(multi.usage!.cacheWriteTokens, equals(4800));
+      expect(multi.usage!.cacheHitRate, equals(0.5889));
+
+      // Case 3: Partial null across steps (e.g. Gemini implicit caching)
+      final partialNull = await runScenario(const [
+        (prompt: 5000, cached: null, cacheWrite: null),
+        (prompt: 6000, cached: 4000, cacheWrite: null),
+        (prompt: 7000, cached: null, cacheWrite: null),
+      ]);
+      expect(partialNull.ok, isTrue);
+      expect(partialNull.usage!.promptTokens, equals(18000));
+      expect(partialNull.usage!.cachedTokens, equals(4000));
+      expect(partialNull.usage!.cacheWriteTokens, isNull);
+      expect(partialNull.usage!.cacheHitRate, equals(0.2222));
+
+      // Case 4: All null across steps
+      final allNull = await runScenario(const [
+        (prompt: 1000, cached: null, cacheWrite: null),
+        (prompt: 1200, cached: null, cacheWrite: null),
+      ]);
+      expect(allNull.ok, isTrue);
+      expect(allNull.usage!.promptTokens, equals(2200));
+      expect(allNull.usage!.cachedTokens, isNull);
+      expect(allNull.usage!.cacheWriteTokens, isNull);
+      expect(allNull.usage!.cacheHitRate, isNull);
+
+      // Case 5: promptTokens == 0 and cachedTokens == 0
+      final zeroPrompt = await runScenario(const [
+        (prompt: 0, cached: 0, cacheWrite: 0),
+      ]);
+      expect(zeroPrompt.ok, isTrue);
+      expect(zeroPrompt.usage!.promptTokens, equals(0));
+      expect(zeroPrompt.usage!.cachedTokens, equals(0));
+      expect(zeroPrompt.usage!.cacheWriteTokens, equals(0));
+      expect(zeroPrompt.usage!.cacheHitRate, isNull);
+    });
+
+    test('preserves wire Prefix across Step 1 -> Step 2 with dynamicContextSummary and excludes pageDirectorySummary from Segment 1 [D-606]', () async {
+      const projector = CanonicalIrProjector();
+      final projectedPrompts = <ProjectedPrompt>[];
+      var step = 0;
+
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_llm_chat',
+          requiredRight: CapRight.llmInfer,
+          kind: 'other',
+          applyIoCap: false,
+          handler: (_) async {
+            projectedPrompts.add(
+              projector.project(
+                pcb.memory,
+                targetProvider: LlmProviderId.openRouter.id,
+                targetModel: 'anthropic/claude-haiku-4.5',
+              ),
+            );
+            step += 1;
+            if (step == 1) {
+              return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+                'content': '',
+                'toolCalls': <Map<String, dynamic>>[
+                  const <String, dynamic>{
+                    'id': 'c1',
+                    'name': 'sys_read_lines',
+                    'arguments': <String, dynamic>{'path': '/workspace/foo.dart'},
+                  },
+                ],
+                'usage': const <String, dynamic>{
+                  'promptTokens': 200,
+                  'completionTokens': 20,
+                  'durationMs': 10,
+                },
+              });
+            }
+            return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
+              'content': 'Done',
+              'toolCalls': <dynamic>[],
+              'usage': <String, dynamic>{
+                'promptTokens': 260,
+                'completionTokens': 15,
+                'durationMs': 10,
+              },
+            });
+          },
+        ),
+      );
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: 'sys_read_lines',
+          requiredRight: CapRight.read,
+          kind: 'read',
+          handler: (_) async =>
+              const SyscallResult<Map<String, dynamic>>.success(
+            <String, dynamic>{'content': 'line 1'},
+          ),
+        ),
+      );
+
+      final agent = LeadAgent(
+        pcb: pcb,
+        syscallGate: gate,
+        capHandle: const CapHandle('cap_workspace_rw'),
+        modelResolver: modelResolver,
+      );
+      addTearDown(agent.dispose);
+
+      // Part 1: Non-empty dynamicContextSummary -> Step 1 wire user message == Step 2 Segment 1 user message.
+      final res1 = await agent.runTurn(
+        userInput: 'Inspect foo.dart',
+        dynamicContextSummary: '  [Workspace Context]\njj status: clean  ',
+      );
+      expect(res1.ok, isTrue);
+      expect(projectedPrompts, hasLength(2));
+
+      final step1UserMsg = projectedPrompts[0]
+          .messages
+          .firstWhere((m) => m.role == ProjectedRole.user)
+          .content;
+      final step2UserMsg = projectedPrompts[1]
+          .messages
+          .firstWhere((m) => m.role == ProjectedRole.user)
+          .content;
+      expect(
+        step1UserMsg,
+        equals('[Workspace Context]\njj status: clean\n\nInspect foo.dart'),
+      );
+      expect(step2UserMsg, equals(step1UserMsg));
+      expect(
+        (pcb.memory.historySegment.turns.first as CanonicalUserTurn).text,
+        equals(step1UserMsg),
+      );
+
+      // Part 2: pageDirectorySummary MUST NOT be committed into Segment 1.
+      step = 0;
+      projectedPrompts.clear();
+      pcb.memory.ephemeralSegment.pageDirectorySummary =
+          '[Context Page Directory]\n- pg_1: /workspace/old.dart (evicted)';
+
+      final res2 = await agent.runTurn(
+        userInput: 'Second turn prompt',
+        dynamicContextSummary: '[Dynamic Summary Turn 2]',
+      );
+      expect(res2.ok, isTrue);
+      final userTurns =
+          pcb.memory.historySegment.turns.whereType<CanonicalUserTurn>().toList();
+      expect(userTurns, hasLength(2));
+      expect(
+        userTurns[1].text,
+        equals('[Dynamic Summary Turn 2]\n\nSecond turn prompt'),
+      );
+      expect(userTurns[1].text, isNot(contains('[Context Page Directory]')));
+      expect(
+        pcb.memory.ephemeralSegment.pageDirectorySummary,
+        contains('[Context Page Directory]'),
+      );
+
+      // Part 3: Whitespace-only dynamicContextSummary commits baseInput unchanged.
+      step = 0;
+      pcb.memory.ephemeralSegment.pageDirectorySummary = null;
+      final res3 = await agent.runTurn(
+        userInput: 'Plain prompt',
+        dynamicContextSummary: '   \n\t  ',
+      );
+      expect(res3.ok, isTrue);
+      final userTurnsAfter3 =
+          pcb.memory.historySegment.turns.whereType<CanonicalUserTurn>().toList();
+      expect(userTurnsAfter3.last.text, equals('Plain prompt'));
+    });
   });
 }

@@ -2,6 +2,7 @@
 library;
 
 export 'src/llm/context_window_resolver.dart';
+export 'src/llm/gateway_cache_policy.dart';
 export 'src/llm/gemini_driver.dart';
 export 'src/llm/llm_env_loader.dart';
 export 'src/llm/llm_router.dart';

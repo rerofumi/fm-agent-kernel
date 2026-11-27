@@ -37,13 +37,13 @@ Rules:
 6. Keep answers concise, accurate, and grounded in observed tool outputs.
 ''';
 
-  /// Default immutable Segment 0 instruction for Stage 2 multi-process execution ([D-007], [D-211], [D-218], [D-219]).
+  /// Default immutable Segment 0 instruction for Stage 2 multi-process execution ([D-007], [D-211], [D-218], [D-219], [D-509]).
   static const String leadStage2Instruction = '''
 $leadStep1Instruction
 Available Stage 2/3 virtual memory, multi-process, merge, and skill syscalls:
 - `sys_mem_pagein`: Reload an evicted Clean Page by `pageId` from Segment 2's Page Directory Summary.
-- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit).
-- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s.
+- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit; `maxWallTimeMs` default `600000` / max `3600000` ms, `maxSteps` default `32` / max `128`, `heartbeatTimeoutMs` default `300000` / max `600000` ms, paused during `SIGSTOP`).
+- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s in `children`. Non-destructive on timeout (`timeoutMs` default `120000`, max `600000`): unfinished children continue running and are returned with `timedOut: true` and live `heartbeat` progress snapshots in `running` so you can re-wait with `sys_wait` or intervene with `sys_kill` if stalled/looping.
 - `sys_jj_merge`: Merge 2+ completed worker `changeIds` into a multi-parent commit (never aborts on First-Class Conflicts; returns `mergeChangeId`, `hasConflicts`, and `conflictedFiles`).
 - `sys_jj_conflicts`: Non-destructively inspect First-Class Conflicts on a revision (`hasConflicts` and `/workspace/...` `files`).
 - `sys_jj_integrate`: Flatten a conflict-free resolved merge or worker change into your single-parent anchor working change and abandon temporary worker/merge changes before `sys_tx_squash`.
@@ -68,10 +68,34 @@ Available Stage 3 team, signal, dirty-swap, MCP, and stacked-task syscalls:
 - `sys_mem_pagein`: Also restores evicted Dirty Page Turn Groups (`source: "dirty_swap"`) by `pageId` or `summaryPageId`.
 ''';
 
+  /// Builds the immutable Segment 0 instruction for LeadAgent at [stage] (`1`, `2`, or `3`),
+  /// deterministically appending [additionalExecRuleSummaries] when non-empty ([D-509]).
+  static String buildLeadInstruction({
+    required int stage,
+    List<String> additionalExecRuleSummaries = const <String>[],
+  }) {
+    final String base;
+    switch (stage) {
+      case 1:
+        base = leadStep1Instruction;
+      case 2:
+        base = leadStage2Instruction;
+      case 3:
+        base = leadStage3Instruction;
+      default:
+        throw ArgumentError.value(stage, 'stage', 'Must be 1, 2, or 3.');
+    }
+    if (additionalExecRuleSummaries.isEmpty) {
+      return base;
+    }
+    return _appendAdditionalExecRules(base, additionalExecRuleSummaries);
+  }
+
   /// Builds the immutable Segment 0 instruction for a Ring 3 child Isolate worker.
   static String buildChildInstruction({
     required ProcessProfileId profile,
     List<String>? allowedSubpaths,
+    List<String> additionalExecRuleSummaries = const <String>[],
   }) {
     switch (profile) {
       case ProcessProfileId.explorer:
@@ -98,7 +122,7 @@ When finished, call `sys_exit(exitCode: 0, summary: "...")` (or reply directly) 
         final scopeNote = (allowedSubpaths != null && allowedSubpaths.isNotEmpty)
             ? 'Your workspace access is strictly scoped to: ${allowedSubpaths.join(', ')}.'
             : 'Your isolated Jujutsu workspace is mounted at /workspace.';
-        return '''
+        final base = '''
 You are a sandboxed Ring 3 WorkspaceWorker sub-agent running inside FM Agent OS.
 $scopeNote
 You own an independent jj workspace and dedicated Change ID; your edits and tests do not affect the main workspace or other parallel workers.
@@ -107,11 +131,14 @@ You may run allowlisted verification commands via `sys_exec` (`dart test`, `dart
 All `sys_jj_status` / `sys_jj_log` / `sys_jj_diff` calls run with `--ignore-working-copy` on your own workspace.
 Before finishing, run `dart analyze` and the relevant `dart test` target via `sys_exec` to verify your changes, then call `sys_exit(exitCode: 0, summary: "...")` with a concise summary of changed files and test results.
 ''';
+        return additionalExecRuleSummaries.isEmpty
+            ? base
+            : _appendAdditionalExecRules(base, additionalExecRuleSummaries);
       case ProcessProfileId.conflictResolver:
         final scopeNote = (allowedSubpaths != null && allowedSubpaths.isNotEmpty)
             ? 'Your conflict-resolution workspace access is strictly scoped to: ${allowedSubpaths.join(', ')}.'
             : 'Your isolated Jujutsu workspace is mounted at /workspace.';
-        return '''
+        final base = '''
 You are a sandboxed Ring 3 ConflictResolver sub-agent running inside FM Agent OS.
 $scopeNote
 You own an independent jj workspace branched from a First-Class Conflict commit, so conflict markers (`<<<<<<< conflict ... >>>>>>> conflict ... ends`) are already materialized in the affected files under `/workspace`.
@@ -123,7 +150,21 @@ Follow this exact workflow:
 5. Run `dart analyze` and relevant `dart test` targets via `sys_exec` (only allowlisted verification commands are permitted; `jj`, `git`, `dart pub get`, and shells are blocked by `EPERM`).
 6. Call `sys_exit(exitCode: 0, summary: "...")` reporting the resolved files and verified test results.
 ''';
+        return additionalExecRuleSummaries.isEmpty
+            ? base
+            : _appendAdditionalExecRules(base, additionalExecRuleSummaries);
     }
+  }
+
+  static String _appendAdditionalExecRules(
+    String base,
+    List<String> summaries,
+  ) {
+    final bullets = summaries.map((s) => '- $s').join('\n');
+    return '$base\n'
+        'Additional `sys_exec` direct commands auto-allowed by `.agent_os/exec_policy.json` '
+        '(shell metacharacters, shell wrappers, raw `git`/`jj`, and paths outside `/workspace` remain blocked):\n'
+        '$bullets\n';
   }
 
   /// Formats a `SIGCONT` runtime policy constraint for injection into the
