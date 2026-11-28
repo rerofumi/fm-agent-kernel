@@ -110,6 +110,76 @@ void main() {
       );
     }
 
+    for (final state in <ProcessState>[
+      ProcessState.terminated,
+      ProcessState.stopped,
+    ]) {
+      test(
+        'preserves ${state.name} while driver execution is pending',
+        () async {
+          final entered = Completer<void>();
+          final finish = Completer<void>();
+          final gate = createGate(
+            approvalHandler: PolicyApprovalHandler.alwaysAllow(),
+          );
+          gate.registerSyscall(
+            SyscallDefinition(
+              name: 'sys_read_lines',
+              requiredRight: CapRight.read,
+              kind: 'read',
+              handler: (_) async {
+                entered.complete();
+                await finish.future;
+                return const SyscallResult<Map<String, dynamic>>.success(
+                  <String, dynamic>{},
+                );
+              },
+            ),
+          );
+          final pending = gate.invoke(
+            ctx,
+            SyscallRequest(name: 'sys_read_lines'),
+          );
+          await entered.future;
+          expect(pcb.state, ProcessState.waitingSyscall);
+          pcb.state = state;
+          finish.complete();
+          expect((await pending).ok, isTrue);
+          expect(pcb.state, state);
+        },
+      );
+
+      test('preserves ${state.name} while approval is pending', () async {
+        final entered = Completer<void>();
+        final finish = Completer<ApprovalDecision>();
+        final gate = createGate(
+          approvalHandler: PolicyApprovalHandler((_, _) async {
+            entered.complete();
+            return finish.future;
+          }),
+        );
+        gate.registerSyscall(
+          SyscallDefinition(
+            name: 'sys_exec',
+            requiredRight: CapRight.exec,
+            kind: 'execute',
+            evaluatePolicy: (_, _) async => RingDecision.askUser,
+            handler: (_) async =>
+                const SyscallResult<Map<String, dynamic>>.success(
+                  <String, dynamic>{},
+                ),
+          ),
+        );
+        final pending = gate.invoke(ctx, SyscallRequest(name: 'sys_exec'));
+        await entered.future;
+        expect(pcb.state, ProcessState.waitingApproval);
+        pcb.state = state;
+        finish.complete(const ApprovalDecision.rejectOnce());
+        expect((await pending).error!.reason, 'DENIED_BY_USER');
+        expect(pcb.state, state);
+      });
+    }
+
     test('enforces Stage 3 hook BEFORE Stage 4 ApprovalGate (approval handler called 0 times)', () async {
       final hook = _TestBlockHook(blockedCommand: 'git status');
       final approvalHandler = PolicyApprovalHandler.alwaysAllow();
