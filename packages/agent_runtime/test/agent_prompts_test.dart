@@ -37,8 +37,8 @@ void main() {
       const expectedStage2 = '$expectedStep1\n'
           'Available Stage 2/3 virtual memory, multi-process, merge, and skill syscalls:\n'
           '- `sys_mem_pagein`: Reload an evicted Clean Page by `pageId` from Segment 2\'s Page Directory Summary.\n'
-          '- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit).\n'
-          '- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s.\n'
+          '- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit; `maxWallTimeMs` default `600000` / max `3600000` ms, `maxSteps` default `32` / max `128`, `heartbeatTimeoutMs` default `300000` / max `600000` ms, paused during `SIGSTOP`).\n'
+          '- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s in `children`. Non-destructive on timeout (`timeoutMs` default `120000`, max `600000`): unfinished children continue running and are returned with `timedOut: true` and live `heartbeat` progress snapshots in `running` so you can re-wait with `sys_wait` or intervene with `sys_kill` if stalled/looping.\n'
           '- `sys_jj_merge`: Merge 2+ completed worker `changeIds` into a multi-parent commit (never aborts on First-Class Conflicts; returns `mergeChangeId`, `hasConflicts`, and `conflictedFiles`).\n'
           '- `sys_jj_conflicts`: Non-destructively inspect First-Class Conflicts on a revision (`hasConflicts` and `/workspace/...` `files`).\n'
           '- `sys_jj_integrate`: Flatten a conflict-free resolved merge or worker change into your single-parent anchor working change and abandon temporary worker/merge changes before `sys_tx_squash`.\n'
@@ -296,6 +296,111 @@ void main() {
           'Avoid starting broad new investigations; finish essential tool calls, '
           'summarize your verified findings and remaining work clearly, and return '
           'a final response so the user can continue seamlessly.',
+        ),
+      );
+    });
+
+    test(
+        'buildLeadInstruction and buildChildInstruction reflect additionalExecRuleSummaries deterministically [D-509]',
+        () {
+      const summaries = <String>[
+        '`v` (allowed prefixes: `test`, `fmt`; maxTimeoutMs: 180000)',
+        '`hostname` (any safe workspace args; maxTimeoutMs: 30000)',
+      ];
+      const expectedSuffix =
+          '\nAdditional `sys_exec` direct commands auto-allowed by `.agent_os/exec_policy.json` '
+          '(shell metacharacters, shell wrappers, raw `git`/`jj`, and paths outside `/workspace` remain blocked):\n'
+          '- `v` (allowed prefixes: `test`, `fmt`; maxTimeoutMs: 180000)\n'
+          '- `hostname` (any safe workspace args; maxTimeoutMs: 30000)\n';
+
+      // Empty summaries preserve identical constant references.
+      expect(
+        identical(
+          AgentPrompts.buildLeadInstruction(stage: 1),
+          AgentPrompts.leadStep1Instruction,
+        ),
+        isTrue,
+      );
+      expect(
+        identical(
+          AgentPrompts.buildLeadInstruction(stage: 2),
+          AgentPrompts.leadStage2Instruction,
+        ),
+        isTrue,
+      );
+      expect(
+        identical(
+          AgentPrompts.buildLeadInstruction(stage: 3),
+          AgentPrompts.leadStage3Instruction,
+        ),
+        isTrue,
+      );
+      expect(
+        () => AgentPrompts.buildLeadInstruction(stage: 4),
+        throwsArgumentError,
+      );
+
+      expect(
+        AgentPrompts.buildLeadInstruction(
+          stage: 1,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals('${AgentPrompts.leadStep1Instruction}$expectedSuffix'),
+      );
+      expect(
+        AgentPrompts.buildLeadInstruction(
+          stage: 2,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals('${AgentPrompts.leadStage2Instruction}$expectedSuffix'),
+      );
+      expect(
+        AgentPrompts.buildLeadInstruction(
+          stage: 3,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals('${AgentPrompts.leadStage3Instruction}$expectedSuffix'),
+      );
+
+      // Ring 3 profiles: workspaceWorker & conflictResolver append; explorer & webResearcher ignore.
+      expect(
+        AgentPrompts.buildChildInstruction(
+          profile: ProcessProfileId.explorer,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals(
+          AgentPrompts.buildChildInstruction(
+            profile: ProcessProfileId.explorer,
+          ),
+        ),
+      );
+      expect(
+        AgentPrompts.buildChildInstruction(
+          profile: ProcessProfileId.webResearcher,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals(
+          AgentPrompts.buildChildInstruction(
+            profile: ProcessProfileId.webResearcher,
+          ),
+        ),
+      );
+      expect(
+        AgentPrompts.buildChildInstruction(
+          profile: ProcessProfileId.workspaceWorker,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals(
+          '${AgentPrompts.buildChildInstruction(profile: ProcessProfileId.workspaceWorker)}$expectedSuffix',
+        ),
+      );
+      expect(
+        AgentPrompts.buildChildInstruction(
+          profile: ProcessProfileId.conflictResolver,
+          additionalExecRuleSummaries: summaries,
+        ),
+        equals(
+          '${AgentPrompts.buildChildInstruction(profile: ProcessProfileId.conflictResolver)}$expectedSuffix',
         ),
       );
     });

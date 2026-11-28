@@ -411,8 +411,10 @@ class LeadAgent {
     var userTurnCommitted = false;
     var promptAgg = 0;
     var completionAgg = 0;
-    int? lastCachedTokens;
-    int? lastCacheWriteTokens;
+    var cachedAgg = 0;
+    var hasAnyCached = false;
+    var cacheWriteAgg = 0;
+    var hasAnyCacheWrite = false;
     var costAgg = 0;
     var hasAnyCost = false;
     int? lastTtftMs;
@@ -578,11 +580,13 @@ class LeadAgent {
           completionAgg += (usageMap['completionTokens'] as num?)?.toInt() ?? 0;
           final cached = usageMap['cachedTokens'];
           if (cached is num) {
-            lastCachedTokens = cached.toInt();
+            cachedAgg += cached.toInt();
+            hasAnyCached = true;
           }
           final cacheWrite = usageMap['cacheWriteTokens'];
           if (cacheWrite is num) {
-            lastCacheWriteTokens = cacheWrite.toInt();
+            cacheWriteAgg += cacheWrite.toInt();
+            hasAnyCacheWrite = true;
           }
           final cost = usageMap['costMicroUsd'];
           if (cost is num) {
@@ -603,8 +607,16 @@ class LeadAgent {
 
         // Commit user prompt into Segment 1 once Step 1 succeeds and clear Segment 2.
         if (!userTurnCommitted) {
-          final committedInput =
+          final dynSummary =
+              pcb.memory.ephemeralSegment.dynamicContextSummary?.trim();
+          final baseInput =
               pcb.memory.ephemeralSegment.currentUserInput ?? userInput;
+          final committedInput =
+              (dynSummary != null && dynSummary.isNotEmpty)
+                  ? (baseInput.isNotEmpty
+                      ? '$dynSummary\n\n$baseInput'
+                      : dynSummary)
+                  : baseInput;
           pcb.memory.appendUserTurn(committedInput);
           pcb.memory.ephemeralSegment.dynamicContextSummary = null;
           pcb.memory.ephemeralSegment.currentUserInput = null;
@@ -646,8 +658,8 @@ class LeadAgent {
           final telemetry = LlmUsageTelemetry(
             promptTokens: promptAgg,
             completionTokens: completionAgg,
-            cachedTokens: lastCachedTokens,
-            cacheWriteTokens: lastCacheWriteTokens,
+            cachedTokens: hasAnyCached ? cachedAgg : null,
+            cacheWriteTokens: hasAnyCacheWrite ? cacheWriteAgg : null,
             costMicroUsd: hasAnyCost ? costAgg : null,
             ttftMs: lastTtftMs,
             durationMs: durationAgg,

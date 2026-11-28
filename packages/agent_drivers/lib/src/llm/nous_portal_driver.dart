@@ -2,12 +2,14 @@ import 'dart:io';
 
 import 'package:agent_kernel/agent_kernel.dart';
 
+import 'gateway_cache_policy.dart';
 import 'open_ai_compat_driver.dart';
 
-/// Nous Portal (`inference-api.nousresearch.com/v1`) SSE streaming driver ([D-402], [D-403]).
+/// Nous Portal (`inference-api.nousresearch.com/v1`) SSE streaming driver ([D-402], [D-403], [D-603]).
 ///
 /// Implements:
 /// - `NOUS_API_KEY` Bearer authentication
+/// - `x-session-id` / `session_id` Sticky Session routing and top-level `cache_control` via [GatewayExplicitCachePolicy]
 /// - `stream_options: {"include_usage": true}` with EOF completion when `[DONE]` is omitted
 /// - Extraction & same-model echo-back of `reasoning_content` / `reasoning_details`
 /// - `usage.cost` to `costMicroUsd` conversion via [OpenAiCompatDriver]
@@ -75,6 +77,32 @@ class NousPortalDriver extends OpenAiCompatDriver {
       return key;
     }
     return null;
+  }
+
+  @override
+  Map<String, String> buildHeaders(
+    LlmChatRequest request, {
+    String? apiKey,
+  }) {
+    return <String, String>{
+      ...super.buildHeaders(request, apiKey: apiKey),
+      if (request.sessionUuid.trim().isNotEmpty)
+        'x-session-id': request.sessionUuid,
+    };
+  }
+
+  @override
+  Map<String, dynamic> buildRequestBody(LlmChatRequest request) {
+    final body = super.buildRequestBody(request);
+    if (request.sessionUuid.trim().isNotEmpty) {
+      body['session_id'] = request.sessionUuid;
+    }
+    if (GatewayExplicitCachePolicy.supportsTopLevelCacheControl(
+      request.model.modelName,
+    )) {
+      body['cache_control'] = GatewayExplicitCachePolicy.ephemeralCacheControl;
+    }
+    return body;
   }
 
   @override

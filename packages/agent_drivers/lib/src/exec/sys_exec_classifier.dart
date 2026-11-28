@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:agent_kernel/agent_kernel.dart';
 import 'package:path/path.dart' as p;
 
+import 'exec_policy_config.dart';
+
 /// Normalized representation of a `sys_exec` command invocation ([D-016], `40_specification.md` §2.3).
 class NormalizedExecCommand {
   const NormalizedExecCommand({
@@ -22,13 +24,9 @@ class NormalizedExecCommand {
 class SysExecCommandNormalizer {
   const SysExecCommandNormalizer._();
 
-  static final RegExp _shellMetaPattern = RegExp(
-    r'[&|;><`\r\n\x00%]|\$\(',
-  );
-
   /// Returns true if [input] contains any shell metacharacter or control character.
   static bool containsShellMetacharacters(String input) =>
-      _shellMetaPattern.hasMatch(input);
+      ExecPolicyConfig.containsShellMetacharacters(input);
 
   /// Normalizes `{command, args}` inputs.
   ///
@@ -149,37 +147,20 @@ class SysExecClassification {
   final String reason;
 }
 
-/// Enforces the 5 mandatory Ring 2 immediate-allow conditions for `sys_exec` (`40_specification.md` §2.3).
+/// Enforces Ring 2/3 immediate-allow conditions and common hard guards for `sys_exec` ([D-016], [D-507]).
 class SysExecClassifier {
-  SysExecClassifier({required this.namespace});
+  SysExecClassifier({
+    required this.namespace,
+    ExecPolicyConfig? policy,
+  }) : policy = policy ?? ExecPolicyConfig.defaults();
 
   final VfsNamespace namespace;
+  final ExecPolicyConfig policy;
 
   static const int maxAutoAllowTimeoutMs = 120000;
 
-  static const Set<String> _shellWrappers = <String>{
-    'cmd',
-    'powershell',
-    'pwsh',
-    'sh',
-    'bash',
-    'wsl',
-    'zsh',
-    'fish',
-    'ash',
-    'dash',
-  };
-
-  static const Set<String> _externalNetworkCommands = <String>{
-    'curl',
-    'wget',
-    'invoke-webrequest',
-    'iwr',
-    'invoke-restmethod',
-    'irm',
-  };
-
   static final RegExp _drivePrefixPattern = RegExp(r'^[a-zA-Z]:');
+  static final RegExp _urlSchemePattern = RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://');
   static final RegExp _concurrencyEqualsPattern =
       RegExp(r'^--concurrency=([1-8])$');
 
@@ -213,7 +194,7 @@ class SysExecClassifier {
     '--fatal-warnings',
   };
 
-  /// Evaluates whether the normalized command satisfies all 5 conditions for `RingDecision.allow`.
+  /// Evaluates whether the normalized command satisfies common hard guards and allowlist rules ([D-507]).
   SysExecClassification classify({
     required String command,
     required List<String> args,
@@ -222,22 +203,18 @@ class SysExecClassifier {
     VfsNamespace? namespaceOverride,
   }) {
     if (namespaceOverride != null && !identical(namespaceOverride, namespace)) {
-      return SysExecClassifier(namespace: namespaceOverride).classify(
+      return SysExecClassifier(
+        namespace: namespaceOverride,
+        policy: policy,
+      ).classify(
         command: command,
         args: args,
         workingDir: workingDir,
         timeoutMs: timeoutMs,
       );
     }
-    // Condition 5: Timeout within 120,000 ms.
-    if (timeoutMs > maxAutoAllowTimeoutMs) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
-        reason: 'TIMEOUT_EXCEEDS_AUTO_ALLOW_LIMIT',
-      );
-    }
 
-    // Condition 1: Zero shell metacharacters or control characters.
+    // Step 1: Common hard guards (always evaluated before built-in and custom rules).
     if (SysExecCommandNormalizer.containsShellMetacharacters(command) ||
         args.any(SysExecCommandNormalizer.containsShellMetacharacters)) {
       return const SysExecClassification(
@@ -246,36 +223,38 @@ class SysExecClassifier {
       );
     }
 
-    // Condition 2: No shell wrappers; must directly invoke `dart` without path separators.
     final trimmedExe = command.trim();
-    if (trimmedExe.contains('/') || trimmedExe.contains(r'\')) {
+    if (trimmedExe.isEmpty ||
+        trimmedExe.contains('/') ||
+        trimmedExe.contains(r'\') ||
+        trimmedExe.contains(':')) {
       return const SysExecClassification(
         decision: RingDecision.askUser,
         reason: 'EXECUTABLE_PATH_NOT_ALLOWLISTED',
       );
     }
+
     final normalizedBase = _normalizeExeBase(trimmedExe);
-    if (_shellWrappers.contains(normalizedBase)) {
+    if (ExecPolicyConfig.shellWrappers.contains(normalizedBase)) {
       return const SysExecClassification(
         decision: RingDecision.askUser,
         reason: 'SHELL_WRAPPER_NOT_ALLOWLISTED',
       );
     }
-    if (_externalNetworkCommands.contains(normalizedBase)) {
+    if (ExecPolicyConfig.externalNetworkCommands.contains(normalizedBase)) {
       return const SysExecClassification(
         decision: RingDecision.askUser,
         reason:
             'EXTERNAL_NETWORK_COMMAND: Direct network command via sys_exec (prefer delegating web lookup to web_researcher).',
       );
     }
-    if (normalizedBase != 'dart') {
+    if (ExecPolicyConfig.blockedVcsCommands.contains(normalizedBase)) {
       return const SysExecClassification(
         decision: RingDecision.askUser,
-        reason: 'NON_ALLOWLISTED_EXECUTABLE',
+        reason: 'VCS_COMMAND_NOT_ALLOWLISTED',
       );
     }
 
-    // Condition 3 (part 1): workingDir must resolve cleanly inside /workspace.
     final effectiveWorkingDir =
         (workingDir == null || workingDir.trim().isEmpty)
             ? VfsNamespace.virtualRoot
@@ -292,8 +271,52 @@ class SysExecClassifier {
         reason: 'WORKING_DIR_OUT_OF_SCOPE',
       );
     }
+    final resolvedWorkingVirtualDir = wdRes.value!.virtualPath;
 
-    // Condition 4: Must match allowlisted `dart test`, `dart analyze`, or `dart format --output=none`.
+    // Step 2: Built-in `dart` 3 rules (preserve existing timeout & reason codes).
+    if (normalizedBase == 'dart') {
+      final builtinResult = _classifyBuiltinDart(
+        args: args,
+        resolvedWorkingVirtualDir: resolvedWorkingVirtualDir,
+        timeoutMs: timeoutMs,
+      );
+      if (builtinResult.decision == RingDecision.allow) {
+        return builtinResult;
+      }
+      if (policy.rulesForCommand(normalizedBase).isNotEmpty) {
+        final customResult = _classifyWithExecPolicy(
+          normalizedBase: normalizedBase,
+          args: args,
+          resolvedWorkingVirtualDir: resolvedWorkingVirtualDir,
+          timeoutMs: timeoutMs,
+        );
+        if (customResult.decision == RingDecision.allow) {
+          return customResult;
+        }
+      }
+      return builtinResult;
+    }
+
+    // Step 3: Custom `.agent_os/exec_policy.json` rules.
+    return _classifyWithExecPolicy(
+      normalizedBase: normalizedBase,
+      args: args,
+      resolvedWorkingVirtualDir: resolvedWorkingVirtualDir,
+      timeoutMs: timeoutMs,
+    );
+  }
+
+  SysExecClassification _classifyBuiltinDart({
+    required List<String> args,
+    required String resolvedWorkingVirtualDir,
+    required int timeoutMs,
+  }) {
+    if (timeoutMs > maxAutoAllowTimeoutMs) {
+      return const SysExecClassification(
+        decision: RingDecision.askUser,
+        reason: 'TIMEOUT_EXCEEDS_AUTO_ALLOW_LIMIT',
+      );
+    }
     if (args.isEmpty) {
       return const SysExecClassification(
         decision: RingDecision.askUser,
@@ -304,9 +327,9 @@ class SysExecClassifier {
     final subcommand = args.first;
     final rest = args.sublist(1);
     return switch (subcommand) {
-      'test' => _classifyDartTest(rest),
-      'analyze' => _classifyDartAnalyze(rest),
-      'format' => _classifyDartFormat(rest),
+      'test' => _classifyDartTest(rest, resolvedWorkingVirtualDir),
+      'analyze' => _classifyDartAnalyze(rest, resolvedWorkingVirtualDir),
+      'format' => _classifyDartFormat(rest, resolvedWorkingVirtualDir),
       _ => const SysExecClassification(
           decision: RingDecision.askUser,
           reason: 'NON_ALLOWLISTED_DART_SUBCOMMAND',
@@ -314,7 +337,136 @@ class SysExecClassifier {
     };
   }
 
-  SysExecClassification _classifyDartTest(List<String> rest) {
+  SysExecClassification _classifyWithExecPolicy({
+    required String normalizedBase,
+    required List<String> args,
+    required String resolvedWorkingVirtualDir,
+    required int timeoutMs,
+  }) {
+    final rules = policy.rulesForCommand(normalizedBase);
+    if (rules.isEmpty) {
+      return const SysExecClassification(
+        decision: RingDecision.askUser,
+        reason: 'NON_ALLOWLISTED_EXECUTABLE',
+      );
+    }
+
+    final argsFailure = _validateCustomCommandArgs(
+      args,
+      workingVirtualDir: resolvedWorkingVirtualDir,
+    );
+    if (argsFailure != null) {
+      return argsFailure;
+    }
+
+    final matchingRules =
+        rules.where((rule) => rule.matchesArgs(args)).toList(growable: false);
+    if (matchingRules.isEmpty) {
+      return const SysExecClassification(
+        decision: RingDecision.askUser,
+        reason: 'NON_ALLOWLISTED_SUBCOMMAND',
+      );
+    }
+
+    final allowsTimeout =
+        matchingRules.any((rule) => timeoutMs <= rule.maxTimeoutMs);
+    if (!allowsTimeout) {
+      return const SysExecClassification(
+        decision: RingDecision.askUser,
+        reason: 'TIMEOUT_EXCEEDS_AUTO_ALLOW_LIMIT',
+      );
+    }
+
+    return const SysExecClassification(
+      decision: RingDecision.allow,
+      reason: 'ALLOWLISTED_BY_EXEC_POLICY',
+    );
+  }
+
+  SysExecClassification? _validateCustomCommandArgs(
+    List<String> args, {
+    required String workingVirtualDir,
+  }) {
+    for (var i = 0; i < args.length; i++) {
+      final trimmed = args[i].trim();
+      if (trimmed.isEmpty) {
+        return const SysExecClassification(
+          decision: RingDecision.askUser,
+          reason: 'EMPTY_ARGUMENT',
+        );
+      }
+
+      if (trimmed == '--' && i + 1 < args.length) {
+        final targetBase =
+            ExecAllowRule.normalizeCommandBasename(args[i + 1]);
+        if (ExecPolicyConfig.forbiddenCommands.contains(targetBase)) {
+          return const SysExecClassification(
+            decision: RingDecision.askUser,
+            reason: 'WRAPPER_TARGET_NOT_ALLOWLISTED',
+          );
+        }
+      }
+
+      if (trimmed.startsWith('-') && !trimmed.contains('=')) {
+        if (_hasUnsafeFlagChars(trimmed)) {
+          return const SysExecClassification(
+            decision: RingDecision.askUser,
+            reason: 'UNSAFE_FLAG_ARGUMENT',
+          );
+        }
+      } else if (trimmed.startsWith('-') && trimmed.contains('=')) {
+        final eqIdx = trimmed.indexOf('=');
+        final flagPart = trimmed.substring(0, eqIdx);
+        final valuePart = trimmed.substring(eqIdx + 1).trim();
+        if (flagPart == '-' ||
+            flagPart == '--' ||
+            _hasUnsafeFlagChars(flagPart)) {
+          return const SysExecClassification(
+            decision: RingDecision.askUser,
+            reason: 'UNSAFE_FLAG_ARGUMENT',
+          );
+        }
+        if (valuePart.isEmpty ||
+            !_isSafeWorkspaceToken(
+              valuePart,
+              workingVirtualDir: workingVirtualDir,
+            )) {
+          return const SysExecClassification(
+            decision: RingDecision.askUser,
+            reason: 'UNSAFE_PATH_ARGUMENT',
+          );
+        }
+      } else {
+        if (!_isSafeWorkspaceToken(
+          trimmed,
+          workingVirtualDir: workingVirtualDir,
+        )) {
+          return const SysExecClassification(
+            decision: RingDecision.askUser,
+            reason: 'UNSAFE_PATH_ARGUMENT',
+          );
+        }
+      }
+    }
+    return null;
+  }
+
+  static bool _hasUnsafeFlagChars(String flag) {
+    final lower = flag.toLowerCase();
+    return flag.contains('/') ||
+        flag.contains(r'\') ||
+        flag.contains(':') ||
+        flag.contains('..') ||
+        lower.contains('.jj') ||
+        lower.contains('.git') ||
+        lower.contains('.agent_os') ||
+        lower.contains('.env');
+  }
+
+  SysExecClassification _classifyDartTest(
+    List<String> rest,
+    String workingVirtualDir,
+  ) {
     var i = 0;
     while (i < rest.length) {
       final arg = rest[i];
@@ -357,7 +509,10 @@ class SysExecClassifier {
           reason: 'UNALLOWED_DART_TEST_OPTION',
         );
       }
-      if (!_isSafeWorkspacePathArg(arg)) {
+      if (!_isSafeWorkspacePathArg(
+        arg,
+        workingVirtualDir: workingVirtualDir,
+      )) {
         return const SysExecClassification(
           decision: RingDecision.askUser,
           reason: 'UNSAFE_PATH_ARGUMENT',
@@ -372,7 +527,10 @@ class SysExecClassifier {
     );
   }
 
-  SysExecClassification _classifyDartAnalyze(List<String> rest) {
+  SysExecClassification _classifyDartAnalyze(
+    List<String> rest,
+    String workingVirtualDir,
+  ) {
     var i = 0;
     while (i < rest.length) {
       final arg = rest[i];
@@ -409,7 +567,10 @@ class SysExecClassifier {
           reason: 'UNALLOWED_DART_ANALYZE_OPTION',
         );
       }
-      if (!_isSafeWorkspacePathArg(arg)) {
+      if (!_isSafeWorkspacePathArg(
+        arg,
+        workingVirtualDir: workingVirtualDir,
+      )) {
         return const SysExecClassification(
           decision: RingDecision.askUser,
           reason: 'UNSAFE_PATH_ARGUMENT',
@@ -424,7 +585,10 @@ class SysExecClassifier {
     );
   }
 
-  SysExecClassification _classifyDartFormat(List<String> rest) {
+  SysExecClassification _classifyDartFormat(
+    List<String> rest,
+    String workingVirtualDir,
+  ) {
     var hasOutputNone = false;
     for (final arg in rest) {
       if (arg == '--output=none') {
@@ -440,7 +604,10 @@ class SysExecClassifier {
           reason: 'UNALLOWED_DART_FORMAT_OPTION',
         );
       }
-      if (!_isSafeWorkspacePathArg(arg)) {
+      if (!_isSafeWorkspacePathArg(
+        arg,
+        workingVirtualDir: workingVirtualDir,
+      )) {
         return const SysExecClassification(
           decision: RingDecision.askUser,
           reason: 'UNSAFE_PATH_ARGUMENT',
@@ -461,31 +628,45 @@ class SysExecClassifier {
     );
   }
 
-  /// Verifies Condition 3 for a path argument: no `..`, no external absolute/UNC/drive paths,
-  /// and resolves cleanly within `/workspace` (excluding protected internal paths).
-  bool _isSafeWorkspacePathArg(String rawArg) {
-    final trimmed = rawArg.trim();
+  /// Verifies path/value token safety for built-in and custom commands within `/workspace`.
+  bool _isSafeWorkspaceToken(
+    String rawToken, {
+    required String workingVirtualDir,
+  }) {
+    final trimmed = rawToken.trim();
     if (trimmed.isEmpty) {
       return false;
     }
     if (trimmed.startsWith(r'\\') ||
         trimmed.startsWith('//') ||
-        _drivePrefixPattern.hasMatch(trimmed)) {
+        _drivePrefixPattern.hasMatch(trimmed) ||
+        trimmed.contains(':') ||
+        _urlSchemePattern.hasMatch(trimmed)) {
       return false;
     }
 
     final forward = trimmed.replaceAll('\\', '/');
-    if (forward.split('/').any((seg) => seg == '..')) {
-      return false;
+    for (final seg in forward.split('/')) {
+      if (seg == '..' || VfsNamespace.isProtectedSegment(seg)) {
+        return false;
+      }
     }
-    if (forward.startsWith('/') &&
-        forward != VfsNamespace.virtualRoot &&
-        !forward.startsWith('${VfsNamespace.virtualRoot}/')) {
-      return false;
+
+    final String virtualCandidate;
+    if (forward.startsWith('/')) {
+      if (forward != VfsNamespace.virtualRoot &&
+          !forward.startsWith('${VfsNamespace.virtualRoot}/')) {
+        return false;
+      }
+      virtualCandidate = forward;
+    } else {
+      virtualCandidate = workingVirtualDir == VfsNamespace.virtualRoot
+          ? '${VfsNamespace.virtualRoot}/$forward'
+          : '$workingVirtualDir/$forward';
     }
 
     final resolved = namespace.resolveVirtualPath(
-      forward,
+      virtualCandidate,
       allowRoot: true,
       checkProtected: true,
       checkSymlinks: true,
@@ -493,13 +674,53 @@ class SysExecClassifier {
     return resolved.ok;
   }
 
-  /// Resolves a safe `/workspace/...` argument to a relative path from [hostWorkingDir] for host execution.
+  /// Verifies Condition 3 for a path argument: no `..`, no external absolute/UNC/drive paths,
+  /// and resolves cleanly within `/workspace` (excluding protected internal paths).
+  bool _isSafeWorkspacePathArg(
+    String rawArg, {
+    String workingVirtualDir = VfsNamespace.virtualRoot,
+  }) {
+    return _isSafeWorkspaceToken(
+      rawArg,
+      workingVirtualDir: workingVirtualDir,
+    );
+  }
+
+  /// Resolves a safe `/workspace/...` argument (or `--flag=/workspace/...`) to a relative path from [hostWorkingDir].
   static String resolveHostCommandArg(
     VfsNamespace namespace,
     String hostWorkingDir,
     String rawArg,
   ) {
-    final forward = rawArg.trim().replaceAll('\\', '/');
+    final trimmed = rawArg.trim();
+    if (trimmed.startsWith('-') && trimmed.contains('=')) {
+      final eqIdx = trimmed.indexOf('=');
+      final prefix = trimmed.substring(0, eqIdx);
+      final value = trimmed.substring(eqIdx + 1).trim();
+      final resolvedValue = _resolveStandaloneVirtualArg(
+        namespace,
+        hostWorkingDir,
+        value,
+      );
+      if (resolvedValue != null) {
+        return '$prefix=$resolvedValue';
+      }
+      return rawArg;
+    }
+    return _resolveStandaloneVirtualArg(
+          namespace,
+          hostWorkingDir,
+          trimmed,
+        ) ??
+        rawArg;
+  }
+
+  static String? _resolveStandaloneVirtualArg(
+    VfsNamespace namespace,
+    String hostWorkingDir,
+    String arg,
+  ) {
+    final forward = arg.trim().replaceAll('\\', '/');
     if (forward == VfsNamespace.virtualRoot ||
         forward.startsWith('${VfsNamespace.virtualRoot}/')) {
       final resolved = namespace.resolveVirtualPath(
@@ -513,18 +734,11 @@ class SysExecClassifier {
         return rel == '.' ? '.' : rel.replaceAll('\\', '/');
       }
     }
-    return rawArg;
+    return null;
   }
 
-  static String _normalizeExeBase(String rawExe) {
-    final lower = rawExe.trim().toLowerCase();
-    for (final ext in const <String>['.exe', '.cmd', '.bat']) {
-      if (lower.endsWith(ext)) {
-        return lower.substring(0, lower.length - ext.length);
-      }
-    }
-    return lower;
-  }
+  static String _normalizeExeBase(String rawExe) =>
+      ExecAllowRule.normalizeCommandName(rawExe);
 }
 
 /// Computes the Ring 2 `allow_always` approval signature and human-readable scope

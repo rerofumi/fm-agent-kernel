@@ -1,16 +1,24 @@
-# FM Agent OS (Stage 3)
+# FM Agent OS
 
 Windows 上で動作する、**防波堤カーネル内蔵・Jujutsu (`jj`) ネイティブのマルチプロセス＆マルチワークスペース対応コーディングエージェント OS** です。
-Stage 1 の基盤（保護リング Ring 0 / Ring 2・Capability / Quota・VFS `/workspace`・CAS 付きファイル編集・`jj` Copy-on-Write トランザクション・Win32 Job Object 外部実行隔離・3 プロバイダ対応 LLM ドライバ・ACP v1 `stdio` サーバー＆CLI）および Stage 2 の拡張（Prefix 保持コンテキストページング・Dart `Isolate` 有界 IPC＆権限単調減少・無菌室 `WebResearcher` SSRF 完全遮断・外部 `SKILL.md` `/skills` マウント・Pre/Post Hook）に加え、Stage 3 では以下の機能を実装しています。
 
-- **Step 3-1 — `WorkspaceWorker` 並列 `jj workspace` 実行**: `jj workspace add .agent_os/ws/<pid> -r <base_change> --no-colocate` による独立作業ディレクトリ・無名 `Change ID` 自動払い出し、Pub Workspaces オフライン依存解決（`dart pub get --offline`）、ホスト単一 `JjDriver` ミューテックスによる `-R <ws_path>` 即時スナップショット直列化（`jj op log` 一本道維持）、終了・破棄時の `jj workspace forget` 自動クリーンアップ。
-- **Step 3-2 — 多親マージと First-Class Conflicts 解消フロー**: `sys_jj_merge([c1, c2, ...])` による多親マージコミット生成、`sys_jj_conflicts` による機械可読な競合検査、未解消誤 `squash` 防止（`ECONFLICT` ガード）、親 `LeadAgent` または専任 `ConflictResolver` 子ワーカーによる非停止解消・テスト・`sys_jj_integrate` 単一親平坦化＆Ring 2 承認 `sys_tx_squash` 連動。
-- **Step 3-3 — シグナル制御・Supervisor 自動回復・Dirty Page Swap・`stdio` MCP・Stacked Changes＆ローカル Web カンバン GUI**:
-  - **シグナル制御 (`sys_kill`)**: `SIGSTOP`（協調サスペンドゲート凍結）・`SIGCONT`（追加制約の Segment 1 末尾注入再開）・`SIGKILL`（プロセスツリー＆一時 `jj workspace` 一括回収）。
-  - **Supervisor 自動回復**: ワーカー異常終了・タイムアウト・フォーマット崩壊時の汚染ワークスペース破棄＋クリーン再試行／`fallbackModel` 切替＋クオータ保存則維持（`TOKEN/COST_QUOTA_EXCEEDED` は非リトライ）。
-  - **Dirty Page Swap**: Turn Group 原子単位で `.agent_os/swap/` へ秘密マスク付き Write-back 退避＋決定論的構造化 `SummaryPage` 圧縮・`sys_mem_pagein` 再展開（`--max-context-tokens` 上限キャップ対応）。
-  - **`stdio` MCP クライアント**: ACP `session/new` `mcpServers` ＆ CLI `--mcp-server` 対応、Segment 0 固定スキーマ（`sys_mcp_list_tools` / `sys_mcp_call`）による Prefix キャッシュ保護、Ring 2 承認ゲート連携・資格情報秘匿・終了時回収。
-  - **Stacked Changes & ローカル Web カンバン GUI (`acp_kanban_app.exe`)**: `sys_task_stack` によるタスク積層（`c_A -> c_B`）＆親タスク修正時の自動リベース・`workspace update-stale` 自動追従。`127.0.0.1` 限定・外部 CDN ゼロ・同一オリジン CSRF 保護付きの単一 `.exe` Web カンバン GUI を同梱。
+### 主な機能
+
+- **保護リング・権限分離・隔離実行**: 保護リング（Ring 0 / Ring 2 / Ring 3）、Capability / Quota 会計、VFS（`/workspace`・`/skills`）と SHA-256 CAS 付きファイル編集、Win32 Job Object による外部コマンド隔離実行、セッション単位の `.agent_os/exec_policy.json` 直接実行許可ポリシー（シェル・メタ文字・ネットワーク・生 `git`/`jj`・保護パスを遮断する共通ハードガード維持）、Pre/Post Hook。
+- **`jj` ネイティブトランザクション・並列ワークスペース・Stacked Changes**:
+  - `jj` Copy-on-Write トランザクションと `WorkspaceWorker` による独立 `jj workspace`（`.agent_os/ws/<pid>`・無名 `Change ID`・Pub Workspaces オフライン解決・終了時自動クリーンアップ）、ホスト単一 `JjDriver` ミューテックス直列化による `jj op log` 一本道維持。
+  - 多親マージ（`sys_jj_merge`）・機械可読な競合検査（`sys_jj_conflicts`）・未解消誤 `squash` 防止（`ECONFLICT` ガード）・専任 `ConflictResolver` 子ワーカーによる非停止解消＆単一親平坦化（`sys_jj_integrate`）。
+  - Stacked Changes（`sys_task_stack`）によるタスク積層（`c_A -> c_B`）＆親タスク修正時の自動リベース・`workspace update-stale` 自動追従。
+- **マルチプロセス制御・Heartbeat・Supervisor 自動回復**:
+  - Dart `Isolate` 有界 IPC・権限単調減少・シグナル制御（`sys_kill`: `SIGSTOP` 協調サスペンド / `SIGCONT` 追加制約注入再開 / `SIGKILL` プロセスツリー＆一時ワークスペース一括回収）。
+  - `ProcessSupervisor` 自動回復（異常終了・タイムアウト・フォーマット崩壊時の汚染ワークスペース破棄＋クリーン再試行／`fallbackModel` 切替・クオータ保存則維持）。
+  - サブプロセス上限拡張（`maxWallTimeMs` 既定 10 分 / 最大 60 分、`maxSteps` 既定 `32` / 最大 `128`）、ホスト側 Heartbeat 監視（`heartbeatTimeoutMs` 既定 5 分 / 最大 10 分、無進行時 `HEARTBEAT_TIMEOUT` 終了、`SIGSTOP` 連動）、非破壊 `sys_wait` タイムアウト（`running` スナップショット返却・再 `sys_wait` / `sys_kill` 可能）、ACP `_fm_agent_os/processes`・CLI `/ps` 進捗表示。
+- **コンテキストページング・Dirty Page Swap・プロンプトキャッシュ自動最適化**:
+  - Prefix 保持コンテキストページングおよび Dirty Page Swap（Turn Group 原子単位での `.agent_os/swap/` 秘密マスク退避＋決定論的構造化 `SummaryPage` 圧縮・`sys_mem_pagein` 再展開、`--max-context-tokens` 上限キャップ対応）。
+  - 計 7 LLM プロバイダ対応とプロンプトキャッシュ自動最適化：OpenRouter / Nous Portal 向けトップレベル `cache_control: {"type": "ephemeral"}` 自動付与・Sticky Routing（`x-session-id` / `session_id`）・SSE `delta.reasoning_details` 正規化マージ、OpenAI `prompt_cache_key` 付与、Gemini `v1beta/cachedContents` 明示的 Context Caching（Segment 0 自動キャッシュ・TTL 延長・終了時 `DELETE`・透過フォールバック）、`LeadAgent` ターン集計（`turnSummary`）の全ステップキャッシュ合算・`dynamicContextSummary` Prefix 維持・子プロセス固有 `sessionUuid` 引き回し。
+- **外部連携・無菌室 Web 調査・ACP サーバー / CLI / ローカル Web カンバン GUI**:
+  - 無菌室 `WebResearcher`（SSRF 完全遮断）、外部 `SKILL.md` `/skills` マウント、`stdio` MCP クライアント（ACP `mcpServers` / CLI `--mcp-server` 対応、Segment 0 固定スキーマによる Prefix キャッシュ保護、Ring 2 承認ゲート連携・資格情報秘匿・終了時回収）。
+  - ACP v1 `stdio` サーバー（`agent_os_daemon.exe`）、対話 CLI（`acp_cli_client.exe`）、`127.0.0.1` 限定・外部 CDN ゼロ・同一オリジン CSRF 保護付きの単一 `.exe` ローカル Web カンバン GUI（`acp_kanban_app.exe`）を同梱。
 
 ---
 
@@ -20,8 +28,8 @@ Pub Workspaces（ルート [pubspec.yaml](./pubspec.yaml)）により以下の 4
 
 | パッケージ | 責務 | 主なコンポーネント |
 | :--- | :--- | :--- |
-| [`packages/agent_kernel`](./packages/agent_kernel/pubspec.yaml) | Ring 0 TCB カーネルコア（外部通信・FFI・HTML/YAML・UI 依存なし） | `SyscallGate`、`ProcessControlBlock` / `ProtectionRing`（Ring 0/2/3）・`ProcessProfile`（`WorkspaceWorker` / `ConflictResolver` / `Explorer` / `WebResearcher`）、Capability / `QuotaLedger`、`VfsNamespace`（`/workspace`・`/skills`）、`ContextPager` / `PageTable` / `DirtyPageSwapper`、`BoundedMailbox`、`SkillRegistry`、`SyscallHook` / `LlmHook` / `TxHook`、Canonical IR、`IoPayloadCapper`、`AuditLogger` / `SecretRedactor` |
-| [`packages/agent_drivers`](./packages/agent_drivers/pubspec.yaml) | OS・VCS・LLM・Web・MCP・Skill・Hook の具体ドライバ | `HostFsDriver`（探索＋SHA-256 CAS 編集）、`JjDriver`（単一ミューテックス直列化・`--ignore-working-copy` / `--at-op` 読取・`workspace add/forget/update-stale`・多親マージ・First-Class Conflicts・`squash` / `op restore`）、`OllamaDriver` / `OpenRouterDriver` / `OpenAiDriver` / `GeminiDriver` / `NousPortalDriver` / `OpenAiCompatDriver` / `LlmRouter` / `LlmEnvLoader` / `ModelCatalogService` / `ModelsConfigLoader`、`ContextWindowResolver`、`WorkspacePageFreshnessChecker`、`Win32JobExecDriver`、`OllamaWebSearchBackend` / `WebFetchDriver`（`SsrfGuard` + `HtmlMarkdownExtractor`）、`McpStdioClient`、`SkillDirectoryLoader`、`AntiGitHabitGuardHook` |
+| [`packages/agent_kernel`](./packages/agent_kernel/pubspec.yaml) | Ring 0 TCB カーネルコア（外部通信・FFI・HTML/YAML・UI 依存なし） | `SyscallGate`、`ProcessControlBlock` / `ProtectionRing`（Ring 0/2/3）・`ProcessProfile` / `SpawnSpec` / `ChildHeartbeatSnapshot`（`WorkspaceWorker` / `ConflictResolver` / `Explorer` / `WebResearcher`）、Capability / `QuotaLedger`、`VfsNamespace`（`/workspace`・`/skills`）、`ContextPager` / `PageTable` / `DirtyPageSwapper`、`BoundedMailbox`、`SkillRegistry`、`SyscallHook` / `LlmHook` / `TxHook`、Canonical IR、`IoPayloadCapper`、`AuditLogger` / `SecretRedactor` |
+| [`packages/agent_drivers`](./packages/agent_drivers/pubspec.yaml) | OS・VCS・LLM・Web・MCP・Skill・Hook の具体ドライバ | `HostFsDriver`（探索＋SHA-256 CAS 編集）、`JjDriver`（単一ミューテックス直列化・`--ignore-working-copy` / `--at-op` 読取・`workspace add/forget/update-stale`・多親マージ・First-Class Conflicts・`squash` / `op restore`）、`OllamaDriver` / `OpenRouterDriver` / `OpenAiDriver` / `GeminiDriver` / `NousPortalDriver` / `OpenAiCompatDriver` / `LlmRouter` / `LlmEnvLoader` / `ModelCatalogService` / `ModelsConfigLoader`、`ContextWindowResolver`、`WorkspacePageFreshnessChecker`、`ExecPolicyConfigLoader` / `SysExecClassifier` / `Win32JobExecDriver`、`OllamaWebSearchBackend` / `WebFetchDriver`（`SsrfGuard` + `HtmlMarkdownExtractor`）、`McpStdioClient`、`SkillDirectoryLoader`、`AntiGitHabitGuardHook` |
 | [`packages/agent_runtime`](./packages/agent_runtime/pubspec.yaml) | ユーザー空間ランタイムとコンパイル時配線 | `LeadAgent`（ReAct ループ）、`IsolateWorkerHost` / `ChildIsolateBootstrap` / `SubAgentWorker`、`ProcessSupervisor`（自動回復・クオータ会計）、`StackedTaskManager`（`sys_task_stack`）、`GreenTaskProcessRunner`、`KernelBootstrap`、`AgentPrompts`（[`agent_prompts.dart`](./packages/agent_runtime/lib/src/prompts/agent_prompts.dart)） |
 | [`packages/agent_acp`](./packages/agent_acp/pubspec.yaml) | ACP v1（JSON-RPC 2.0 over `stdio`）サーバー・CLI・ローカル Web カンバン GUI | `AcpServer`（`_fm_agent_os/*` 拡張含む） / `AcpApprovalHandler` / `AcpEventMapper` / `JsonRpcPeer`（`stdout` 単一所有）、`agent_os_daemon`、`acp_cli_client`（`AcpCliRunner`）、`acp_kanban_app`（`KanbanServer` / `KanbanAcpBridge` / `KanbanCliRunner`） |
 
@@ -67,6 +75,15 @@ Pub Workspaces（ルート [pubspec.yaml](./pubspec.yaml)）により以下の 4
    - `OLLAMA_API_KEY` は Ollama Cloud および `sys_web_search` の標準バックエンド（`https://ollama.com/api/web_search`）で共用されます。`sys_web_fetch` は API キー不要です。
    - `LlmEnvLoader` は **1. プロセス環境変数 → 2. `<sessionCwd>/.agent_os/.env` → 3. `<Directory.current>/.agent_os/.env`** の優先順で読み込み、登録された秘密値は `AuditLogger` / `SecretRedactor` により出力・ログ上で `<REDACTED>` へ自動マスクされます。また `sys_exec` 子プロセスおよび外部 MCP サーバー環境からは秘密環境変数が除去されます。
    - `.agent_os/.gitignore`（`*`）はセッション初期化時に自動生成され、`.env`・監査ログ・退避ファイル・一時ワークスペース（`.agent_os/ws/`）・Swap（`.agent_os/swap/`）を VCS 追跡対象から除外します。
+   - **プロンプトキャッシュ自動最適化と関連環境変数**:
+     - **OpenRouter / Nous Portal**: 全モデルで `x-session-id` ヘッダおよび `session_id` ボディによる Sticky Routing を送信し、`anthropic/` 系および Qwen 明示キャッシュ対象モデル（`qwen/qwen3-coder-flash`, `qwen/qwen3.7`, `qwen/qwen3.5`, `qwen/qwen3-max`, `qwen/qwen-plus`, `qwen/qwen-turbo`）にはトップレベル `cache_control: {"type": "ephemeral"}` を自動付与します。推論モデルの SSE `delta.reasoning_details` は `(index, type, id, format)` 単位で正規化マージしてエコーバックします。
+     - **OpenAI 直接 API**: セッション単位で `prompt_cache_key` を自動付与します。
+     - **Gemini 直接 API（明示的 Context Caching）**: `v1beta/cachedContents` により Segment 0（`systemInstruction` + `tools`）を既定で自動キャッシュ化します（最小トークン閾値: Flash 系 `1,024` / Pro 系 `2,048`、認証は `x-goog-api-key` ヘッダのみ・`?key=` 禁止、TTL 自動延長および終了時 `DELETE`、閾値未満・失敗時は通常の非キャッシュ経路へ透過フォールバック）。以下の環境変数（プロセス環境変数または `.agent_os/.env`）で挙動を制御できます。
+       ```dotenv
+       GEMINI_EXPLICIT_CACHE=true               # 既定 true。false / 0 / off / no で無効化
+       GEMINI_EXPLICIT_CACHE_TTL_SECONDS=300    # 既定 300 秒（許容範囲 60..3600 秒）
+       ```
+     - **マルチステップ集計・Prefix 保護**: `LeadAgent` のマルチステップターン結果（`AgentTurnResult.usage` / ACP `turnSummary`）は全ステップの `cachedTokens`・`cacheWriteTokens` を合算して `cacheHitRate` を算出します。また `dynamicContextSummary` を Step 1 と同一表現で履歴コミットして Prefix 一致を維持し、Ring 3 子プロセス（`SubAgentWorker`）は子固有の `sessionUuid` を引き回します。
 3. **モデル一覧の自動取得と `.agent_os/models.json` による制御（任意）**
    - 起動時に 1 回のみ、有効なプロバイダから並列にチャット対応モデル一覧を自動取得してメモリキャッシュします（埋め込み・音声・画像等の非チャットモデルは自動除外され、一部プロバイダが未到達・タイムアウトしても他プロバイダの起動は継続します）。
    - `<sessionCwd>/.agent_os/models.json`（不在時は `<Directory.current>/.agent_os/models.json`）でプロバイダごとの有効化・自動取得抑止・手動許可モデル・`baseUrl` を制御できます（`.agent_os/` 配下のため VFS 保護によりエージェントのファイルツールからは遮断されます）。
@@ -84,6 +101,32 @@ Pub Workspaces（ルート [pubspec.yaml](./pubspec.yaml)）により以下の 4
 4. **外部 `SKILL.md` ディレクトリ（任意）**
    - 起動時に **1. `--skills-dir <path>`（複数指定可・指定順） → 2. 環境変数 `AGENT_OS_SKILLS_DIR`（Windows は `;` 区切り） → 3. `<cwd>/.agent_os/skills`** の優先順で `<skill>/SKILL.md` をスキャンし、Read-Only の `/skills` へマウントします（同名スキルは先指定優先）。
    - `required_capabilities` を省略した一般的な既存 `SKILL.md` も、追加特権なし・権限昇格ゼロでそのままマウント可能です。
+5. **`.agent_os/exec_policy.json` による `sys_exec` 直接実行コマンド許可設定（任意）**
+   - ビルトイン既定の `dart test` / `dart analyze` / `dart format --output=none` に加え、任意の直接実行コマンドを承認なしで即時実行できるよう設定できます。
+   - **1. `<sessionCwd>/.agent_os/exec_policy.json` → 2. `<Directory.current>/.agent_os/exec_policy.json` → 3. ビルトイン既定**の優先順で読み込み、セッション単位で不変保持してプロンプト・ツールスキーマへ反映します（`.agent_os/` 配下のため VFS 保護によりエージェントのファイルツールからは `EACCES: PROTECTED_INTERNAL_PATH` で遮断）。
+     ```json
+     {
+       "allow": [
+         {
+           "command": "v",
+           "allowedSubcommands": ["test", "check-md", "fmt"],
+           "maxTimeoutMs": 180000
+         },
+         {
+           "command": "mise",
+           "allowedArgPrefixes": [["exec", "--"], ["run"]],
+           "maxTimeoutMs": 300000
+         },
+         {
+           "command": "cargo",
+           "maxTimeoutMs": 300000
+         }
+       ]
+     }
+     ```
+   - `command` はパス区切り・ドライブレター・空白・メタ文字を含まない実行ファイル名を指定します（`.exe`/`.cmd`/`.bat`/`.ps1` は正規化）。`allowedSubcommands`（第 1 引数制限）または `allowedArgPrefixes`（先頭引数トークン列制限）を省略した場合は任意の安全な引数リストを許可し、`maxTimeoutMs` の既定は `120000`（許容範囲 `100..600000`）です。
+   - 構文不正や未知キー・不正値を含む場合は **Fail-Closed** で警告出力のうえ当該ルールまたはファイル全体を無効化して既定へフォールバックします。またシェル実行ファイル（`cmd`, `powershell`, `pwsh`, `sh`, `bash`, `wsl` 等）・生 `git`/`jj`（`--` 後続含む）・ネットワークコマンド（`curl`, `wget`, `iwr` 等）・シェルメタ文字・`/workspace` 外や保護パスへの引数・`workingDir` 指定は共通ハードガードにより設定で上書きできず拒否されます。
+   - Ring 3 子プロセス（`workspace_worker` / `conflict_resolver`）でも承認不要で即時実行でき、`/workspace/...` 仮想パス引数（`--out=/workspace/...` 形式含む）は隔離ワークスペース基準の相対パスへ自動解決されます。
 
 ---
 
@@ -98,7 +141,7 @@ mise exec -- dart pub get
 # 2. 静的解析
 mise exec -- dart analyze
 
-# 3. 全パッケージ自動テスト（47 テストファイル・計 293 件）
+# 3. 全パッケージ自動テスト（53 テストファイル・計 341 件）
 mise exec -- dart test packages/agent_kernel/test packages/agent_drivers/test packages/agent_runtime/test packages/agent_acp/test
 
 # 4. ネイティブ実行ファイル（AOT .exe 全 3 本）ビルド
@@ -146,7 +189,7 @@ build\acp_kanban_app.exe --daemon build\agent_os_daemon.exe --cwd <jj_repo> --po
 | `/rollback [opId]` | `_fm_agent_os/tx_rollback`（`sys_tx_rollback`）で開始前または指定 `opId` へ一発復元（監査ログは保持） |
 | `/status` | セッション ID・モデル・`jjChange` / `jjOp`・トランザクション状態・累計トークン数を表示 |
 | `/cancel` | 実行中ターンへ `session/cancel` 通知を送信（ターン実行中の `Ctrl+C` でも同様に中断） |
-| `/ps` | 稼働中のプロセスツリー（`pid`, `profile`, `state`, `jjChangeId`, `workspacePath`）を表示 |
+| `/ps` | 稼働中のプロセスツリー（`pid`, `profile`, `state`, `model`, `ws`, `change` および Heartbeat 進捗 `step`/`idle`）を表示（ACP `_fm_agent_os/processes` 連携） |
 | `/pause`（または `/stop`） | 稼働中ワーカーへ `SIGSTOP` を送信して協調サスペンドゲートで一時凍結 |
 | `/resume [msg]`（または `/cont [msg]`） | 一時凍結中のワーカーへ `SIGCONT` を送信して再開（`[msg]` 指定時は追加方針を Segment 1 末尾へ注入） |
 | `/kill [pid]` | 指定 `pid`（省略時は全稼働子ワーカー）へ `SIGKILL` を送信し、プロセスツリーと一時 `jj workspace` を一括回収 |
@@ -185,11 +228,11 @@ build\acp_kanban_app.exe --daemon build\agent_os_daemon.exe --cwd <jj_repo> --po
 
 ---
 
-## 5. 既知の制約・Stage 3 範囲境界
+## 5. 既知の制約・仕様境界
 
 - **プロセス階層・権限分離**:
   - プロセス階層深さは `1`（Ring 2 `LeadAgent` → Ring 3 子プロセス）に固定されています。
-  - `Explorer` / `WebResearcher` は引き続き Read-Only（または `/workspace` 権限ゼロ）かつ UI 承認要求禁止（TTY 独占）です。`WorkspaceWorker` / `ConflictResolver` は独立 `jj workspace`（`.agent_os/ws/<pid>`）内でのみ編集可能です。
+  - `Explorer` / `WebResearcher` は Read-Only（または `/workspace` 権限ゼロ）かつ UI 承認要求禁止（TTY 独占）です。`WorkspaceWorker` / `ConflictResolver` は独立 `jj workspace`（`.agent_os/ws/<pid>`）内でのみ編集可能です。
 - **MCP トランスポート範囲**:
   - 本番バイナリの MCP クライアントは **`stdio` トランスポート** を実装しています（リモート `Streamable HTTP` / 旧 `SSE` は対象外）。`sys_mcp_call` は Ring 2 承認ゲートを必須とし、Ring 3 子プロセスからは既定非公開です。
 - **ローカル Web カンバン GUI の公開範囲**:
@@ -201,10 +244,17 @@ build\acp_kanban_app.exe --daemon build\agent_os_daemon.exe --cwd <jj_repo> --po
   - 外部 `SKILL.md` のマウントはデーモン起動時に確定します（セッション実行中の動的ホストパス追加マウントは対象外）。
 - **`--cwd <別repo>` 指定時の `.env` 参照仕様**:
   `acp_cli_client.exe` / `acp_kanban_app.exe` で `--cwd <target_repo>` を指定すると、子プロセス `agent_os_daemon.exe` は `<target_repo>` を作業ディレクトリ（`workingDirectory: cwd`）として起動されます。そのため、別リポジトリを対象として OpenRouter / Ollama Cloud / Ollama Web Search を利用する場合は、**親プロセスの環境変数に `OPENROUTER_API_KEY` / `OLLAMA_API_KEY` を設定する**か、**`<target_repo>/.agent_os/.env` にキーを配置**してください。
-- **OS 依存性**: `sys_exec` のプロセス隔離およびタイムアウト時子孫プロセス一括強制終了は Windows（Win32 Job Object FFI）専用です。
+- **OS 依存性**: `sys_exec` のプロセス隔離およびタイムアウト時子孫プロセス一括強制終了は Windows（Win32 Job Object FFI）専用です。単発コマンドの実行タイムアウト上限は `600,000`ms（10 分）です。
+- **サブプロセス実行制限・Heartbeat・非破壊 `sys_wait`**:
+  - `sys_spawn` の実行上限は `maxWallTimeMs` 既定 `600,000`ms（10 分）／最大 `3,600,000`ms（60 分）、`maxSteps` 既定 `32`／最大 `128`、無進行検知 `heartbeatTimeoutMs` 既定 `300,000`ms（5 分）／最大 `600,000`ms（10 分）です。無進行タイムアウト超過時は `HEARTBEAT_TIMEOUT` (`ETIMEDOUT`, `exitCode: 124`) で強制終了します。
+  - `SIGSTOP` サスペンド中は壁時計タイマーと Heartbeat タイマーの双方を一時停止し、`SIGCONT` で残余時間から再開します。
+  - `sys_wait`（`timeoutMs` 既定 `120,000`ms / 最大 `600,000`ms）のタイムアウト時は子プロセスを kill せず `running` 配列（`ChildRunningSnapshot` と `heartbeat` を含む）を返却し、後続の `sys_wait` / `sys_kill` を継続できます。未完了の子を残したまま親ターンが終了した場合は `PARENT_TURN_ENDED` で自動回収されます。
 - **Ring 2 承認ゲートと Hook 制約**:
-  - `sys_tx_squash`・`sys_mcp_call` および一般の `sys_exec` は Ring 2 承認（`WAITING_APPROVAL`）を要求します（定型安全コマンドの `dart test` / `dart analyze` / `dart format --output=none` のみ自動許可）。
-  - `AntiGitHabitGuardHook` により、`sys_exec` 経由の生 `git` / `jj` コマンド実行は承認ゲート前に `HOOK_BLOCKED` (`EPERM`) として遮断されます（`sys_jj_*` / `sys_tx_*` を使用してください）。
+  - `sys_tx_squash`・`sys_mcp_call` および一般の `sys_exec` は Ring 2 承認（`WAITING_APPROVAL`）を要求します（自動許可はビルトインの `dart test` / `dart analyze` / `dart format --output=none`、および `.agent_os/exec_policy.json` で許可され共通ハードガードを通過した直接実行コマンドのみ）。
+  - `AntiGitHabitGuardHook` により、`sys_exec` 経由の生 `git` / `jj` コマンド実行（`mise exec -- git ...` 等の `--` 経由を含む）は承認ゲート前に `HOOK_BLOCKED` (`EPERM`) として遮断されます（`sys_jj_*` / `sys_tx_*` を使用してください）。
+- **プロンプトキャッシュの適用条件**:
+  - プロンプト長が各プロバイダ／モデルの最小トークン閾値（例: OpenAI / Gemini Flash `1,024`、Gemini Pro `2,048`、Anthropic Haiku 4.5 `4,096` 等）未満の場合は、仕様上キャッシュ対象外（`cachedTokens: 0`）となります。
+  - Gemini 明示的 Context Caching はキャッシュ保持時間に応じたストレージ課金が発生するため、セッション終了時に自動で `DELETE` クリーンアップを実行します。無効化したい場合は `GEMINI_EXPLICIT_CACHE=false` を設定してください。
 
 ---
 

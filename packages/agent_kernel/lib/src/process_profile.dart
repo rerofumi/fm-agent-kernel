@@ -89,7 +89,7 @@ enum ProcessProfileId {
   }
 }
 
-/// Validated specification for spawning a Ring 3 child process via `sys_spawn` ([D-211], [D-307], [D-315]).
+/// Validated specification for spawning a Ring 3 child process via `sys_spawn` ([D-211], [D-307], [D-315], [D-502]).
 class SpawnSpec {
   SpawnSpec({
     required this.profile,
@@ -101,12 +101,17 @@ class SpawnSpec {
     this.maxCostMicroUsd,
     this.maxWallTimeMs = defaultMaxWallTimeMs,
     this.maxSteps = defaultMaxSteps,
+    this.heartbeatTimeoutMs = defaultHeartbeatTimeoutMs,
     Set<CapRight>? requestedRights,
     this.baseChangeId,
     this.logicalTaskId,
     this.supervision,
   })  : assert(maxWallTimeMs > 0 && maxWallTimeMs <= maxAllowedWallTimeMs),
         assert(maxSteps > 0 && maxSteps <= maxAllowedSteps),
+        assert(
+          heartbeatTimeoutMs > 0 &&
+              heartbeatTimeoutMs <= maxAllowedHeartbeatTimeoutMs,
+        ),
         allowedSubpaths = allowedSubpaths == null
             ? null
             : List<String>.unmodifiable(allowedSubpaths),
@@ -114,10 +119,12 @@ class SpawnSpec {
             ? null
             : Set<CapRight>.unmodifiable(requestedRights);
 
-  static const int defaultMaxWallTimeMs = 90000;
-  static const int maxAllowedWallTimeMs = 300000;
-  static const int defaultMaxSteps = 16;
-  static const int maxAllowedSteps = 32;
+  static const int defaultMaxWallTimeMs = 600000;
+  static const int maxAllowedWallTimeMs = 3600000;
+  static const int defaultMaxSteps = 32;
+  static const int maxAllowedSteps = 128;
+  static const int defaultHeartbeatTimeoutMs = 300000;
+  static const int maxAllowedHeartbeatTimeoutMs = 600000;
 
   final ProcessProfileId profile;
   final String taskPrompt;
@@ -128,6 +135,7 @@ class SpawnSpec {
   final int? maxCostMicroUsd;
   final int maxWallTimeMs;
   final int maxSteps;
+  final int heartbeatTimeoutMs;
   final Set<CapRight>? requestedRights;
   final String? baseChangeId;
   final String? logicalTaskId;
@@ -144,6 +152,7 @@ class SpawnSpec {
       if (maxCostMicroUsd != null) 'maxCostMicroUsd': maxCostMicroUsd,
       'maxWallTimeMs': maxWallTimeMs,
       'maxSteps': maxSteps,
+      'heartbeatTimeoutMs': heartbeatTimeoutMs,
       if (requestedRights != null)
         'requestedRights': requestedRights!.map((r) => r.name).toList(),
       if (baseChangeId != null) 'baseChangeId': baseChangeId,
@@ -151,6 +160,104 @@ class SpawnSpec {
       if (supervision != null) 'supervision': supervision!.toJson(),
     };
   }
+}
+
+/// Immutable host-observed heartbeat and loop-symptom snapshot for a Ring 3 child ([D-503]).
+class ChildHeartbeatSnapshot {
+  const ChildHeartbeatSnapshot({
+    required this.currentStep,
+    required this.maxSteps,
+    required this.totalSyscalls,
+    required this.elapsedMs,
+    required this.idleMs,
+    required this.heartbeatTimeoutMs,
+    required this.lastHeartbeatAt,
+    required this.isPaused,
+    this.activeSyscall,
+    this.lastSyscall,
+    required this.consecutiveErrors,
+    this.lastErrorReason,
+  });
+
+  final int currentStep;
+  final int maxSteps;
+  final int totalSyscalls;
+  final int elapsedMs;
+  final int idleMs;
+  final int heartbeatTimeoutMs;
+  final String lastHeartbeatAt; // ISO-8601 UTC string
+  final bool isPaused;
+  final String? activeSyscall;
+  final String? lastSyscall;
+  final int consecutiveErrors;
+  final String? lastErrorReason;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'currentStep': currentStep,
+        'maxSteps': maxSteps,
+        'totalSyscalls': totalSyscalls,
+        'elapsedMs': elapsedMs,
+        'idleMs': idleMs,
+        'heartbeatTimeoutMs': heartbeatTimeoutMs,
+        'lastHeartbeatAt': lastHeartbeatAt,
+        'isPaused': isPaused,
+        'activeSyscall': activeSyscall,
+        'lastSyscall': lastSyscall,
+        'consecutiveErrors': consecutiveErrors,
+        'lastErrorReason': lastErrorReason,
+      };
+}
+
+/// Non-destructive progress snapshot for an active or retrying child returned in `sys_wait.running` ([D-504]).
+class ChildRunningSnapshot {
+  const ChildRunningSnapshot({
+    required this.pid,
+    required this.logicalTaskId,
+    required this.name,
+    required this.profile,
+    required this.state,
+    required this.model,
+    required this.attemptIndex,
+    required this.maxWallTimeMs,
+    this.workspaceName,
+    this.baseChangeId,
+    this.workingChangeId,
+    required this.consumedTokens,
+    required this.consumedCostMicroUsd,
+    this.heartbeat,
+  });
+
+  final Pid pid;
+  final String logicalTaskId;
+  final String name;
+  final ProcessProfileId profile;
+  final String state;
+  final String model;
+  final int attemptIndex;
+  final int maxWallTimeMs;
+  final String? workspaceName;
+  final String? baseChangeId;
+  final String? workingChangeId;
+  final int consumedTokens;
+  final int consumedCostMicroUsd;
+  final ChildHeartbeatSnapshot? heartbeat;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'pid': pid,
+        'logicalTaskId': logicalTaskId,
+        'name': name,
+        'profile': profile.wireValue,
+        'state': state,
+        'model': model,
+        'attemptIndex': attemptIndex,
+        'maxWallTimeMs': maxWallTimeMs,
+        'workspaceName': workspaceName,
+        'baseChangeId': baseChangeId,
+        'workingChangeId': workingChangeId,
+        'consumedTokens': consumedTokens,
+        'consumedCostMicroUsd': consumedCostMicroUsd,
+        'heartbeat': heartbeat?.toJson(),
+      };
 }
 
 /// Summary status returned by `sys_wait` when a child process terminates ([D-211], [D-214], [D-307], [D-315]).

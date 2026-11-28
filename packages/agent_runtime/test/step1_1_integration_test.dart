@@ -410,9 +410,12 @@ void main() {
         equals('openrouter/anthropic/claude-sonnet-4'),
       );
       expect(t2.toolCallsExecuted, equals(1));
+      expect(t2.usage?.promptTokens, equals(1310));
       expect(t2.usage?.cachedTokens, equals(550));
+      expect(t2.usage?.cacheWriteTokens, equals(400));
+      expect(t2.usage?.cacheHitRate, equals(0.4198));
 
-      // Verify Sticky Routing & cache_control & 9-char Base62 tool_call_id pairing.
+      // Verify Sticky Routing & top-level cache_control & 9-char Base62 tool_call_id pairing.
       expect(
         capturedOpenRouterHeaders.first.value('x-session-id'),
         equals(bootstrap.leadAgent.sessionUuid),
@@ -421,16 +424,21 @@ void main() {
         capturedOpenRouterBodies.first['session_id'],
         equals(bootstrap.leadAgent.sessionUuid),
       );
+      expect(
+        capturedOpenRouterBodies.first['cache_control'],
+        equals(<String, dynamic>{'type': 'ephemeral'}),
+      );
       final orMsgs =
           capturedOpenRouterBodies.first['messages'] as List<dynamic>;
       final sysMsg = orMsgs.first as Map<String, dynamic>;
       expect(sysMsg['role'], equals('system'));
-      expect(sysMsg['content'], isA<List<dynamic>>());
-      expect(
-        ((sysMsg['content'] as List<dynamic>).first
-            as Map<String, dynamic>)['cache_control'],
-        equals(<String, dynamic>{'type': 'ephemeral'}),
-      );
+      expect(sysMsg['content'], isA<String>());
+      for (final m in orMsgs) {
+        final msg = m as Map<String, dynamic>;
+        if (msg['content'] != null) {
+          expect(msg['content'], isA<String>());
+        }
+      }
       final assistantWithTool = orMsgs.firstWhere(
         (m) => m is Map && m['role'] == 'assistant' && m['tool_calls'] != null,
       ) as Map<String, dynamic>;

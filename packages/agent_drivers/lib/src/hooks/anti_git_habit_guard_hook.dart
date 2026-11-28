@@ -201,6 +201,16 @@ class AntiGitHabitGuardHook extends BaseSyscallHook {
       }
     }
 
+    // Inspect subcommands forwarded via `--` (e.g. `mise exec -- git status`).
+    for (var j = idx + 1; j < tokens.length - 1; j++) {
+      if (tokens[j].trim() == '--') {
+        final hit = _inspectTokens(tokens.sublist(j + 1), depth: depth + 1);
+        if (hit != null) {
+          return hit;
+        }
+      }
+    }
+
     return null;
   }
 

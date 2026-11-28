@@ -378,4 +378,346 @@ void main() {
       );
     });
   });
+
+  group('OpenAiCompatDriver SSE reasoning_details normalization [D-604]', () {
+    late HttpServer server;
+    late Uri endpointUri;
+
+    setUp(() async {
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      endpointUri = Uri.parse(
+        'http://${server.address.address}:${server.port}/v1/chat/completions',
+      );
+    });
+
+    tearDown(() async {
+      await server.close(force: true);
+    });
+
+    test('merges reasoning.summary, reasoning.text+signature, and preserves reasoning.encrypted and order in SSE', () async {
+      server.listen((req) async {
+        req.response.statusCode = 200;
+        req.response.headers.contentType = ContentType('text', 'event-stream');
+        final chunks = <Map<String, dynamic>>[
+          <String, dynamic>{
+            'choices': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'delta': <String, dynamic>{
+                  'reasoning_details': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'index': 0,
+                      'type': 'reasoning.summary',
+                      'format': 'openai-responses-v1',
+                      'summary': 'Checking ',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          <String, dynamic>{
+            'choices': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'delta': <String, dynamic>{
+                  'reasoning_details': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'index': 0,
+                      'type': 'reasoning.summary',
+                      'format': 'openai-responses-v1',
+                      'summary': 'files.',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          <String, dynamic>{
+            'choices': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'delta': <String, dynamic>{
+                  'reasoning_details': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'index': 1,
+                      'type': 'reasoning.encrypted',
+                      'id': 'rs_1',
+                      'format': 'openai-responses-v1',
+                      'data': 'gAAAA_part1',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          <String, dynamic>{
+            'choices': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'delta': <String, dynamic>{
+                  'reasoning_details': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'index': 1,
+                      'type': 'reasoning.encrypted',
+                      'id': 'rs_1',
+                      'format': 'openai-responses-v1',
+                      'data': '_part2==',
+                    },
+                    <String, dynamic>{
+                      'index': 2,
+                      'type': 'reasoning.text',
+                      'id': 'rt_1',
+                      'text': 'Step A. ',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          <String, dynamic>{
+            'choices': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'delta': <String, dynamic>{
+                  'reasoning_details': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'index': 2,
+                      'type': 'reasoning.text',
+                      'id': 'rt_1',
+                      'text': 'Step B.',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          <String, dynamic>{
+            'choices': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'delta': <String, dynamic>{
+                  'reasoning_details': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'index': 2,
+                      'type': 'reasoning.text',
+                      'id': 'rt_1',
+                      'signature': 'sig_xyz',
+                    },
+                  ],
+                  'content': 'Done',
+                },
+                'finish_reason': 'stop',
+              },
+            ],
+          },
+        ];
+        for (final c in chunks) {
+          req.response.write('data: ${jsonEncode(c)}\n\n');
+        }
+        req.response.write('data: [DONE]\n\n');
+        await req.response.close();
+      });
+
+      final driver = _TestOpenAiCompatDriver(
+        endpointUri: endpointUri,
+        apiKey: 'sk-test-merge',
+      );
+      addTearDown(driver.close);
+
+      final events = await driver.chatStream(_buildRequest()).toList();
+      final resp = events.whereType<LlmDoneEvent>().single.response;
+      final details = resp.rawReasoningDetails as List<dynamic>;
+
+      expect(details, hasLength(3));
+      expect(
+        details[0],
+        equals(<String, dynamic>{
+          'index': 0,
+          'type': 'reasoning.summary',
+          'format': 'openai-responses-v1',
+          'summary': 'Checking files.',
+        }),
+      );
+      expect(
+        details[1],
+        equals(<String, dynamic>{
+          'index': 1,
+          'type': 'reasoning.encrypted',
+          'id': 'rs_1',
+          'format': 'openai-responses-v1',
+          'data': 'gAAAA_part1_part2==',
+        }),
+      );
+      expect(
+        details[2],
+        equals(<String, dynamic>{
+          'index': 2,
+          'type': 'reasoning.text',
+          'id': 'rt_1',
+          'text': 'Step A. Step B.',
+          'signature': 'sig_xyz',
+        }),
+      );
+    });
+
+    test('preserves unknown fields, distinct encrypted ids, unidentifiable maps, and non-map elements without throwing', () {
+      final merged = OpenAiCompatDriver.mergeReasoningDetailsChunks(
+        <List<dynamic>>[
+          <dynamic>[
+            <String, dynamic>{
+              'index': 0,
+              'type': 'reasoning.text',
+              'text': 'Hello ',
+              'custom_meta': 'keep_me',
+            },
+            <String, dynamic>{'opaque_only': 'first'},
+            'raw_string_entry',
+            42,
+          ],
+          <dynamic>[
+            <String, dynamic>{
+              'index': 0,
+              'type': 'reasoning.text',
+              'text': 'world',
+              'custom_meta': null,
+              'extra_flag': true,
+            },
+            <String, dynamic>{'opaque_only': 'second'},
+            <String, dynamic>{
+              'index': 1,
+              'type': 'reasoning.encrypted',
+              'id': 'rs_1',
+              'data': 'AAA',
+            },
+            <String, dynamic>{
+              'index': 2,
+              'type': 'reasoning.encrypted',
+              'id': 'rs_2',
+              'data': 'BBB',
+            },
+          ],
+        ],
+      );
+
+      expect(merged, hasLength(7));
+      expect(
+        merged[0],
+        equals(<String, dynamic>{
+          'index': 0,
+          'type': 'reasoning.text',
+          'text': 'Hello world',
+          'custom_meta': 'keep_me',
+          'extra_flag': true,
+        }),
+      );
+      expect(merged[1], equals(<String, dynamic>{'opaque_only': 'first'}));
+      expect(merged[2], equals('raw_string_entry'));
+      expect(merged[3], equals(42));
+      expect(merged[4], equals(<String, dynamic>{'opaque_only': 'second'}));
+      expect(merged[5]['id'], equals('rs_1'));
+      expect(merged[6]['id'], equals('rs_2'));
+    });
+
+    test('does not emit empty rawReasoningDetails for empty [] chunks and keeps non-streaming and single-object behavior', () async {
+      var mode = 'empty_chunks';
+      server.listen((req) async {
+        req.response.statusCode = 200;
+        if (mode == 'empty_chunks') {
+          req.response.headers.contentType = ContentType('text', 'event-stream');
+          req.response.write(
+            'data: ${jsonEncode(<String, dynamic>{
+                  'choices': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'delta': <String, dynamic>{
+                        'reasoning_details': const <dynamic>[],
+                        'content': 'OK',
+                      },
+                      'finish_reason': 'stop',
+                    },
+                  ],
+                })}\n\n',
+          );
+          req.response.write('data: [DONE]\n\n');
+        } else if (mode == 'single_object') {
+          req.response.headers.contentType = ContentType('text', 'event-stream');
+          req.response.write(
+            'data: ${jsonEncode(<String, dynamic>{
+                  'choices': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'delta': <String, dynamic>{
+                        'reasoning_details': <String, dynamic>{
+                          'type': 'reasoning.summary',
+                          'summary': 'Single obj',
+                        },
+                        'content': 'Single',
+                      },
+                      'finish_reason': 'stop',
+                    },
+                  ],
+                })}\n\n',
+          );
+          req.response.write('data: [DONE]\n\n');
+        } else {
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(
+            jsonEncode(<String, dynamic>{
+              'choices': <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'message': <String, dynamic>{
+                    'role': 'assistant',
+                    'content': 'Non-stream',
+                    'reasoning_details': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'type': 'reasoning.summary',
+                        'summary': 'Full summary',
+                      },
+                    ],
+                  },
+                  'finish_reason': 'stop',
+                },
+              ],
+            }),
+          );
+        }
+        await req.response.close();
+      });
+
+      final driver = _TestOpenAiCompatDriver(
+        endpointUri: endpointUri,
+        apiKey: 'sk-test-compat',
+      );
+      addTearDown(driver.close);
+
+      final emptyResp = (await driver.chatStream(_buildRequest()).toList())
+          .whereType<LlmDoneEvent>()
+          .single
+          .response;
+      expect(emptyResp.rawReasoningDetails, isNull);
+
+      mode = 'single_object';
+      final singleResp = (await driver.chatStream(_buildRequest()).toList())
+          .whereType<LlmDoneEvent>()
+          .single
+          .response;
+      expect(
+        singleResp.rawReasoningDetails,
+        equals(<String, dynamic>{
+          'type': 'reasoning.summary',
+          'summary': 'Single obj',
+        }),
+      );
+
+      mode = 'non_streaming';
+      final nonStreamResp =
+          (await driver.chatStream(_buildRequest(stream: false)).toList())
+              .whereType<LlmDoneEvent>()
+              .single
+              .response;
+      expect(nonStreamResp.content, equals('Non-stream'));
+      expect(
+        nonStreamResp.rawReasoningDetails,
+        equals(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'type': 'reasoning.summary',
+            'summary': 'Full summary',
+          },
+        ]),
+      );
+    });
+  });
 }

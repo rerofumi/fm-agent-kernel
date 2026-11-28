@@ -27,7 +27,9 @@ class IsolateWorkerHost {
     required this.parentCurrentModelProvider,
     this.jjDriver,
     this.backend = const IsolateChildWorkerBackend(),
-  }) {
+    List<String> additionalExecRuleSummaries = const <String>[],
+  }) : additionalExecRuleSummaries =
+           List<String>.unmodifiable(additionalExecRuleSummaries) {
     _hostPort = ReceivePort();
     _hostPortSub = _hostPort.listen(_onIsolateMessage);
   }
@@ -39,6 +41,7 @@ class IsolateWorkerHost {
   final String Function() parentCurrentModelProvider;
   final JjDriver? jjDriver;
   final ChildWorkerBackend backend;
+  final List<String> additionalExecRuleSummaries;
 
   late final ReceivePort _hostPort;
   late final StreamSubscription<dynamic> _hostPortSub;
@@ -407,6 +410,7 @@ class IsolateWorkerHost {
           instruction: AgentPrompts.buildChildInstruction(
             profile: spec.profile,
             allowedSubpaths: childNamespace.allowedWorkspaceSubpaths,
+            additionalExecRuleSummaries: additionalExecRuleSummaries,
           ),
           tools: const <SyscallToolSchema>[],
         ),
@@ -436,6 +440,7 @@ class IsolateWorkerHost {
           instruction: AgentPrompts.buildChildInstruction(
             profile: spec.profile,
             allowedSubpaths: childNamespace.allowedWorkspaceSubpaths,
+            additionalExecRuleSummaries: additionalExecRuleSummaries,
           ),
           tools: filteredTools,
         ),
@@ -478,6 +483,8 @@ class IsolateWorkerHost {
       logicalTask: task,
       attemptIndex: attemptIndex,
       remainingWallTimeMs: donation.childQuota.maxWallTimeMs,
+      maxSteps: spec.maxSteps,
+      heartbeatTimeoutMs: spec.heartbeatTimeoutMs,
     );
     _children[childPid] = managed;
     _tasksByPid[childPid] = task;
@@ -496,6 +503,7 @@ class IsolateWorkerHost {
         ),
       );
     });
+    managed.startHeartbeatTimer(() => _onChildHeartbeatTimeout(managed));
 
     try {
       final directInvoker = _HostDirectSyscallInvoker(
@@ -616,12 +624,13 @@ class IsolateWorkerHost {
     if (targets.isEmpty) {
       return const SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
         'children': <Map<String, dynamic>>[],
+        'running': <Map<String, dynamic>>[],
+        'timedOut': false,
       });
     }
 
     final cancelToken = exec.context.cancelToken;
     var cancelled = cancelToken?.isCancelled ?? false;
-    var timedOut = false;
 
     if (!cancelled) {
       final allDone = Future.wait<ChildExitStatus>(
@@ -631,7 +640,6 @@ class IsolateWorkerHost {
 
       Timer? timer;
       timer = Timer(Duration(milliseconds: timeoutMs), () {
-        timedOut = true;
         if (!waitDone.isCompleted) {
           waitDone.complete();
         }
@@ -666,6 +674,7 @@ class IsolateWorkerHost {
           t.killedBySignal = true;
           final active = t.currentChild;
           if (active != null && !active.isCompleted) {
+            active.pcb.suspendController.releaseForTermination();
             await _killAndCompleteChild(
               active,
               reason: 'CANCELLED',
@@ -686,35 +695,70 @@ class IsolateWorkerHost {
       );
     }
 
-    if (timedOut) {
-      await Future.wait<void>(
-        targets.where((t) => !t.taskCompleter.isCompleted).map((t) async {
-          t.abortedByWaitTimeout = true;
-          final active = t.currentChild;
-          if (active != null && !active.isCompleted) {
-            await _killAndCompleteChild(
-              active,
-              reason: 'WAIT_TIMEOUT',
-              errorCode: SyscallErrorCode.etimedout.codeName,
-              exitCode: 124,
-              summary:
-                  'Child process did not exit within sys_wait timeout (${timeoutMs}ms) and was terminated.',
-            );
-          }
-        }),
-      );
-    }
-
-    final statuses = <Map<String, dynamic>>[];
+    final children = <Map<String, dynamic>>[];
+    final running = <Map<String, dynamic>>[];
     for (final task in targets) {
-      final status = await task.taskCompleter.future;
-      task.reapedByWait = true;
-      statuses.add(status.toJson());
+      if (task.taskCompleter.isCompleted) {
+        final status = await task.taskCompleter.future;
+        task.reapedByWait = true;
+        children.add(status.toJson());
+      } else {
+        running.add(_buildRunningTaskSnapshot(task).toJson());
+      }
     }
+    final effectiveTimedOut = running.isNotEmpty;
 
     return SyscallResult<Map<String, dynamic>>.success(<String, dynamic>{
-      'children': statuses,
+      'children': children,
+      'running': running,
+      'timedOut': effectiveTimedOut,
     });
+  }
+
+  ChildRunningSnapshot _buildRunningTaskSnapshot(_LogicalSupervisedTask task) {
+    final child = task.currentChild;
+    final bool isRetrying = child == null || child.isCompleted;
+    final String state = isRetrying ? 'retrying' : child.pcb.state.name;
+    final int consumedTokens = task.cumulativeConsumedTokens +
+        ((child != null && !child.isCompleted)
+            ? child.pcb.quotaUsage.totalTokensUsed
+            : 0);
+    final int consumedCostMicroUsd = task.cumulativeConsumedCostMicroUsd +
+        ((child != null && !child.isCompleted)
+            ? child.pcb.quotaUsage.costMicroUsdUsed
+            : 0);
+    return ChildRunningSnapshot(
+      pid: child?.pid ?? task.initialChildPid,
+      logicalTaskId: task.logicalTaskId,
+      name: child?.pcb.name ?? task.spec.name ?? task.logicalTaskId,
+      profile: task.spec.profile,
+      state: state,
+      model: child?.model.canonicalId ?? task.initialModel.canonicalId,
+      attemptIndex: child?.attemptIndex ?? (task.attempts.length + 1),
+      maxWallTimeMs: task.spec.maxWallTimeMs,
+      workspaceName: child?.pcb.jjWorkspaceName,
+      baseChangeId: child?.pcb.jjContext.parentChangeId,
+      workingChangeId: child?.pcb.jjContext.workingChangeId,
+      consumedTokens: consumedTokens,
+      consumedCostMicroUsd: consumedCostMicroUsd,
+      heartbeat: child?.buildHeartbeatSnapshot(),
+    );
+  }
+
+  void _onChildHeartbeatTimeout(_ManagedChild child) {
+    if (child.isCompleted || child.isHeartbeatPaused) {
+      return;
+    }
+    unawaited(
+      _killAndCompleteChild(
+        child,
+        reason: 'HEARTBEAT_TIMEOUT',
+        errorCode: SyscallErrorCode.etimedout.codeName,
+        exitCode: 124,
+        summary:
+            'Child process made no progress for ${child.heartbeatTimeoutMs}ms (heartbeat stall timeout) and was terminated.',
+      ),
+    );
   }
 
   /// Handles `sys_kill` from a Ring 2 parent targeting one of its child processes ([D-312], [D-314]).
@@ -862,6 +906,7 @@ class IsolateWorkerHost {
           child.pendingStopConstraints.add(constraintMessage.trim());
         }
         child.pauseWallTimer();
+        child.pauseHeartbeatTimer();
         child.pcb.suspendController.requestStop(reason: reason);
         child.pcb.state = ProcessState.stopped;
         parent?.mailbox.enqueueControl(
@@ -902,6 +947,7 @@ class IsolateWorkerHost {
             ),
           );
         });
+        child.resumeHeartbeatTimer(() => _onChildHeartbeatTimeout(child));
         parent?.mailbox.enqueueControl(
           ControlSignalMessage(
             kind: ControlSignalKind.sigcont,
@@ -984,12 +1030,20 @@ class IsolateWorkerHost {
     );
   }
 
-  /// Returns a JSON-serializable snapshot of all active and completed supervised child tasks ([D-320]).
+  /// Returns a JSON-serializable snapshot of all active and completed supervised child tasks ([D-320], [D-504]).
   List<Map<String, dynamic>> snapshotProcesses() {
     final result = <Map<String, dynamic>>[];
     for (final task in _tasksById.values) {
       final child = task.currentChild;
       final completed = child?.exitStatus;
+      final consumedTokens = task.cumulativeConsumedTokens +
+          ((child != null && !child.isCompleted)
+              ? child.pcb.quotaUsage.totalTokensUsed
+              : 0);
+      final consumedCostMicroUsd = task.cumulativeConsumedCostMicroUsd +
+          ((child != null && !child.isCompleted)
+              ? child.pcb.quotaUsage.costMicroUsdUsed
+              : 0);
       result.add(<String, dynamic>{
         'pid': child?.pid ?? task.initialChildPid,
         'logicalTaskId': task.logicalTaskId,
@@ -1001,6 +1055,7 @@ class IsolateWorkerHost {
                 : child.pcb.state.name)
             : (task.taskCompleter.isCompleted ? 'terminated' : 'pending'),
         'model': child?.model.canonicalId ?? task.initialModel.canonicalId,
+        'maxWallTimeMs': task.spec.maxWallTimeMs,
         'workspaceName':
             completed?.workspaceName ?? child?.pcb.jjWorkspaceName,
         'baseChangeId':
@@ -1008,6 +1063,9 @@ class IsolateWorkerHost {
         'workingChangeId':
             completed?.workingChangeId ?? child?.pcb.jjContext.workingChangeId,
         'finalCommitId': completed?.finalCommitId,
+        'consumedTokens': consumedTokens,
+        'consumedCostMicroUsd': consumedCostMicroUsd,
+        'heartbeat': child?.buildHeartbeatSnapshot().toJson(),
         'attempts':
             task.attempts.map((a) => a.toJson()).toList(growable: false),
       });
@@ -1161,6 +1219,7 @@ class IsolateWorkerHost {
             child.pendingControlPort = port;
           }
         }
+        child.recordHeartbeat(() => _onChildHeartbeatTimeout(child));
       case 'syscall_req':
         final reqId = message['reqId'];
         final name = message['name'];
@@ -1273,6 +1332,7 @@ class IsolateWorkerHost {
     if (name == 'sys_llm_chat') {
       if (child.pcb.suspendController.isSuspended) {
         child.pauseWallTimer();
+        child.pauseHeartbeatTimer();
         await child.pcb.suspendController.waitIfSuspended(
           pcb: child.pcb,
           cancelToken: child.cancelSource.token,
@@ -1299,6 +1359,7 @@ class IsolateWorkerHost {
             ),
           );
         });
+        child.resumeHeartbeatTimer(() => _onChildHeartbeatTimeout(child));
       }
 
       final injectedConstraint =
@@ -1321,6 +1382,14 @@ class IsolateWorkerHost {
           );
         }
       }
+
+      child.currentStep =
+          (args['turnIndex'] as num?)?.toInt() ?? (child.currentStep + 1);
+      child.activeSyscall = 'sys_llm_chat';
+      child.recordHeartbeat(() => _onChildHeartbeatTimeout(child));
+    } else {
+      child.activeSyscall = name;
+      child.recordHeartbeat(() => _onChildHeartbeatTimeout(child));
     }
 
     final ctx = SyscallContext(
@@ -1330,10 +1399,40 @@ class IsolateWorkerHost {
       cancelToken: child.cancelSource.token,
     );
 
+    var effectiveArgs = args;
+    if (name == 'sys_llm_chat') {
+      final rawSessionUuid = args['sessionUuid'];
+      if (rawSessionUuid is! String || rawSessionUuid.trim().isEmpty) {
+        effectiveArgs = <String, dynamic>{
+          ...args,
+          'sessionUuid': SubAgentWorker.deriveChildSessionUuid(
+            parentSessionId: child.sessionId,
+            pid: child.pid,
+          ),
+        };
+      }
+    }
+
     final res = await syscallGate.invoke(
       ctx,
-      SyscallRequest(name: name, args: args),
+      SyscallRequest(name: name, args: effectiveArgs),
     );
+
+    if (!child.isCompleted || (name == 'sys_exit' && res.ok)) {
+      child.totalSyscalls += 1;
+      child.activeSyscall = null;
+      child.lastSyscall = name;
+      if (!res.ok) {
+        child.consecutiveErrors += 1;
+        child.lastErrorReason = res.error?.reason;
+      } else if (name != 'sys_llm_chat') {
+        child.consecutiveErrors = 0;
+        child.lastErrorReason = null;
+      }
+      if (!child.isCompleted) {
+        child.recordHeartbeat(() => _onChildHeartbeatTimeout(child));
+      }
+    }
 
     if (name == 'sys_llm_chat') {
       if (!res.ok) {
@@ -1509,8 +1608,12 @@ class IsolateWorkerHost {
     }
     child.isCompleting = true;
     child.wallTimer?.cancel();
+    child.heartbeatTimer?.cancel();
+    child.heartbeatTimer = null;
     child.wallStopwatch.stop();
+    child.idleStopwatch.stop();
     child.stopwatch.stop();
+    child.activeSyscall = null;
 
     WorkspaceCleanupResult? cleanupRes;
     if (jjDriver != null && child.pcb.hasIsolatedJjWorkspace) {
@@ -1548,8 +1651,12 @@ class IsolateWorkerHost {
     }
     child.isCompleted = true;
     child.wallTimer?.cancel();
+    child.heartbeatTimer?.cancel();
+    child.heartbeatTimer = null;
     child.wallStopwatch.stop();
+    child.idleStopwatch.stop();
     child.stopwatch.stop();
+    child.activeSyscall = null;
     child.pcb.state = ProcessState.terminated;
 
     final parent = processTable.getProcess(child.parentPid);
@@ -1681,7 +1788,6 @@ class IsolateWorkerHost {
 
     if (_disposed ||
         task.killedBySignal ||
-        task.abortedByWaitTimeout ||
         _isNonRetryableFailure(reason: reason, errorCode: errorCode)) {
       completeTask(
         finalOk: false,
@@ -1899,7 +2005,6 @@ class IsolateWorkerHost {
       'CANCELLED',
       'PARENT_TURN_ENDED',
       'HOST_DISPOSED',
-      'WAIT_TIMEOUT',
       'TOKEN_QUOTA_EXCEEDED',
       'COST_QUOTA_EXCEEDED',
       'RETRY_BUDGET_EXHAUSTED',
@@ -1993,7 +2098,6 @@ class _LogicalSupervisedTask {
   int cumulativeConsumedTokens = 0;
   int cumulativeConsumedCostMicroUsd = 0;
   bool killedBySignal = false;
-  bool abortedByWaitTimeout = false;
   bool reapedByWait = false;
 }
 
@@ -2011,7 +2115,10 @@ class _ManagedChild {
     required this.logicalTask,
     required this.attemptIndex,
     this.remainingWallTimeMs,
-  });
+    required this.maxSteps,
+    required this.heartbeatTimeoutMs,
+  })  : remainingHeartbeatMs = heartbeatTimeoutMs,
+        lastHeartbeatAtUtc = DateTime.now().toUtc();
 
   final Pid pid;
   final Pid parentPid;
@@ -2024,7 +2131,10 @@ class _ManagedChild {
   final Stopwatch stopwatch;
   final _LogicalSupervisedTask logicalTask;
   final int attemptIndex;
+  final int maxSteps;
+  final int heartbeatTimeoutMs;
   final Stopwatch wallStopwatch = Stopwatch();
+  final Stopwatch idleStopwatch = Stopwatch();
   final CancellationTokenSource cancelSource = CancellationTokenSource();
   final Completer<ChildExitStatus> exitCompleter = Completer<ChildExitStatus>();
 
@@ -2034,6 +2144,16 @@ class _ManagedChild {
   Timer? wallTimer;
   int? remainingWallTimeMs;
   DateTime? pausedAtUtc;
+  Timer? heartbeatTimer;
+  int remainingHeartbeatMs;
+  bool isHeartbeatPaused = false;
+  DateTime lastHeartbeatAtUtc;
+  int currentStep = 0;
+  int totalSyscalls = 0;
+  String? activeSyscall;
+  String? lastSyscall;
+  int consecutiveErrors = 0;
+  String? lastErrorReason;
   ChildExitStatus? exitStatus;
   bool userTurnCommitted = false;
   int canonicalCallSeq = 0;
@@ -2076,6 +2196,81 @@ class _ManagedChild {
       pausedAtUtc = null;
     }
     startWallTimer(onTimeout);
+  }
+
+  void startHeartbeatTimer(void Function() onTimeout) {
+    if (isCompleted || isHeartbeatPaused) {
+      return;
+    }
+    heartbeatTimer?.cancel();
+    idleStopwatch
+      ..reset()
+      ..start();
+    remainingHeartbeatMs = heartbeatTimeoutMs < 1 ? 1 : heartbeatTimeoutMs;
+    heartbeatTimer = Timer(
+      Duration(milliseconds: remainingHeartbeatMs),
+      onTimeout,
+    );
+  }
+
+  void recordHeartbeat(void Function() onTimeout) {
+    lastHeartbeatAtUtc = DateTime.now().toUtc();
+    remainingHeartbeatMs = heartbeatTimeoutMs < 1 ? 1 : heartbeatTimeoutMs;
+    heartbeatTimer?.cancel();
+    heartbeatTimer = null;
+    if (isHeartbeatPaused || isCompleted) {
+      idleStopwatch
+        ..stop()
+        ..reset();
+      return;
+    }
+    idleStopwatch
+      ..reset()
+      ..start();
+    heartbeatTimer = Timer(
+      Duration(milliseconds: remainingHeartbeatMs),
+      onTimeout,
+    );
+  }
+
+  void pauseHeartbeatTimer() {
+    if (isHeartbeatPaused || isCompleted) {
+      return;
+    }
+    heartbeatTimer?.cancel();
+    heartbeatTimer = null;
+    idleStopwatch.stop();
+    final rem = heartbeatTimeoutMs - idleStopwatch.elapsedMilliseconds;
+    remainingHeartbeatMs = rem < 1 ? 1 : rem;
+    isHeartbeatPaused = true;
+  }
+
+  void resumeHeartbeatTimer(void Function() onTimeout) {
+    if (!isHeartbeatPaused || isCompleted) {
+      return;
+    }
+    isHeartbeatPaused = false;
+    idleStopwatch.start();
+    final ms = remainingHeartbeatMs < 1 ? 1 : remainingHeartbeatMs;
+    heartbeatTimer?.cancel();
+    heartbeatTimer = Timer(Duration(milliseconds: ms), onTimeout);
+  }
+
+  ChildHeartbeatSnapshot buildHeartbeatSnapshot() {
+    return ChildHeartbeatSnapshot(
+      currentStep: currentStep,
+      maxSteps: maxSteps,
+      totalSyscalls: totalSyscalls,
+      elapsedMs: stopwatch.elapsedMilliseconds,
+      idleMs: idleStopwatch.elapsedMilliseconds,
+      heartbeatTimeoutMs: heartbeatTimeoutMs,
+      lastHeartbeatAt: lastHeartbeatAtUtc.toIso8601String(),
+      isPaused: !isCompleted && (isHeartbeatPaused || pcb.state == ProcessState.stopped),
+      activeSyscall: activeSyscall,
+      lastSyscall: lastSyscall,
+      consecutiveErrors: consecutiveErrors,
+      lastErrorReason: lastErrorReason,
+    );
   }
 }
 

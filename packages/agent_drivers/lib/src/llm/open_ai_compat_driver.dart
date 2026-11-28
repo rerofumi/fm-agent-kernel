@@ -295,7 +295,7 @@ abstract class OpenAiCompatDriver implements LlmDriver {
     final contentBuffer = StringBuffer();
     final thoughtBuffer = StringBuffer();
     final pendingToolCalls = <int, _PendingToolCall>{};
-    final collectedReasoningDetails = <dynamic>[];
+    final reasoningDetailsAccumulator = _ReasoningDetailsAccumulator();
     Object? singleReasoningDetails;
 
     int? ttftMs;
@@ -377,7 +377,7 @@ abstract class OpenAiCompatDriver implements LlmDriver {
           final rd = deltaMap['reasoning_details'];
           if (rd != null) {
             if (rd is List) {
-              collectedReasoningDetails.addAll(rd);
+              reasoningDetailsAccumulator.addAll(rd);
             } else {
               singleReasoningDetails = rd;
             }
@@ -428,7 +428,7 @@ abstract class OpenAiCompatDriver implements LlmDriver {
 
       stopwatch.stop();
       final rawReasoning = buildRawReasoningDetails(
-        collectedReasoningDetails: collectedReasoningDetails,
+        collectedReasoningDetails: reasoningDetailsAccumulator.toList(),
         singleReasoningDetails: singleReasoningDetails,
         thoughtBuffer: thoughtBuffer,
       );
@@ -623,6 +623,17 @@ abstract class OpenAiCompatDriver implements LlmDriver {
         details: <String, dynamic>{'statusCode': statusCode},
       ),
     );
+  }
+
+  /// Normalizes and merges chunked SSE `delta.reasoning_details` lists ([D-604]).
+  static List<dynamic> mergeReasoningDetailsChunks(
+    List<List<dynamic>> chunks,
+  ) {
+    final accumulator = _ReasoningDetailsAccumulator();
+    for (final chunk in chunks) {
+      accumulator.addAll(chunk);
+    }
+    return accumulator.toList();
   }
 
   /// Extracts reasoning text from `reasoning_content`, `reasoning`, or `reasoning_details`.
@@ -900,4 +911,127 @@ class _PendingToolCall {
   String? id;
   String name = '';
   final StringBuffer argumentsBuffer = StringBuffer();
+}
+
+class _ReasoningDetailKey {
+  const _ReasoningDetailKey({
+    required this.index,
+    required this.type,
+    required this.id,
+    required this.format,
+  });
+
+  final int? index;
+  final String? type;
+  final String? id;
+  final String? format;
+
+  bool get isIdentifiable =>
+      index != null || type != null || id != null || format != null;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _ReasoningDetailKey &&
+        other.index == index &&
+        other.type == type &&
+        other.id == id &&
+        other.format == format;
+  }
+
+  @override
+  int get hashCode => Object.hash(index, type, id, format);
+}
+
+class _ReasoningDetailsAccumulator {
+  final List<dynamic> _items = <dynamic>[];
+  final Map<_ReasoningDetailKey, int> _keyToIndex = <_ReasoningDetailKey, int>{};
+
+  void addAll(List<dynamic> chunk) {
+    for (final Object? item in chunk) {
+      if (item is! Map) {
+        _items.add(item);
+        continue;
+      }
+      final map = item is Map<String, dynamic>
+          ? Map<String, dynamic>.from(item)
+          : <String, dynamic>{
+              for (final entry in item.entries)
+                entry.key.toString(): entry.value,
+            };
+
+      final rawIndex = map['index'];
+      final index = rawIndex is num ? rawIndex.toInt() : null;
+      final rawType = map['type'];
+      final type = rawType is String ? rawType : null;
+      final rawId = map['id'];
+      final id = rawId is String ? rawId : null;
+      final rawFormat = map['format'];
+      final format = rawFormat is String ? rawFormat : null;
+
+      final key = _ReasoningDetailKey(
+        index: index,
+        type: type,
+        id: id,
+        format: format,
+      );
+      if (!key.isIdentifiable) {
+        _items.add(map);
+        continue;
+      }
+
+      final existingIdx = _keyToIndex[key];
+      if (existingIdx == null) {
+        _items.add(map);
+        _keyToIndex[key] = _items.length - 1;
+        continue;
+      }
+
+      final existing = _items[existingIdx] as Map<String, dynamic>;
+      _mergeInto(existing, map, type);
+    }
+  }
+
+  static void _mergeInto(
+    Map<String, dynamic> existing,
+    Map<String, dynamic> incoming,
+    String? type,
+  ) {
+    for (final entry in incoming.entries) {
+      final k = entry.key;
+      final v = entry.value;
+      if (k == 'index' || k == 'type' || k == 'id' || k == 'format') {
+        continue;
+      }
+      if (type == 'reasoning.text') {
+        if (k == 'text' && v is String) {
+          final prev = existing['text'];
+          existing['text'] = prev is String ? '$prev$v' : v;
+          continue;
+        }
+        if (k == 'signature' && v is String) {
+          if (v.isNotEmpty) {
+            existing['signature'] = v;
+          }
+          continue;
+        }
+      } else if (type == 'reasoning.summary') {
+        if (k == 'summary' && v is String) {
+          final prev = existing['summary'];
+          existing['summary'] = prev is String ? '$prev$v' : v;
+          continue;
+        }
+      } else if (type == 'reasoning.encrypted') {
+        if (k == 'data' && v is String) {
+          final prev = existing['data'];
+          existing['data'] = prev is String ? '$prev$v' : v;
+          continue;
+        }
+      }
+      if (v != null) {
+        existing[k] = v;
+      }
+    }
+  }
+
+  List<dynamic> toList() => List<dynamic>.unmodifiable(_items);
 }
