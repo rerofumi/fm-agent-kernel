@@ -23,6 +23,8 @@ enum CapRight {
   netRead,
   // --- Stage 3 rights ([D-302]) ---
   mcpCall,
+  // --- Subprocess approval right ([D-702]) ---
+  requestApproval,
 }
 
 /// Single capability descriptor binding a scope and set of rights to a [CapHandle].
@@ -65,6 +67,7 @@ class CapabilityTable {
             CapRight.vcsRead,
             CapRight.vcsTx,
             CapRight.llmInfer,
+            CapRight.requestApproval,
           },
         ),
       ],
@@ -95,6 +98,7 @@ class CapabilityTable {
             CapRight.memManage,
             CapRight.procSpawn,
             CapRight.ipc,
+            CapRight.requestApproval,
           },
         ),
         CapabilityEntry(
@@ -280,14 +284,17 @@ class CapabilityTable {
     );
   }
 
-  /// Derives a child CSpace constrained to [profile]'s allowed rights and optional subset [requestedRights] ([D-211], [D-213], [D-306]).
+  /// Derives a child CSpace constrained to [profile]'s allowed rights and optional subset [requestedRights] ([D-211], [D-213], [D-306], [D-702]).
   SyscallResult<CapabilityTable> deriveForProfile(
     ProcessProfileId profile, {
     Set<CapRight>? requestedRights,
+    bool allowUserApproval = false,
     CapHandle? childHandle,
   }) {
-    final profileDefaults = profile.defaultRights;
-    final targetRights = requestedRights ?? profileDefaults;
+    final baseRights = requestedRights ?? profile.defaultRights;
+    final targetRights = allowUserApproval
+        ? <CapRight>{...baseRights, CapRight.requestApproval}
+        : baseRights;
 
     if (profile.allowsIsolatedWorkspaceMutation) {
       final forbidden = targetRights.intersection(stage3ForbiddenChildRights);
@@ -328,8 +335,23 @@ class CapabilityTable {
       }
     }
 
+    // Sterile profiles may never opt into CapRight.requestApproval ([D-702]).
+    if (!profile.supportsUserApprovalOptIn &&
+        targetRights.contains(CapRight.requestApproval)) {
+      return SyscallResult<CapabilityTable>.failure(
+        SyscallError(
+          code: SyscallErrorCode.eperm,
+          reason: 'APPROVAL_NOT_ALLOWED_FOR_PROFILE',
+          message:
+              'Child profile "${profile.wireValue}" is not permitted to hold CapRight.requestApproval.',
+          recoverable: false,
+          details: <String, dynamic>{'profile': profile.wireValue},
+        ),
+      );
+    }
+
     if (requestedRights != null) {
-      final outsideProfile = requestedRights.difference(profileDefaults);
+      final outsideProfile = requestedRights.difference(profile.maxAllowedRights);
       if (outsideProfile.isNotEmpty) {
         final names = outsideProfile.map((r) => r.name).toList()..sort();
         return SyscallResult<CapabilityTable>.failure(

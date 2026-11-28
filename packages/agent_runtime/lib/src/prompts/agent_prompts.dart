@@ -37,13 +37,14 @@ Rules:
 6. Keep answers concise, accurate, and grounded in observed tool outputs.
 ''';
 
-  /// Default immutable Segment 0 instruction for Stage 2 multi-process execution ([D-007], [D-211], [D-218], [D-219], [D-509]).
+  /// Default immutable Segment 0 instruction for Stage 2 multi-process execution ([D-007], [D-211], [D-218], [D-219], [D-509], [D-711]).
   static const String leadStage2Instruction = '''
 $leadStep1Instruction
 Available Stage 2/3 virtual memory, multi-process, merge, and skill syscalls:
 - `sys_mem_pagein`: Reload an evicted Clean Page by `pageId` from Segment 2's Page Directory Summary.
-- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit; `maxWallTimeMs` default `600000` / max `3600000` ms, `maxSteps` default `32` / max `128`, `heartbeatTimeoutMs` default `300000` / max `600000` ms, paused during `SIGSTOP`).
+- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit; optional `allowUserApproval: true` opts `workspace_worker` / `conflict_resolver` into user approval requests [default off]; `maxWallTimeMs` default `600000` / max `3600000` ms, `maxSteps` default `32` / max `128`, `heartbeatTimeoutMs` default `300000` / max `600000` ms, paused during `SIGSTOP` and `waitingApproval`).
 - `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s in `children`. Non-destructive on timeout (`timeoutMs` default `120000`, max `600000`): unfinished children continue running and are returned with `timedOut: true` and live `heartbeat` progress snapshots in `running` so you can re-wait with `sys_wait` or intervene with `sys_kill` if stalled/looping.
+- `sys_request_approval`: Pre-validate a target `syscall` and `args` (with optional `reason`) and request user approval to obtain a one-time approval ticket bound to `(pid, syscall, normalizedArgs)`.
 - `sys_jj_merge`: Merge 2+ completed worker `changeIds` into a multi-parent commit (never aborts on First-Class Conflicts; returns `mergeChangeId`, `hasConflicts`, and `conflictedFiles`).
 - `sys_jj_conflicts`: Non-destructively inspect First-Class Conflicts on a revision (`hasConflicts` and `/workspace/...` `files`).
 - `sys_jj_integrate`: Flatten a conflict-free resolved merge or worker change into your single-parent anchor working change and abandon temporary worker/merge changes before `sys_tx_squash`.
@@ -69,10 +70,11 @@ Available Stage 3 team, signal, dirty-swap, MCP, and stacked-task syscalls:
 ''';
 
   /// Builds the immutable Segment 0 instruction for LeadAgent at [stage] (`1`, `2`, or `3`),
-  /// deterministically appending [additionalExecRuleSummaries] when non-empty ([D-509]).
+  /// deterministically appending [additionalExecRuleSummaries] and [subprocessApprovalProfileNames] when non-empty ([D-509], [D-711]).
   static String buildLeadInstruction({
     required int stage,
     List<String> additionalExecRuleSummaries = const <String>[],
+    List<String> subprocessApprovalProfileNames = const <String>[],
   }) {
     final String base;
     switch (stage) {
@@ -85,10 +87,17 @@ Available Stage 3 team, signal, dirty-swap, MCP, and stacked-task syscalls:
       default:
         throw ArgumentError.value(stage, 'stage', 'Must be 1, 2, or 3.');
     }
-    if (additionalExecRuleSummaries.isEmpty) {
-      return base;
+    var result = base;
+    if (additionalExecRuleSummaries.isNotEmpty) {
+      result = _appendAdditionalExecRules(result, additionalExecRuleSummaries);
     }
-    return _appendAdditionalExecRules(base, additionalExecRuleSummaries);
+    if (stage >= 2 && subprocessApprovalProfileNames.isNotEmpty) {
+      result = _appendSubprocessApprovalProfiles(
+        result,
+        subprocessApprovalProfileNames,
+      );
+    }
+    return result;
   }
 
   /// Builds the immutable Segment 0 instruction for a Ring 3 child Isolate worker.
@@ -96,6 +105,7 @@ Available Stage 3 team, signal, dirty-swap, MCP, and stacked-task syscalls:
     required ProcessProfileId profile,
     List<String>? allowedSubpaths,
     List<String> additionalExecRuleSummaries = const <String>[],
+    bool canRequestApproval = false,
   }) {
     switch (profile) {
       case ProcessProfileId.explorer:
@@ -122,12 +132,15 @@ When finished, call `sys_exit(exitCode: 0, summary: "...")` (or reply directly) 
         final scopeNote = (allowedSubpaths != null && allowedSubpaths.isNotEmpty)
             ? 'Your workspace access is strictly scoped to: ${allowedSubpaths.join(', ')}.'
             : 'Your isolated Jujutsu workspace is mounted at /workspace.';
+        final execGuidance = canRequestApproval
+            ? 'You may run allowlisted verification commands via `sys_exec` (`dart test`, `dart analyze`, `dart format --output=none`) and any `.agent_os/exec_policy.json` allowlisted commands directly. For other safe direct commands within `/workspace`, you may call `sys_request_approval(syscall: "sys_exec", args: {...}, reason: "...")` to obtain a one-time approval ticket before calling `sys_exec`, or invoke `sys_exec` directly to wait for user approval (shells, shell metacharacters, raw `git`/`jj`, network commands, and paths outside `/workspace` are unconditionally denied).'
+            : 'You may run allowlisted verification commands via `sys_exec` (`dart test`, `dart analyze`, `dart format --output=none`). Other commands (`dart pub get`, `git`, `jj`, shells) are forbidden by TTY monopoly (`EPERM`).';
         final base = '''
 You are a sandboxed Ring 3 WorkspaceWorker sub-agent running inside FM Agent OS.
 $scopeNote
 You own an independent jj workspace and dedicated Change ID; your edits and tests do not affect the main workspace or other parallel workers.
 Use `sys_read_lines` / `sys_glob` / `sys_grep` to inspect files and `sys_write_file` / `sys_edit_block` (with CAS SHA-256) to edit files inside `/workspace`.
-You may run allowlisted verification commands via `sys_exec` (`dart test`, `dart analyze`, `dart format --output=none`). Other commands (`dart pub get`, `git`, `jj`, shells) are forbidden by TTY monopoly (`EPERM`).
+$execGuidance
 All `sys_jj_status` / `sys_jj_log` / `sys_jj_diff` calls run with `--ignore-working-copy` on your own workspace.
 Before finishing, run `dart analyze` and the relevant `dart test` target via `sys_exec` to verify your changes, then call `sys_exit(exitCode: 0, summary: "...")` with a concise summary of changed files and test results.
 ''';
@@ -138,6 +151,9 @@ Before finishing, run `dart analyze` and the relevant `dart test` target via `sy
         final scopeNote = (allowedSubpaths != null && allowedSubpaths.isNotEmpty)
             ? 'Your conflict-resolution workspace access is strictly scoped to: ${allowedSubpaths.join(', ')}.'
             : 'Your isolated Jujutsu workspace is mounted at /workspace.';
+        final execStep = canRequestApproval
+            ? '5. Run `dart analyze` and relevant `dart test` targets via `sys_exec` (allowlisted verification and `.agent_os/exec_policy.json` commands run directly; for other safe direct commands within `/workspace`, call `sys_request_approval(syscall: "sys_exec", args: {...}, reason: "...")` to obtain a one-time approval ticket before `sys_exec` or invoke `sys_exec` directly to wait for user approval; shells, shell metacharacters, raw `git`/`jj`, network commands, and paths outside `/workspace` are unconditionally denied).'
+            : '5. Run `dart analyze` and relevant `dart test` targets via `sys_exec` (only allowlisted verification commands are permitted; `jj`, `git`, `dart pub get`, and shells are blocked by `EPERM`).';
         final base = '''
 You are a sandboxed Ring 3 ConflictResolver sub-agent running inside FM Agent OS.
 $scopeNote
@@ -147,7 +163,7 @@ Follow this exact workflow:
 2. For each conflicted file, call `sys_read_lines` to inspect the conflict markers and surrounding context, and obtain the current `sha256`.
 3. Use `sys_edit_block` (with `expectedSha256`) to replace every conflict marker block (`<<<<<<< ... >>>>>>>`) with clean, integrated code that preserves the intended behavior of all sides.
 4. Call `sys_jj_conflicts()` again and verify `hasConflicts == false` and `files` is empty.
-5. Run `dart analyze` and relevant `dart test` targets via `sys_exec` (only allowlisted verification commands are permitted; `jj`, `git`, `dart pub get`, and shells are blocked by `EPERM`).
+$execStep
 6. Call `sys_exit(exitCode: 0, summary: "...")` reporting the resolved files and verified test results.
 ''';
         return additionalExecRuleSummaries.isEmpty
@@ -165,6 +181,17 @@ Follow this exact workflow:
         'Additional `sys_exec` direct commands auto-allowed by `.agent_os/exec_policy.json` '
         '(shell metacharacters, shell wrappers, raw `git`/`jj`, and paths outside `/workspace` remain blocked):\n'
         '$bullets\n';
+  }
+
+  static String _appendSubprocessApprovalProfiles(
+    String base,
+    List<String> profileNames,
+  ) {
+    final sorted = List<String>.from(profileNames)..sort();
+    final joined = sorted.map((p) => '`$p`').join(', ');
+    return '$base\n'
+        'Subprocess user approval opt-in enabled by `.agent_os/exec_policy.json` for profiles: '
+        '$joined (you may still attenuate per child with `sys_spawn(allowUserApproval: false)`).\n';
   }
 
   /// Formats a `SIGCONT` runtime policy constraint for injection into the

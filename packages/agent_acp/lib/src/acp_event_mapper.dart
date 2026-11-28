@@ -16,7 +16,9 @@ class AcpSyscallObserverHook extends BaseSyscallHook {
 
   @override
   Future<HookBeforeResult> beforeSyscall(SyscallHookContext context) async {
-    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
+    if (!context.isApprovalPrecheck &&
+        context.pid == 1 &&
+        context.syscallName != 'sys_llm_chat') {
       _mapper.recordBeforeSyscall(context);
     }
     return const HookAllow();
@@ -27,7 +29,9 @@ class AcpSyscallObserverHook extends BaseSyscallHook {
     SyscallHookContext context,
     SyscallResult<Map<String, dynamic>> result,
   ) async {
-    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
+    if (!context.isApprovalPrecheck &&
+        context.pid == 1 &&
+        context.syscallName != 'sys_llm_chat') {
       _mapper.recordAfterSyscall(context, result);
     }
   }
@@ -146,14 +150,32 @@ class AcpEventMapper {
     _afterSyscallResult = result;
   }
 
-  /// Records the Stage 4 approval request preview and decision for `tool_call_update`.
+  /// Records the Stage 4 approval request preview and decision for `tool_call_update` ([D-708]).
   void recordApprovalResolution(
     ApprovalRequest request,
     ApprovalDecision decision,
   ) {
+    if (request.pid != 1) {
+      return;
+    }
     _lastApprovalDecision = decision;
     if (request.content.isNotEmpty) {
       _lastApprovalContent = request.content;
+    }
+  }
+
+  /// Records a consumed one-time [ApprovalGrant] for `pid == 1` ([D-704]).
+  void recordGrantConsumed(ApprovalGrant grant) {
+    if (grant.pid != 1) {
+      return;
+    }
+    _lastApprovalDecision = switch (grant.decisionOption) {
+      ApprovalOption.allowOnce => const ApprovalDecision.allowOnce(),
+      ApprovalOption.allowAlways => const ApprovalDecision.allowAlways(),
+      ApprovalOption.rejectOnce => const ApprovalDecision.rejectOnce(),
+    };
+    if (grant.preview != null && grant.preview!.content.isNotEmpty) {
+      _lastApprovalContent = grant.preview!.content;
     }
   }
 
@@ -381,6 +403,8 @@ class AcpEventMapper {
         return 'jj conflicts (${args['rev'] ?? '@'})';
       case 'sys_jj_integrate':
         return 'jj integrate';
+      case 'sys_request_approval':
+        return 'Request approval for ${args['syscall'] ?? ''}';
       default:
         return toolName;
     }

@@ -2,8 +2,9 @@ import 'context_memory.dart';
 import 'llm_driver.dart';
 import 'pcb.dart';
 import 'syscall_error.dart';
+import 'vfs_namespace.dart';
 
-/// Read-only context supplied to [SyscallHook] and [TxHook] callbacks ([D-017], [D-220]).
+/// Read-only context supplied to [SyscallHook] and [TxHook] callbacks ([D-017], [D-220], [D-704]).
 class SyscallHookContext {
   SyscallHookContext({
     required this.pid,
@@ -12,6 +13,8 @@ class SyscallHookContext {
     required this.syscallName,
     required Map<String, dynamic> args,
     required this.jjContext,
+    this.namespace,
+    this.isApprovalPrecheck = false,
   }) : args = Map<String, dynamic>.unmodifiable(args);
 
   final Pid pid;
@@ -20,6 +23,8 @@ class SyscallHookContext {
   final String syscallName;
   final Map<String, dynamic> args;
   final JjTxContext jjContext;
+  final VfsNamespace? namespace;
+  final bool isApprovalPrecheck;
 }
 
 /// Decision returned by [SyscallHook.beforeSyscall] and [TxHook.onTxSquash] ([D-017], [D-220]).

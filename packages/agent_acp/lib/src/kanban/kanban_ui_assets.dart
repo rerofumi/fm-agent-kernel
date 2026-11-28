@@ -118,6 +118,26 @@ const String kanbanIndexHtml = r'''<!DOCTYPE html>
     }
     .badge.conflict { color: var(--danger); border-color: var(--danger); }
     .badge.queued { color: var(--warn); border-color: var(--warn); }
+    .badge.subprocess { color: var(--warn); border-color: var(--warn); }
+    .perm-banner {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 14px 0 14px;
+    }
+    .perm-banner.visible { display: flex; }
+    .perm-box {
+      background: var(--surface);
+      border: 1px solid var(--warn);
+      border-radius: 8px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .perm-title { font-weight: 700; font-size: 13px; color: var(--warn); }
+    .perm-reason { font-size: 12px; color: var(--text); word-break: break-word; }
     .card-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
     .stream-box {
       font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -169,6 +189,8 @@ const String kanbanIndexHtml = r'''<!DOCTYPE html>
     <button id="btn-global-cont" class="ok">Resume All</button>
     <button id="btn-shutdown" class="danger">Shutdown</button>
   </header>
+
+  <section id="global-permissions" class="perm-banner"></section>
 
   <main class="board" id="board">
     <section class="lane" data-lane="todo">
@@ -316,6 +338,21 @@ const String kanbanIndexHtml = r'''<!DOCTYPE html>
           modelSel.value = s.currentModel;
         }
 
+        const cardIds = new Set((state.cards || []).map(c => c.taskId));
+        const globalPermsEl = document.getElementById('global-permissions');
+        globalPermsEl.textContent = '';
+        const globalPerms = (state.pendingPermissions || []).filter(
+          p => !p.taskId || !cardIds.has(p.taskId)
+        );
+        if (globalPerms.length > 0) {
+          globalPermsEl.classList.add('visible');
+          for (const perm of globalPerms) {
+            globalPermsEl.appendChild(buildPermissionBox(perm));
+          }
+        } else {
+          globalPermsEl.classList.remove('visible');
+        }
+
         const lanes = { todo: [], running: [], paused: [], review: [], done: [] };
         for (const card of (state.cards || [])) {
           lanes[laneForCard(card, state.pendingPermissions || [])].push(card);
@@ -461,29 +498,91 @@ const String kanbanIndexHtml = r'''<!DOCTYPE html>
           actions.appendChild(sqBtn);
         }
 
+        div.appendChild(actions);
+
         for (const perm of (state.pendingPermissions || [])) {
           if (perm.taskId === card.taskId || !perm.taskId) {
-            const appBtn = document.createElement('button');
-            appBtn.className = 'ok';
-            appBtn.textContent = 'Approve';
-            appBtn.onclick = () => api('/api/permissions/respond', 'POST', {
-              requestId: perm.requestId,
-              optionId: 'allow_once'
-            }).then(refresh);
-            const rejBtn = document.createElement('button');
-            rejBtn.className = 'danger';
-            rejBtn.textContent = 'Reject';
-            rejBtn.onclick = () => api('/api/permissions/respond', 'POST', {
-              requestId: perm.requestId,
-              optionId: 'reject_once'
-            }).then(refresh);
-            actions.appendChild(appBtn);
-            actions.appendChild(rejBtn);
+            div.appendChild(buildPermissionBox(perm));
           }
         }
 
-        div.appendChild(actions);
         return div;
+      }
+
+      function buildPermissionBox(perm) {
+        const box = document.createElement('div');
+        box.className = 'perm-box';
+        box.dataset.requestId = perm.requestId || '';
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'perm-title';
+        titleEl.textContent = (perm.toolCall && perm.toolCall.title) || 'Approval Required';
+        box.appendChild(titleEl);
+
+        const meta = perm.approvalMeta || {};
+        if (meta.pid !== undefined && meta.pid !== null && meta.pid !== 1) {
+          const badgeRow = document.createElement('div');
+          badgeRow.className = 'badge-row';
+          const b = document.createElement('span');
+          b.className = 'badge subprocess';
+          b.textContent = 'Subprocess PID ' + meta.pid + (meta.profile ? ' (' + meta.profile + ')' : '');
+          badgeRow.appendChild(b);
+          box.appendChild(badgeRow);
+        }
+
+        if (meta.reason) {
+          const reasonEl = document.createElement('div');
+          reasonEl.className = 'perm-reason';
+          reasonEl.textContent = 'Reason: ' + meta.reason;
+          box.appendChild(reasonEl);
+        }
+
+        const previewParts = [];
+        const rawContent = perm.toolCall && Array.isArray(perm.toolCall.content)
+          ? perm.toolCall.content
+          : [];
+        for (const item of rawContent) {
+          if (!item || typeof item !== 'object') continue;
+          if (item.type === 'content' && item.content && typeof item.content.text === 'string' && item.content.text.trim()) {
+            previewParts.push(item.content.text.trim());
+          } else if (item.type === 'diff') {
+            previewParts.push('diff: ' + (item.path || '(file)'));
+          }
+        }
+        if (previewParts.length > 0) {
+          const previewBox = document.createElement('div');
+          previewBox.className = 'stream-box';
+          previewBox.textContent = previewParts.join('\n');
+          box.appendChild(previewBox);
+        }
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'card-actions';
+        const opts = (Array.isArray(perm.options) && perm.options.length > 0)
+          ? perm.options
+          : [
+              { optionId: 'allow_once', name: 'Allow once' },
+              { optionId: 'allow_always', name: 'Allow always' },
+              { optionId: 'reject_once', name: 'Deny' }
+            ];
+        for (const opt of opts) {
+          const btn = document.createElement('button');
+          if (opt.optionId === 'reject_once') {
+            btn.className = 'danger';
+          } else if (opt.optionId === 'allow_always') {
+            btn.className = 'primary';
+          } else {
+            btn.className = 'ok';
+          }
+          btn.textContent = opt.name || opt.optionId;
+          btn.onclick = () => api('/api/permissions/respond', 'POST', {
+            requestId: perm.requestId,
+            optionId: opt.optionId
+          }).then(refresh);
+          btnRow.appendChild(btn);
+        }
+        box.appendChild(btnRow);
+        return box;
       }
 
       async function openDiff(taskId) {

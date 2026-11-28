@@ -37,8 +37,9 @@ void main() {
       const expectedStage2 = '$expectedStep1\n'
           'Available Stage 2/3 virtual memory, multi-process, merge, and skill syscalls:\n'
           '- `sys_mem_pagein`: Reload an evicted Clean Page by `pageId` from Segment 2\'s Page Directory Summary.\n'
-          '- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit; `maxWallTimeMs` default `600000` / max `3600000` ms, `maxSteps` default `32` / max `128`, `heartbeatTimeoutMs` default `300000` / max `600000` ms, paused during `SIGSTOP`).\n'
+          '- `sys_spawn`: Spawn sandboxed Ring 3 child Isolate workers (`explorer` for read-only inspection, `web_researcher` for sterile web research, `workspace_worker` for isolated `jj workspace` parallel editing/testing, `conflict_resolver` for resolving First-Class Conflicts on a merge commit; optional `allowUserApproval: true` opts `workspace_worker` / `conflict_resolver` into user approval requests [default off]; `maxWallTimeMs` default `600000` / max `3600000` ms, `maxSteps` default `32` / max `128`, `heartbeatTimeoutMs` default `300000` / max `600000` ms, paused during `SIGSTOP` and `waitingApproval`).\n'
           '- `sys_wait`: Wait for spawned child processes and receive their exit summaries and `workingChangeId`s in `children`. Non-destructive on timeout (`timeoutMs` default `120000`, max `600000`): unfinished children continue running and are returned with `timedOut: true` and live `heartbeat` progress snapshots in `running` so you can re-wait with `sys_wait` or intervene with `sys_kill` if stalled/looping.\n'
+          '- `sys_request_approval`: Pre-validate a target `syscall` and `args` (with optional `reason`) and request user approval to obtain a one-time approval ticket bound to `(pid, syscall, normalizedArgs)`.\n'
           '- `sys_jj_merge`: Merge 2+ completed worker `changeIds` into a multi-parent commit (never aborts on First-Class Conflicts; returns `mergeChangeId`, `hasConflicts`, and `conflictedFiles`).\n'
           '- `sys_jj_conflicts`: Non-destructively inspect First-Class Conflicts on a revision (`hasConflicts` and `/workspace/...` `files`).\n'
           '- `sys_jj_integrate`: Flatten a conflict-free resolved merge or worker change into your single-parent anchor working change and abandon temporary worker/merge changes before `sys_tx_squash`.\n'
@@ -403,6 +404,95 @@ void main() {
           '${AgentPrompts.buildChildInstruction(profile: ProcessProfileId.conflictResolver)}$expectedSuffix',
         ),
       );
+    });
+
+    test(
+        'buildLeadInstruction appends subprocessApprovalProfileNames deterministically for Stage 2/3 only [D-711]',
+        () {
+      // Stage 1 ignores subprocessApprovalProfileNames and preserves identical const reference.
+      expect(
+        identical(
+          AgentPrompts.buildLeadInstruction(
+            stage: 1,
+            subprocessApprovalProfileNames: const <String>['workspace_worker'],
+          ),
+          AgentPrompts.leadStep1Instruction,
+        ),
+        isTrue,
+      );
+
+      const expectedApprovalSuffix =
+          '\nSubprocess user approval opt-in enabled by `.agent_os/exec_policy.json` for profiles: '
+          '`conflict_resolver`, `workspace_worker` '
+          '(you may still attenuate per child with `sys_spawn(allowUserApproval: false)`).\n';
+
+      // Input order is sorted deterministically.
+      expect(
+        AgentPrompts.buildLeadInstruction(
+          stage: 2,
+          subprocessApprovalProfileNames: const <String>[
+            'workspace_worker',
+            'conflict_resolver',
+          ],
+        ),
+        equals('${AgentPrompts.leadStage2Instruction}$expectedApprovalSuffix'),
+      );
+      expect(
+        AgentPrompts.buildLeadInstruction(
+          stage: 3,
+          subprocessApprovalProfileNames: const <String>[
+            'workspace_worker',
+            'conflict_resolver',
+          ],
+        ),
+        equals('${AgentPrompts.leadStage3Instruction}$expectedApprovalSuffix'),
+      );
+    });
+
+    test(
+        'buildChildInstruction switches guidance for canRequestApproval: true on workspaceWorker / conflictResolver and ignores sterile profiles [D-711]',
+        () {
+      // Sterile profiles ignore canRequestApproval: true completely.
+      expect(
+        AgentPrompts.buildChildInstruction(
+          profile: ProcessProfileId.explorer,
+          canRequestApproval: true,
+        ),
+        equals(
+          AgentPrompts.buildChildInstruction(
+            profile: ProcessProfileId.explorer,
+          ),
+        ),
+      );
+      expect(
+        AgentPrompts.buildChildInstruction(
+          profile: ProcessProfileId.webResearcher,
+          canRequestApproval: true,
+        ),
+        equals(
+          AgentPrompts.buildChildInstruction(
+            profile: ProcessProfileId.webResearcher,
+          ),
+        ),
+      );
+
+      // workspaceWorker with canRequestApproval: true replaces TTY monopoly text with sys_request_approval guidance.
+      final workerWithApproval = AgentPrompts.buildChildInstruction(
+        profile: ProcessProfileId.workspaceWorker,
+        canRequestApproval: true,
+      );
+      expect(workerWithApproval, contains('sys_request_approval'));
+      expect(workerWithApproval, contains('one-time approval ticket'));
+      expect(workerWithApproval, isNot(contains('TTY monopoly (`EPERM`)')));
+
+      // conflictResolver with canRequestApproval: true replaces EPERM parenthetical with sys_request_approval guidance.
+      final resolverWithApproval = AgentPrompts.buildChildInstruction(
+        profile: ProcessProfileId.conflictResolver,
+        canRequestApproval: true,
+      );
+      expect(resolverWithApproval, contains('sys_request_approval'));
+      expect(resolverWithApproval, contains('one-time approval ticket'));
+      expect(resolverWithApproval, isNot(contains('blocked by `EPERM`')));
     });
   });
 }

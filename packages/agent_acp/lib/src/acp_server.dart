@@ -484,6 +484,7 @@ class AcpServer {
           bootstrap.pcb.quota.maxTotalTokens ??
           32768,
     );
+    bootstrap.approvalGate.onGrantConsumed = mapper.recordGrantConsumed;
 
     final eventSubscription =
         bootstrap.processRunner.events.listen(mapper.onAgentLoopEvent);
@@ -1597,7 +1598,9 @@ class _DeferredAcpObserverHook extends BaseSyscallHook {
 
   @override
   Future<HookBeforeResult> beforeSyscall(SyscallHookContext context) async {
-    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
+    if (!context.isApprovalPrecheck &&
+        context.pid == 1 &&
+        context.syscallName != 'sys_llm_chat') {
       _mapperProvider().recordBeforeSyscall(context);
     }
     return const HookAllow();
@@ -1608,7 +1611,9 @@ class _DeferredAcpObserverHook extends BaseSyscallHook {
     SyscallHookContext context,
     SyscallResult<Map<String, dynamic>> result,
   ) async {
-    if (context.pid == 1 && context.syscallName != 'sys_llm_chat') {
+    if (!context.isApprovalPrecheck &&
+        context.pid == 1 &&
+        context.syscallName != 'sys_llm_chat') {
       _mapperProvider().recordAfterSyscall(context, result);
     }
   }

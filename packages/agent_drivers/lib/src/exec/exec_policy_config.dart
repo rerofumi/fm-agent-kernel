@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:agent_kernel/agent_kernel.dart';
 import 'package:path/path.dart' as p;
 
 /// Single allowlist rule parsed from `.agent_os/exec_policy.json` ([D-506]).
@@ -26,15 +27,26 @@ class ExecAllowRule {
   final List<List<String>>? argPrefixes;
   final int maxTimeoutMs;
 
-  /// Strips trailing `.exe` / `.cmd` / `.bat` / `.ps1` and lowercases [rawCommand].
+  /// Iteratively strips trailing dots (`.`) and Windows executable extensions
+  /// (`.exe` / `.cmd` / `.bat` / `.ps1` / `.com`) after lowercasing [rawCommand] ([D-703], [D-705]).
   static String normalizeCommandName(String rawCommand) {
-    final lower = rawCommand.trim().toLowerCase();
-    for (final ext in const <String>['.exe', '.cmd', '.bat', '.ps1']) {
-      if (lower.endsWith(ext)) {
-        return lower.substring(0, lower.length - ext.length);
+    var current = rawCommand.trim().toLowerCase();
+    var changed = true;
+    while (changed && current.isNotEmpty) {
+      changed = false;
+      while (current.endsWith('.')) {
+        current = current.substring(0, current.length - 1);
+        changed = true;
+      }
+      for (final ext in const <String>['.exe', '.cmd', '.bat', '.ps1', '.com']) {
+        if (current.endsWith(ext)) {
+          current = current.substring(0, current.length - ext.length);
+          changed = true;
+          break;
+        }
       }
     }
-    return lower;
+    return current;
   }
 
   /// Strips any leading directory path (`/` or `\`) and then normalizes extension/case.
@@ -80,21 +92,40 @@ class ExecAllowRule {
   }
 }
 
-/// Parsed `.agent_os/exec_policy.json` configuration ([D-506], [D-509]).
+/// Parsed `.agent_os/exec_policy.json` configuration ([D-506], [D-509], [D-703]).
 class ExecPolicyConfig {
   ExecPolicyConfig({
     List<ExecAllowRule> allow = const <ExecAllowRule>[],
-  }) : allow = List<ExecAllowRule>.unmodifiable(allow);
+    Set<ProcessProfileId> subprocessApprovalProfiles =
+        const <ProcessProfileId>{},
+  })  : allow = List<ExecAllowRule>.unmodifiable(allow),
+        subprocessApprovalProfiles = Set<ProcessProfileId>.unmodifiable(
+          subprocessApprovalProfiles.where((p) => p.supportsUserApprovalOptIn),
+        );
 
-  /// Default policy with no additional allowlisted direct commands.
+  /// Default policy with no additional allowlisted direct commands or subprocess approval opt-ins.
   factory ExecPolicyConfig.defaults() => ExecPolicyConfig();
 
   final List<ExecAllowRule> allow;
+
+  /// Ring 3 profiles opted into `CapRight.requestApproval` via `.agent_os/exec_policy.json` ([D-703]).
+  final Set<ProcessProfileId> subprocessApprovalProfiles;
+
+  /// Returns true if [profile] is eligible and opted into `CapRight.requestApproval` ([D-703]).
+  bool allowsUserApprovalForProfile(ProcessProfileId profile) =>
+      profile.supportsUserApprovalOptIn &&
+      subprocessApprovalProfiles.contains(profile);
 
   static final RegExp _shellMetaPattern = RegExp(
     r'[&|;><`\r\n\x00%]|\$\(',
   );
   static final RegExp _whitespacePattern = RegExp(r'\s');
+
+  static const Set<String> _allowedRootKeys = <String>{
+    'allow',
+    'allowSubprocessUserApproval',
+    'subprocessApprovalProfiles',
+  };
 
   static const Set<String> _allowedRuleKeys = <String>{
     'command',
@@ -206,14 +237,22 @@ class ExecPolicyConfig {
 
     for (final rawKey in decoded.keys) {
       final key = rawKey.toString();
-      if (key != 'allow') {
+      if (!_allowedRootKeys.contains(key)) {
         warnings.add('Unknown root key "$key" in $label; ignoring.');
       }
     }
 
+    final approvalProfiles = _parseSubprocessApprovalProfiles(
+      decoded,
+      label: label,
+      warnings: warnings,
+    );
+
     if (!decoded.containsKey('allow')) {
       return ExecPolicyLoadResult(
-        config: ExecPolicyConfig.defaults(),
+        config: ExecPolicyConfig(
+          subprocessApprovalProfiles: approvalProfiles,
+        ),
         sourcePath: sourcePath,
         warnings: warnings,
       );
@@ -245,10 +284,95 @@ class ExecPolicyConfig {
     }
 
     return ExecPolicyLoadResult(
-      config: ExecPolicyConfig(allow: rules),
+      config: ExecPolicyConfig(
+        allow: rules,
+        subprocessApprovalProfiles: approvalProfiles,
+      ),
       sourcePath: sourcePath,
       warnings: warnings,
     );
+  }
+
+  static Set<ProcessProfileId> _parseSubprocessApprovalProfiles(
+    Map<dynamic, dynamic> decoded, {
+    required String label,
+    required List<String> warnings,
+  }) {
+    final hasAllowFlag = decoded.containsKey('allowSubprocessUserApproval');
+    final hasProfiles = decoded.containsKey('subprocessApprovalProfiles');
+    if (!hasAllowFlag && !hasProfiles) {
+      return const <ProcessProfileId>{};
+    }
+
+    bool? allowFlag;
+    if (hasAllowFlag) {
+      final rawFlag = decoded['allowSubprocessUserApproval'];
+      if (rawFlag is! bool) {
+        warnings.add(
+          '"allowSubprocessUserApproval" in $label must be a boolean; disabling subprocess user approval (fail-closed).',
+        );
+        return const <ProcessProfileId>{};
+      }
+      allowFlag = rawFlag;
+    }
+
+    if (allowFlag == false) {
+      if (hasProfiles) {
+        warnings.add(
+          'Both "allowSubprocessUserApproval": false and "subprocessApprovalProfiles" are set in $label; disabling subprocess user approval (fail-closed).',
+        );
+      }
+      return const <ProcessProfileId>{};
+    }
+
+    if (!hasProfiles) {
+      // allowFlag == true and subprocessApprovalProfiles omitted -> all opt-in-eligible profiles.
+      return const <ProcessProfileId>{
+        ProcessProfileId.workspaceWorker,
+        ProcessProfileId.conflictResolver,
+      };
+    }
+
+    final rawProfiles = decoded['subprocessApprovalProfiles'];
+    if (rawProfiles is! List) {
+      warnings.add(
+        '"subprocessApprovalProfiles" in $label must be a JSON array; disabling subprocess user approval (fail-closed).',
+      );
+      return const <ProcessProfileId>{};
+    }
+
+    final result = <ProcessProfileId>{};
+    for (var i = 0; i < rawProfiles.length; i++) {
+      final item = rawProfiles[i];
+      if (item is! String) {
+        warnings.add(
+          'Entry subprocessApprovalProfiles[$i] in $label must be a string; ignoring (fail-closed).',
+        );
+        continue;
+      }
+      final trimmed = item.trim();
+      if (trimmed.isEmpty) {
+        warnings.add(
+          'Entry subprocessApprovalProfiles[$i] in $label is empty; ignoring (fail-closed).',
+        );
+        continue;
+      }
+      final parsed = ProcessProfileId.tryParse(trimmed);
+      if (parsed == null) {
+        warnings.add(
+          'Unknown profile "$trimmed" in subprocessApprovalProfiles of $label; ignoring (fail-closed).',
+        );
+        continue;
+      }
+      if (!parsed.supportsUserApprovalOptIn) {
+        warnings.add(
+          'Profile "${parsed.wireValue}" in subprocessApprovalProfiles is forbidden from holding requestApproval; ignoring (fail-closed).',
+        );
+        continue;
+      }
+      result.add(parsed);
+    }
+    return result;
   }
 
   static ExecAllowRule? _parseRule(

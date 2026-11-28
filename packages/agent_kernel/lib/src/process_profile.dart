@@ -77,6 +77,29 @@ enum ProcessProfileId {
   /// Whether `sys_jj_*` calls must force `--ignore-working-copy` ([D-204], [D-306]).
   bool get forcesVcsIgnoreWorkingCopy => this != ProcessProfileId.webResearcher;
 
+  /// Optional rights that may be granted to this profile only via explicit opt-in ([D-702]).
+  Set<CapRight> get optInRights {
+    return switch (this) {
+      ProcessProfileId.explorer ||
+      ProcessProfileId.webResearcher => const <CapRight>{},
+      ProcessProfileId.workspaceWorker ||
+      ProcessProfileId.conflictResolver => const <CapRight>{
+          CapRight.requestApproval,
+        },
+    };
+  }
+
+  /// Maximum capability ceiling permitted for this profile (`defaultRights ∪ optInRights`) ([D-702]).
+  Set<CapRight> get maxAllowedRights => <CapRight>{
+        ...defaultRights,
+        ...optInRights,
+      };
+
+  /// Whether this profile is eligible to opt into `CapRight.requestApproval` ([D-702]).
+  bool get supportsUserApprovalOptIn =>
+      this == ProcessProfileId.workspaceWorker ||
+      this == ProcessProfileId.conflictResolver;
+
   /// Parses a wire profile identifier.
   static ProcessProfileId? tryParse(String raw) {
     final normalized = raw.trim().toLowerCase();
@@ -103,6 +126,7 @@ class SpawnSpec {
     this.maxSteps = defaultMaxSteps,
     this.heartbeatTimeoutMs = defaultHeartbeatTimeoutMs,
     Set<CapRight>? requestedRights,
+    this.allowUserApproval,
     this.baseChangeId,
     this.logicalTaskId,
     this.supervision,
@@ -137,6 +161,7 @@ class SpawnSpec {
   final int maxSteps;
   final int heartbeatTimeoutMs;
   final Set<CapRight>? requestedRights;
+  final bool? allowUserApproval;
   final String? baseChangeId;
   final String? logicalTaskId;
   final SupervisionPolicy? supervision;
@@ -155,6 +180,7 @@ class SpawnSpec {
       'heartbeatTimeoutMs': heartbeatTimeoutMs,
       if (requestedRights != null)
         'requestedRights': requestedRights!.map((r) => r.name).toList(),
+      if (allowUserApproval != null) 'allowUserApproval': allowUserApproval,
       if (baseChangeId != null) 'baseChangeId': baseChangeId,
       if (logicalTaskId != null) 'logicalTaskId': logicalTaskId,
       if (supervision != null) 'supervision': supervision!.toJson(),

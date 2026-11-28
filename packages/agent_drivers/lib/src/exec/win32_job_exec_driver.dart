@@ -330,6 +330,19 @@ class Win32JobExecDriver {
       command: command,
       args: args,
     );
+    if (callerPcb?.ring == ProtectionRing.ring3 &&
+        (normalized.hadShellMeta ||
+            _shellExecutables.contains(_normalizeExeBase(normalized.command)))) {
+      return SyscallResult<Map<String, dynamic>>.failure(
+        SyscallError(
+          code: SyscallErrorCode.eperm,
+          reason: 'DENIED_BY_POLICY',
+          message:
+              'Ring 3 child processes are prohibited from executing shell wrappers or shell metacharacters ("${normalized.command}").',
+          recoverable: false,
+        ),
+      );
+    }
     final effectiveWorkingDir =
         (workingDir == null || workingDir.trim().isEmpty)
             ? VfsNamespace.virtualRoot
@@ -742,6 +755,17 @@ class Win32JobExecDriver {
       return resolved;
     }
     final res = resolved.value!;
+    if (res.isSkillsMount || res.isReadOnly) {
+      return SyscallResult<VfsPathResolution>.failure(
+        SyscallError(
+          code: SyscallErrorCode.eacces,
+          reason: 'OUT_OF_WORKSPACE_SCOPE',
+          message:
+              'workingDir "${res.virtualPath}" must be inside mutable /workspace (read-only /skills mount is not permitted).',
+          recoverable: true,
+        ),
+      );
+    }
     final type = FileSystemEntity.typeSync(res.hostPath, followLinks: true);
     if (type == FileSystemEntityType.notFound) {
       return SyscallResult<VfsPathResolution>.failure(
@@ -802,6 +826,7 @@ class Win32JobExecDriver {
               args: resolvedArgs,
               workingDir: workingDir,
               timeoutMs: timeoutMs,
+              callerRing: pcb.ring,
               namespaceOverride: pcb.namespace,
             )
             .decision;
@@ -822,12 +847,17 @@ class Win32JobExecDriver {
           args: argsList,
           workingDir: workingDir,
           timeoutMs: timeoutMs,
+          callerRing: hookCtx.ring,
+          namespaceOverride: hookCtx.namespace,
         );
         final scope = SysExecApprovalScope.build(
           command: command,
           args: argsList,
           workingDir: workingDir,
         );
+        final scopeLine = hookCtx.pid == 1
+            ? 'Session allow_always scope: ${scope.scopeDescription}'
+            : 'Process allow_always scope (pid=${hookCtx.pid} only): ${scope.scopeDescription}';
         return ApprovalPreview(
           title: 'Execute external command: $fullCmd',
           kind: 'execute',
@@ -837,7 +867,7 @@ class Win32JobExecDriver {
               'content': <String, dynamic>{
                 'type': 'text',
                 'text':
-                    'Command: $fullCmd\nWorkingDir: $workingDir\nTimeout: ${timeoutMs}ms\nReason: ${classification.reason}\nSession allow_always scope: ${scope.scopeDescription}',
+                    'Command: $fullCmd\nWorkingDir: $workingDir\nTimeout: ${timeoutMs}ms\nReason: ${classification.reason}\n$scopeLine',
               },
             },
           ],
@@ -1004,7 +1034,9 @@ class Win32JobExecDriver {
 
     final out = Map<String, dynamic>.from(args);
     out['command'] = normalized.command;
-    if (args['args'] != null || normalized.wasSplitFromSingleString) {
+    if (args['args'] != null ||
+        normalized.wasSplitFromSingleString ||
+        !normalized.hadShellMeta) {
       out['args'] = normalized.args;
     }
     if (out['workingDir'] == null) {

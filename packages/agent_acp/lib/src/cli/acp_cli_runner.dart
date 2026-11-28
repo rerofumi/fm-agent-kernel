@@ -491,6 +491,8 @@ class AcpCliRunner {
     peer.onNotification = (method, params) {
       if (method == 'session/update') {
         state.handleSessionUpdate(params);
+      } else if (method == '_fm_agent_os/permission_cancelled') {
+        state.handlePermissionCancelled(params);
       }
     };
     peer.onRequest = (method, params) async {
@@ -848,6 +850,7 @@ class AcpCliRunner {
         peer.sendNotification('session/cancel', <String, dynamic>{
           'sessionId': state.sessionId,
         });
+        state.clearPendingPermissionWait();
         _out.writeln('[Cancel] Sent session/cancel.');
         return true;
       }
@@ -893,6 +896,7 @@ class AcpCliRunner {
       return const _LineAction(failed: true);
     } finally {
       state.turnActive = false;
+      state.clearPendingPermissionWait();
       state.stdinRouter?.setMidTurnCommandHandler(null);
     }
   }
@@ -1244,6 +1248,36 @@ class _CliSessionState {
 
   bool _wroteThought = false;
   bool _wroteText = false;
+  String? _pendingPermissionRequestId;
+  String? _pendingPermissionToolCallId;
+
+  /// Clears any active interactive permission wait and its correlation IDs ([D-709]).
+  void clearPendingPermissionWait() {
+    _pendingPermissionRequestId = null;
+    _pendingPermissionToolCallId = null;
+    stdinRouter?.cancelPermissionWait();
+  }
+
+  /// Handles daemon `_fm_agent_os/permission_cancelled` only when the ID matches
+  /// the currently pending interactive approval request ([D-709], RV-001).
+  void handlePermissionCancelled(Map<String, dynamic> params) {
+    final reqId = params['requestId'] as String?;
+    final tcId = params['toolCallId'] as String?;
+    final matchesReq = reqId != null &&
+        reqId.isNotEmpty &&
+        reqId == _pendingPermissionRequestId;
+    final matchesTc = tcId != null &&
+        tcId.isNotEmpty &&
+        tcId == _pendingPermissionToolCallId;
+    if (!matchesReq && !matchesTc) {
+      return;
+    }
+    _pendingPermissionRequestId = null;
+    _pendingPermissionToolCallId = null;
+    stdinRouter?.cancelPermissionWait();
+    out.writeln('');
+    out.writeln('[Approval cancelled]');
+  }
 
   void resetTurnDisplay() {
     _wroteThought = false;
@@ -1391,6 +1425,12 @@ class _CliSessionState {
     final title = (toolCall['title'] as String?) ?? 'Approve action';
     final kind = (toolCall['kind'] as String?) ?? 'other';
     final content = toolCall['content'];
+    final approvalMeta = _asStringMap(
+      _asStringMap(params['_meta'])['fm_agent_os/approval'],
+    );
+    final pid = (approvalMeta['pid'] as num?)?.toInt();
+    final requestId = approvalMeta['requestId'] as String?;
+    final toolCallId = toolCall['toolCallId'] as String?;
 
     out.writeln('');
     out.writeln('=== [RING 2 APPROVAL REQUIRED] ===');
@@ -1410,8 +1450,23 @@ class _CliSessionState {
         '[Policy:${permissionPolicy.rawSpec}] -> $chosenOptionId',
       );
     } else {
-      out.write('Allow? [y] once / [a] session / [n] deny: ');
-      final answer = await stdinRouter!.readPermissionAnswer();
+      if (pid != null && pid != 1) {
+        out.write('Allow? [y] once / [a] process (pid=$pid) / [n] deny: ');
+      } else {
+        out.write('Allow? [y] once / [a] session / [n] deny: ');
+      }
+      _pendingPermissionRequestId = requestId;
+      _pendingPermissionToolCallId = toolCallId;
+      final String? answer;
+      try {
+        answer = await stdinRouter!.readPermissionAnswer();
+      } finally {
+        if (_pendingPermissionRequestId == requestId &&
+            _pendingPermissionToolCallId == toolCallId) {
+          _pendingPermissionRequestId = null;
+          _pendingPermissionToolCallId = null;
+        }
+      }
       if (answer == null) {
         return <String, dynamic>{
           'outcome': <String, dynamic>{'outcome': 'cancelled'},
@@ -1521,6 +1576,13 @@ class _StdinLineRouter {
 
   void _onLine(String line) {
     if (_permissionWaiter != null && !_permissionWaiter!.isCompleted) {
+      final trimmed = line.trim();
+      if (_midTurnCommandHandler != null && _midTurnCommandHandler!(line)) {
+        if (trimmed == '/cancel') {
+          cancelPermissionWait();
+        }
+        return;
+      }
       final w = _permissionWaiter!;
       _permissionWaiter = null;
       w.complete(line);
@@ -1536,6 +1598,14 @@ class _StdinLineRouter {
       return;
     }
     _replBuffer.add(line);
+  }
+
+  void cancelPermissionWait() {
+    final w = _permissionWaiter;
+    _permissionWaiter = null;
+    if (w != null && !w.isCompleted) {
+      w.complete(null);
+    }
   }
 
   void _onDone() {
@@ -1563,6 +1633,11 @@ class _StdinLineRouter {
   }
 
   Future<String?> readPermissionAnswer() {
+    if (_permissionWaiter != null && !_permissionWaiter!.isCompleted) {
+      final prev = _permissionWaiter!;
+      _permissionWaiter = null;
+      prev.complete(null);
+    }
     if (_closed) {
       return Future<String?>.value(null);
     }

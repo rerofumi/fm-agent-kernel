@@ -37,7 +37,7 @@ class KanbanQueuedRun {
   }
 }
 
-/// Pending `session/request_permission` prompt awaiting user decision in the Kanban UI.
+/// Pending `session/request_permission` prompt awaiting user decision in the Kanban UI ([D-709]).
 class KanbanPendingPermission {
   KanbanPendingPermission({
     required this.requestId,
@@ -45,6 +45,9 @@ class KanbanPendingPermission {
     required this.toolCall,
     required this.options,
     this.taskId,
+    this.daemonRequestId,
+    this.toolCallId,
+    this.approvalMeta,
   }) : completer = Completer<Map<String, dynamic>>();
 
   final String requestId;
@@ -52,6 +55,9 @@ class KanbanPendingPermission {
   final Map<String, dynamic> toolCall;
   final List<Map<String, dynamic>> options;
   final String? taskId;
+  final String? daemonRequestId;
+  final String? toolCallId;
+  final Map<String, dynamic>? approvalMeta;
   final Completer<Map<String, dynamic>> completer;
 
   Map<String, dynamic> toJson() {
@@ -61,6 +67,7 @@ class KanbanPendingPermission {
       if (taskId != null) 'taskId': taskId,
       'toolCall': toolCall,
       'options': options,
+      'approvalMeta': ?approvalMeta,
     };
   }
 }
@@ -455,6 +462,7 @@ class KanbanAcpBridge {
             next.completer.completeError(e, st);
           }
         } finally {
+          _cancelAllPendingPermissions();
           _activeRun = null;
           _emitEvent(<String, dynamic>{
             'type': 'run_finished',
@@ -631,11 +639,18 @@ class KanbanAcpBridge {
         : <String, dynamic>{'diff': ''};
   }
 
-  /// Responds to a pending `session/request_permission` prompt.
+  /// Responds to a pending `session/request_permission` prompt ([D-709]).
   Future<Map<String, dynamic>> respondPermission({
     required String requestId,
     required String optionId,
   }) async {
+    const validOptions = <String>{'allow_once', 'allow_always', 'reject_once'};
+    if (!validOptions.contains(optionId)) {
+      throw WireJsonRpcException(
+        WireJsonRpcErrorCodes.invalidParams,
+        'Invalid permission optionId "$optionId". Expected allow_once, allow_always, or reject_once.',
+      );
+    }
     final pending = _pendingPermissions.remove(requestId);
     if (pending == null) {
       throw WireJsonRpcException(
@@ -785,12 +800,25 @@ class KanbanAcpBridge {
               .toList(growable: false)
           : <Map<String, dynamic>>[];
 
+      Map<String, dynamic>? approvalMeta;
+      final rawMeta = params['_meta'];
+      if (rawMeta is Map && rawMeta['fm_agent_os/approval'] is Map) {
+        approvalMeta = Map<String, dynamic>.from(
+          rawMeta['fm_agent_os/approval'] as Map,
+        );
+      }
+      final daemonRequestId = approvalMeta?['requestId'] as String?;
+      final toolCallId = toolCall['toolCallId'] as String?;
+
       final pending = KanbanPendingPermission(
         requestId: reqId,
         sessionId: sid,
         toolCall: toolCall,
         options: options,
         taskId: _activeRun?.taskId,
+        daemonRequestId: daemonRequestId,
+        toolCallId: toolCallId,
+        approvalMeta: approvalMeta,
       );
       _pendingPermissions[reqId] = pending;
       _emitEvent(<String, dynamic>{
@@ -806,10 +834,62 @@ class KanbanAcpBridge {
     );
   }
 
+  void _cancelAllPendingPermissions() {
+    if (_pendingPermissions.isEmpty) {
+      return;
+    }
+    final entries = _pendingPermissions.values.toList(growable: false);
+    _pendingPermissions.clear();
+    for (final pending in entries) {
+      if (!pending.completer.isCompleted) {
+        pending.completer.complete(<String, dynamic>{
+          'outcome': <String, dynamic>{'outcome': 'cancelled'},
+        });
+      }
+      _emitEvent(<String, dynamic>{
+        'type': 'permission_cancelled',
+        'requestId': pending.requestId,
+      });
+    }
+  }
+
   void _handleIncomingNotification(
     String method,
     Map<String, dynamic> params,
   ) {
+    if (method == '_fm_agent_os/permission_cancelled') {
+      final targetReqId = params['requestId'] as String?;
+      final targetToolCallId = params['toolCallId'] as String?;
+      final matchedKeys = <String>[];
+      for (final entry in _pendingPermissions.entries) {
+        final pending = entry.value;
+        final matchesReq = targetReqId != null &&
+            targetReqId.isNotEmpty &&
+            pending.daemonRequestId == targetReqId;
+        final matchesTc = targetToolCallId != null &&
+            targetToolCallId.isNotEmpty &&
+            pending.toolCallId == targetToolCallId;
+        if (matchesReq || matchesTc) {
+          matchedKeys.add(entry.key);
+        }
+      }
+      for (final key in matchedKeys) {
+        final removed = _pendingPermissions.remove(key);
+        if (removed != null) {
+          if (!removed.completer.isCompleted) {
+            removed.completer.complete(<String, dynamic>{
+              'outcome': <String, dynamic>{'outcome': 'cancelled'},
+            });
+          }
+          _emitEvent(<String, dynamic>{
+            'type': 'permission_cancelled',
+            'requestId': removed.requestId,
+          });
+        }
+      }
+      return;
+    }
+
     if (method == 'session/update') {
       final update = params['update'];
       if (update is Map) {

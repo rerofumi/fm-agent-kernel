@@ -163,6 +163,8 @@ class SysExecClassifier {
   static final RegExp _urlSchemePattern = RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://');
   static final RegExp _concurrencyEqualsPattern =
       RegExp(r'^--concurrency=([1-8])$');
+  static final RegExp _envAssignPattern =
+      RegExp(r'^[A-Za-z_][A-Za-z0-9_]*=.*$');
 
   static const Set<String> _dartTestFlagOnly = <String>{
     '--fail-fast',
@@ -194,12 +196,13 @@ class SysExecClassifier {
     '--fatal-warnings',
   };
 
-  /// Evaluates whether the normalized command satisfies common hard guards and allowlist rules ([D-507]).
+  /// Evaluates whether the normalized command satisfies common hard guards and allowlist rules ([D-507], [D-705]).
   SysExecClassification classify({
     required String command,
     required List<String> args,
     String? workingDir,
     int timeoutMs = 60000,
+    ProtectionRing callerRing = ProtectionRing.ring2,
     VfsNamespace? namespaceOverride,
   }) {
     if (namespaceOverride != null && !identical(namespaceOverride, namespace)) {
@@ -211,14 +214,19 @@ class SysExecClassifier {
         args: args,
         workingDir: workingDir,
         timeoutMs: timeoutMs,
+        callerRing: callerRing,
       );
     }
+
+    final isRing3 = callerRing == ProtectionRing.ring3;
+    final hardGuardDecision =
+        isRing3 ? RingDecision.deny : RingDecision.askUser;
 
     // Step 1: Common hard guards (always evaluated before built-in and custom rules).
     if (SysExecCommandNormalizer.containsShellMetacharacters(command) ||
         args.any(SysExecCommandNormalizer.containsShellMetacharacters)) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
+      return SysExecClassification(
+        decision: hardGuardDecision,
         reason: 'SHELL_METACHARS_PRESENT',
       );
     }
@@ -228,29 +236,35 @@ class SysExecClassifier {
         trimmedExe.contains('/') ||
         trimmedExe.contains(r'\') ||
         trimmedExe.contains(':')) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
+      return SysExecClassification(
+        decision: hardGuardDecision,
         reason: 'EXECUTABLE_PATH_NOT_ALLOWLISTED',
       );
     }
 
     final normalizedBase = _normalizeExeBase(trimmedExe);
+    if (normalizedBase.isEmpty) {
+      return SysExecClassification(
+        decision: hardGuardDecision,
+        reason: 'EXECUTABLE_PATH_NOT_ALLOWLISTED',
+      );
+    }
     if (ExecPolicyConfig.shellWrappers.contains(normalizedBase)) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
+      return SysExecClassification(
+        decision: hardGuardDecision,
         reason: 'SHELL_WRAPPER_NOT_ALLOWLISTED',
       );
     }
     if (ExecPolicyConfig.externalNetworkCommands.contains(normalizedBase)) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
+      return SysExecClassification(
+        decision: hardGuardDecision,
         reason:
             'EXTERNAL_NETWORK_COMMAND: Direct network command via sys_exec (prefer delegating web lookup to web_researcher).',
       );
     }
     if (ExecPolicyConfig.blockedVcsCommands.contains(normalizedBase)) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
+      return SysExecClassification(
+        decision: hardGuardDecision,
         reason: 'VCS_COMMAND_NOT_ALLOWLISTED',
       );
     }
@@ -265,13 +279,28 @@ class SysExecClassifier {
       checkProtected: true,
       checkSymlinks: true,
     );
-    if (!wdRes.ok) {
-      return const SysExecClassification(
-        decision: RingDecision.askUser,
+    if (!wdRes.ok || wdRes.value!.isSkillsMount || wdRes.value!.isReadOnly) {
+      return SysExecClassification(
+        decision: hardGuardDecision,
         reason: 'WORKING_DIR_OUT_OF_SCOPE',
       );
     }
     final resolvedWorkingVirtualDir = wdRes.value!.virtualPath;
+
+    SysExecClassification finalizeRing3(SysExecClassification result) {
+      if (!isRing3 || result.decision != RingDecision.askUser) {
+        return result;
+      }
+      final argsFailure = _validateCustomCommandArgs(
+        args,
+        workingVirtualDir: resolvedWorkingVirtualDir,
+        violationDecision: RingDecision.deny,
+      );
+      if (argsFailure != null) {
+        return argsFailure;
+      }
+      return result;
+    }
 
     // Step 2: Built-in `dart` 3 rules (preserve existing timeout & reason codes).
     if (normalizedBase == 'dart') {
@@ -289,20 +318,24 @@ class SysExecClassifier {
           args: args,
           resolvedWorkingVirtualDir: resolvedWorkingVirtualDir,
           timeoutMs: timeoutMs,
+          violationDecision: hardGuardDecision,
         );
         if (customResult.decision == RingDecision.allow) {
           return customResult;
         }
       }
-      return builtinResult;
+      return finalizeRing3(builtinResult);
     }
 
     // Step 3: Custom `.agent_os/exec_policy.json` rules.
-    return _classifyWithExecPolicy(
-      normalizedBase: normalizedBase,
-      args: args,
-      resolvedWorkingVirtualDir: resolvedWorkingVirtualDir,
-      timeoutMs: timeoutMs,
+    return finalizeRing3(
+      _classifyWithExecPolicy(
+        normalizedBase: normalizedBase,
+        args: args,
+        resolvedWorkingVirtualDir: resolvedWorkingVirtualDir,
+        timeoutMs: timeoutMs,
+        violationDecision: hardGuardDecision,
+      ),
     );
   }
 
@@ -342,6 +375,7 @@ class SysExecClassifier {
     required List<String> args,
     required String resolvedWorkingVirtualDir,
     required int timeoutMs,
+    RingDecision violationDecision = RingDecision.askUser,
   }) {
     final rules = policy.rulesForCommand(normalizedBase);
     if (rules.isEmpty) {
@@ -354,6 +388,7 @@ class SysExecClassifier {
     final argsFailure = _validateCustomCommandArgs(
       args,
       workingVirtualDir: resolvedWorkingVirtualDir,
+      violationDecision: violationDecision,
     );
     if (argsFailure != null) {
       return argsFailure;
@@ -386,22 +421,25 @@ class SysExecClassifier {
   SysExecClassification? _validateCustomCommandArgs(
     List<String> args, {
     required String workingVirtualDir,
+    RingDecision violationDecision = RingDecision.askUser,
   }) {
     for (var i = 0; i < args.length; i++) {
       final trimmed = args[i].trim();
       if (trimmed.isEmpty) {
-        return const SysExecClassification(
-          decision: RingDecision.askUser,
+        return SysExecClassification(
+          decision: violationDecision,
           reason: 'EMPTY_ARGUMENT',
         );
       }
 
       if (trimmed == '--' && i + 1 < args.length) {
-        final targetBase =
-            ExecAllowRule.normalizeCommandBasename(args[i + 1]);
-        if (ExecPolicyConfig.forbiddenCommands.contains(targetBase)) {
-          return const SysExecClassification(
-            decision: RingDecision.askUser,
+        final targetBase = _resolveEffectiveWrappedCommand(
+          args.sublist(i + 1),
+        );
+        if (targetBase != null &&
+            ExecPolicyConfig.forbiddenCommands.contains(targetBase)) {
+          return SysExecClassification(
+            decision: violationDecision,
             reason: 'WRAPPER_TARGET_NOT_ALLOWLISTED',
           );
         }
@@ -409,8 +447,8 @@ class SysExecClassifier {
 
       if (trimmed.startsWith('-') && !trimmed.contains('=')) {
         if (_hasUnsafeFlagChars(trimmed)) {
-          return const SysExecClassification(
-            decision: RingDecision.askUser,
+          return SysExecClassification(
+            decision: violationDecision,
             reason: 'UNSAFE_FLAG_ARGUMENT',
           );
         }
@@ -421,8 +459,8 @@ class SysExecClassifier {
         if (flagPart == '-' ||
             flagPart == '--' ||
             _hasUnsafeFlagChars(flagPart)) {
-          return const SysExecClassification(
-            decision: RingDecision.askUser,
+          return SysExecClassification(
+            decision: violationDecision,
             reason: 'UNSAFE_FLAG_ARGUMENT',
           );
         }
@@ -431,8 +469,8 @@ class SysExecClassifier {
               valuePart,
               workingVirtualDir: workingVirtualDir,
             )) {
-          return const SysExecClassification(
-            decision: RingDecision.askUser,
+          return SysExecClassification(
+            decision: violationDecision,
             reason: 'UNSAFE_PATH_ARGUMENT',
           );
         }
@@ -441,12 +479,55 @@ class SysExecClassifier {
           trimmed,
           workingVirtualDir: workingVirtualDir,
         )) {
-          return const SysExecClassification(
-            decision: RingDecision.askUser,
+          return SysExecClassification(
+            decision: violationDecision,
             reason: 'UNSAFE_PATH_ARGUMENT',
           );
         }
       }
+    }
+    return null;
+  }
+
+  /// Resolves the first effective command token after `--`, skipping leading `env`,
+  /// `KEY=VAL` assignments, and `env` flags, then normalizing with [ExecAllowRule.normalizeCommandBasename] ([D-705]).
+  static String? _resolveEffectiveWrappedCommand(List<String> tokens) {
+    var idx = 0;
+    while (idx < tokens.length) {
+      final tok = tokens[idx].trim();
+      if (tok.isEmpty) {
+        idx++;
+        continue;
+      }
+      if (_envAssignPattern.hasMatch(tok)) {
+        idx++;
+        continue;
+      }
+      final base = ExecAllowRule.normalizeCommandBasename(tok);
+      if (base == 'env') {
+        idx++;
+        while (idx < tokens.length) {
+          final next = tokens[idx].trim();
+          if (next == '-i' || next == '--ignore-environment') {
+            idx++;
+            continue;
+          }
+          if (next == '-u' ||
+              next == '--unset' ||
+              next == '-C' ||
+              next == '--chdir') {
+            idx += 2;
+            continue;
+          }
+          if (next.startsWith('-') || _envAssignPattern.hasMatch(next)) {
+            idx++;
+            continue;
+          }
+          break;
+        }
+        continue;
+      }
+      return base;
     }
     return null;
   }

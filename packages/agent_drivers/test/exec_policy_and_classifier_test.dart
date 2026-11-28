@@ -886,4 +886,612 @@ void main() {
       expect(grepScanRes.error!.reason, equals('PROTECTED_INTERNAL_PATH'));
     });
   });
+
+  group('Subprocess approval opt-in & Ring 3 sys_exec hard guards [D-703], [D-705]', () {
+    late Directory repoDir;
+    late Directory skillsRoot;
+    late Directory skillDir;
+    late VfsNamespace namespaceWithSkills;
+    late ExecPolicyConfig samplePolicy;
+
+    setUp(() {
+      repoDir = Directory.systemTemp.createTempSync('exec_d705_repo_');
+      skillsRoot = Directory.systemTemp.createTempSync('exec_d705_skills_');
+      skillDir = Directory(p.join(skillsRoot.path, 'my_skill'))..createSync();
+      final skillFilePath = p.join(skillDir.path, 'SKILL.md');
+      File(skillFilePath).writeAsStringSync(
+        '---\nname: my_skill\ndescription: test\n---\n',
+      );
+      Directory(p.join(repoDir.path, 'src')).createSync();
+      Directory(p.join(repoDir.path, 'pkg_a')).createSync();
+      Directory(p.join(repoDir.path, 'pkg_b')).createSync();
+      File(p.join(repoDir.path, 'pkg_a', 'a.v')).writeAsStringSync('// a\n');
+      File(p.join(repoDir.path, 'pkg_b', 'b.v')).writeAsStringSync('// b\n');
+      File(p.join(repoDir.path, '.env')).writeAsStringSync('SECRET=1\n');
+
+      namespaceWithSkills = VfsNamespace(
+        workspaceHostRoot: repoDir.path,
+        skillsMount: SkillRegistry(
+          skills: <SkillManifest>[
+            SkillManifest(
+              name: 'my_skill',
+              description: 'test',
+              virtualPath: '/skills/my_skill/SKILL.md',
+              hostFilePath: skillFilePath,
+              hostDirectoryPath: skillDir.path,
+              sourceRootPath: skillsRoot.path,
+            ),
+          ],
+        ),
+      );
+      samplePolicy = ExecPolicyConfig.parseJsonString('''
+{
+  "allow": [
+    {"command": "v", "allowedSubcommands": ["test", "build"], "maxTimeoutMs": 180000},
+    {"command": "mise", "allowedArgPrefixes": [["exec", "--"]], "maxTimeoutMs": 300000}
+  ]
+}
+''').config;
+    });
+
+    tearDown(() {
+      if (repoDir.existsSync()) {
+        repoDir.deleteSync(recursive: true);
+      }
+      if (skillsRoot.existsSync()) {
+        skillsRoot.deleteSync(recursive: true);
+      }
+    });
+
+    test('[D-703] parses allowSubprocessUserApproval & subprocessApprovalProfiles fail-closed with warnings', () {
+      // Default config has no subprocess approval profiles.
+      final defaults = ExecPolicyConfig.defaults();
+      expect(defaults.subprocessApprovalProfiles, isEmpty);
+      for (final profile in ProcessProfileId.values) {
+        expect(defaults.allowsUserApprovalForProfile(profile), isFalse);
+      }
+
+      // Constructor defensively strips non-eligible profiles.
+      final manual = ExecPolicyConfig(
+        subprocessApprovalProfiles: const <ProcessProfileId>{
+          ProcessProfileId.explorer,
+          ProcessProfileId.webResearcher,
+          ProcessProfileId.workspaceWorker,
+        },
+      );
+      expect(
+        manual.subprocessApprovalProfiles,
+        equals(const <ProcessProfileId>{ProcessProfileId.workspaceWorker}),
+      );
+
+      // allowSubprocessUserApproval: true without "allow" or "subprocessApprovalProfiles"
+      final allEligible = ExecPolicyConfig.parseJsonString(
+        '{"allowSubprocessUserApproval": true}',
+      );
+      expect(allEligible.warnings, isEmpty);
+      expect(
+        allEligible.config.subprocessApprovalProfiles,
+        equals(const <ProcessProfileId>{
+          ProcessProfileId.workspaceWorker,
+          ProcessProfileId.conflictResolver,
+        }),
+      );
+      expect(
+        allEligible.config.allowsUserApprovalForProfile(ProcessProfileId.workspaceWorker),
+        isTrue,
+      );
+      expect(
+        allEligible.config.allowsUserApprovalForProfile(ProcessProfileId.conflictResolver),
+        isTrue,
+      );
+      expect(
+        allEligible.config.allowsUserApprovalForProfile(ProcessProfileId.explorer),
+        isFalse,
+      );
+      expect(
+        allEligible.config.allowsUserApprovalForProfile(ProcessProfileId.webResearcher),
+        isFalse,
+      );
+
+      // allowSubprocessUserApproval: false overrides subprocessApprovalProfiles and warns while preserving allow rules
+      final disabledWithProfiles = ExecPolicyConfig.parseJsonString('''
+{
+  "allowSubprocessUserApproval": false,
+  "subprocessApprovalProfiles": ["workspace_worker"],
+  "allow": [{"command": "cargo"}]
+}
+''');
+      expect(disabledWithProfiles.hasWarnings, isTrue);
+      expect(disabledWithProfiles.config.subprocessApprovalProfiles, isEmpty);
+      expect(
+        disabledWithProfiles.config.allow.map((r) => r.normalizedCommand),
+        equals(<String>['cargo']),
+      );
+
+      // Non-bool allowSubprocessUserApproval fails closed to {} while keeping valid allow rules
+      for (final badValue in const <String>['"true"', '1', '[]', 'null']) {
+        final badFlag = ExecPolicyConfig.parseJsonString(
+          '{"allowSubprocessUserApproval": $badValue, "allow": [{"command": "cargo"}]}',
+        );
+        expect(badFlag.hasWarnings, isTrue, reason: badValue);
+        expect(badFlag.config.subprocessApprovalProfiles, isEmpty, reason: badValue);
+        expect(badFlag.config.allow, hasLength(1), reason: badValue);
+      }
+
+      // Non-list subprocessApprovalProfiles fails closed to {}
+      final nonListProfiles = ExecPolicyConfig.parseJsonString(
+        '{"allowSubprocessUserApproval": true, "subprocessApprovalProfiles": "workspace_worker"}',
+      );
+      expect(nonListProfiles.hasWarnings, isTrue);
+      expect(nonListProfiles.config.subprocessApprovalProfiles, isEmpty);
+
+      // Mixed valid, forbidden (explorer/web_researcher), unknown, empty, and non-string entries
+      final mixedProfiles = ExecPolicyConfig.parseJsonString('''
+{
+  "subprocessApprovalProfiles": [
+    "workspace_worker",
+    "explorer",
+    "web_researcher",
+    "unknown_profile",
+    "",
+    42
+  ]
+}
+''');
+      expect(
+        mixedProfiles.config.subprocessApprovalProfiles,
+        equals(const <ProcessProfileId>{ProcessProfileId.workspaceWorker}),
+      );
+      expect(mixedProfiles.warnings, hasLength(5));
+      expect(
+        mixedProfiles.warnings,
+        contains(
+          'Profile "explorer" in subprocessApprovalProfiles is forbidden from holding requestApproval; ignoring (fail-closed).',
+        ),
+      );
+      expect(
+        mixedProfiles.warnings,
+        contains(
+          'Profile "web_researcher" in subprocessApprovalProfiles is forbidden from holding requestApproval; ignoring (fail-closed).',
+        ),
+      );
+    });
+
+    test('[D-703][D-705] normalizes trailing dots and .com extensions iteratively in ExecAllowRule and exec_policy.json', () {
+      expect(ExecAllowRule.normalizeCommandName('powershell.exe.'), equals('powershell'));
+      expect(ExecAllowRule.normalizeCommandName('cmd..'), equals('cmd'));
+      expect(ExecAllowRule.normalizeCommandName('curl.com.'), equals('curl'));
+      expect(ExecAllowRule.normalizeCommandName('CURL.COM'), equals('curl'));
+      expect(ExecAllowRule.normalizeCommandName('powershell.exe.com..'), equals('powershell'));
+      expect(ExecAllowRule.normalizeCommandName('...'), isEmpty);
+      expect(
+        ExecAllowRule.normalizeCommandBasename(r'C:\Windows\System32\powershell.exe.'),
+        equals('powershell'),
+      );
+
+      final res = ExecPolicyConfig.parseJsonString('''
+{
+  "allow": [
+    {"command": "powershell.exe."},
+    {"command": "cmd.."},
+    {"command": "curl.com"},
+    {"command": "curl.exe."},
+    {"command": "git.com."},
+    {"command": "..."},
+    {"command": "cargo.exe."}
+  ]
+}
+''');
+      expect(res.warnings, hasLength(6));
+      expect(
+        res.config.allow.map((r) => r.normalizedCommand),
+        equals(<String>['cargo']),
+      );
+    });
+
+    test('[D-705] Ring 3 SysExecClassifier returns RingDecision.deny for all hard guards and unsafe args while preserving Ring 2 askUser', () {
+      final classifier = SysExecClassifier(
+        namespace: namespaceWithSkills,
+        policy: samplePolicy,
+      );
+
+      // 1. Shell 10 types + trailing-dot / .com variants -> Ring 3 deny, Ring 2 askUser
+      for (final shell in const <String>[
+        ...ExecPolicyConfig.shellWrappers,
+        'powershell.exe.',
+        'cmd.',
+        'cmd..',
+        'bash.com',
+        'pwsh.com.',
+      ]) {
+        final r3 = classifier.classify(
+          command: shell,
+          args: const <String>['-c', 'echo'],
+          callerRing: ProtectionRing.ring3,
+        );
+        expect(r3.decision, equals(RingDecision.deny), reason: 'Ring 3 $shell');
+        expect(r3.reason, equals('SHELL_WRAPPER_NOT_ALLOWLISTED'));
+
+        final r2 = classifier.classify(
+          command: shell,
+          args: const <String>['-c', 'echo'],
+          callerRing: ProtectionRing.ring2,
+        );
+        expect(r2.decision, equals(RingDecision.askUser), reason: 'Ring 2 $shell');
+      }
+
+      // 2. Network 6 types + trailing-dot / .com variants -> Ring 3 deny
+      for (final net in const <String>[
+        ...ExecPolicyConfig.externalNetworkCommands,
+        'curl.exe.',
+        'curl.com',
+        'curl.com.',
+        'wget.com',
+      ]) {
+        final r3 = classifier.classify(
+          command: net,
+          args: const <String>['https://example.com'],
+          callerRing: ProtectionRing.ring3,
+        );
+        expect(r3.decision, equals(RingDecision.deny), reason: 'Ring 3 $net');
+        expect(r3.reason, startsWith('EXTERNAL_NETWORK_COMMAND'));
+      }
+
+      // 3. Raw VCS + path-qualified executable + metacharacters -> Ring 3 deny
+      for (final vcs in const <String>['git', 'git.exe.', 'jj', 'jj.com']) {
+        final r3 = classifier.classify(
+          command: vcs,
+          args: const <String>['status'],
+          callerRing: ProtectionRing.ring3,
+        );
+        expect(r3.decision, equals(RingDecision.deny), reason: vcs);
+        expect(r3.reason, equals('VCS_COMMAND_NOT_ALLOWLISTED'));
+      }
+      for (final badCmd in const <String>[r'C:\tools\v.exe', './v', 'bin/v', 'C:v', '...']) {
+        final r3 = classifier.classify(
+          command: badCmd,
+          args: const <String>['test'],
+          callerRing: ProtectionRing.ring3,
+        );
+        expect(r3.decision, equals(RingDecision.deny), reason: badCmd);
+        expect(r3.reason, equals('EXECUTABLE_PATH_NOT_ALLOWLISTED'));
+      }
+      final metaR3 = classifier.classify(
+        command: 'where',
+        args: const <String>['dart', '&&', 'whoami'],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(metaR3.decision, equals(RingDecision.deny));
+      expect(metaR3.reason, equals('SHELL_METACHARS_PRESENT'));
+
+      // 4. workingDir: /skills/<mountedSkill> -> Ring 3 deny, Ring 2 askUser
+      final skillsWdR3 = classifier.classify(
+        command: 'dart',
+        args: const <String>['analyze'],
+        workingDir: '/skills/my_skill',
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(skillsWdR3.decision, equals(RingDecision.deny));
+      expect(skillsWdR3.reason, equals('WORKING_DIR_OUT_OF_SCOPE'));
+
+      final skillsWdR2 = classifier.classify(
+        command: 'dart',
+        args: const <String>['analyze'],
+        workingDir: '/skills/my_skill',
+        callerRing: ProtectionRing.ring2,
+      );
+      expect(skillsWdR2.decision, equals(RingDecision.askUser));
+      expect(skillsWdR2.reason, equals('WORKING_DIR_OUT_OF_SCOPE'));
+
+      // 5. `--` forbidden delegation including `env`, `KEY=VAL`, and trailing-dot/.com variants -> Ring 3 deny
+      for (final args in const <List<String>>[
+        <String>['exec', '--', 'powershell.exe.', '-c', 'whoami'],
+        <String>['exec', '--', 'env', 'FOO=1', 'powershell.exe.', '-c', 'whoami'],
+        <String>['exec', '--', 'env', '-u', 'PATH', 'curl.com', 'https://example.com'],
+        <String>['exec', '--', 'FOO=1', 'cmd..', '/c', 'dir'],
+        <String>['exec', '--', '/bin/bash', '-c', 'id'],
+      ]) {
+        final r3 = classifier.classify(
+          command: 'mise',
+          args: args,
+          callerRing: ProtectionRing.ring3,
+        );
+        expect(r3.decision, equals(RingDecision.deny), reason: '$args');
+        expect(r3.reason, equals('WRAPPER_TARGET_NOT_ALLOWLISTED'));
+      }
+
+      // 6. Unsafe args/flags on non-builtin dart and unregistered commands -> Ring 3 deny
+      final dartCompileOutside = classifier.classify(
+        command: 'dart',
+        args: const <String>['compile', 'exe', 'lib/main.dart', '-o', r'C:\outside\a.exe'],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(dartCompileOutside.decision, equals(RingDecision.deny));
+      expect(dartCompileOutside.reason, equals('UNSAFE_PATH_ARGUMENT'));
+
+      final dartUnsafeFlag = classifier.classify(
+        command: 'dart',
+        args: const <String>['analyze', '-f.env'],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(dartUnsafeFlag.decision, equals(RingDecision.deny));
+      expect(dartUnsafeFlag.reason, equals('UNSAFE_FLAG_ARGUMENT'));
+
+      final unregisteredOutside = classifier.classify(
+        command: 'where',
+        args: const <String>[r'C:\Windows\win.ini'],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(unregisteredOutside.decision, equals(RingDecision.deny));
+      expect(unregisteredOutside.reason, equals('UNSAFE_PATH_ARGUMENT'));
+
+      final emptyArg = classifier.classify(
+        command: 'where',
+        args: const <String>['   '],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(emptyArg.decision, equals(RingDecision.deny));
+      expect(emptyArg.reason, equals('EMPTY_ARGUMENT'));
+
+      // 7. namespaceOverride propagates callerRing == ring3
+      final singleSubNs = namespaceWithSkills
+          .deriveForChild(allowedSubpaths: const <String>['/workspace/pkg_a'])
+          .value!;
+      final subViolation = classifier.classify(
+        command: 'v',
+        args: const <String>['test', '/workspace/pkg_b/b.v'],
+        workingDir: '/workspace/pkg_a',
+        callerRing: ProtectionRing.ring3,
+        namespaceOverride: singleSubNs,
+      );
+      expect(subViolation.decision, equals(RingDecision.deny));
+      expect(subViolation.reason, equals('UNSAFE_PATH_ARGUMENT'));
+
+      // 8. Safe unregistered commands & over-limit timeouts still return askUser in Ring 3
+      final safeUnregistered = classifier.classify(
+        command: 'where',
+        args: const <String>['dart'],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(safeUnregistered.decision, equals(RingDecision.askUser));
+      expect(safeUnregistered.reason, equals('NON_ALLOWLISTED_EXECUTABLE'));
+
+      final safeDartPub = classifier.classify(
+        command: 'dart',
+        args: const <String>['pub', '--help'],
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(safeDartPub.decision, equals(RingDecision.askUser));
+      expect(safeDartPub.reason, equals('NON_ALLOWLISTED_DART_SUBCOMMAND'));
+
+      final safeOverTimeout = classifier.classify(
+        command: 'dart',
+        args: const <String>['test'],
+        timeoutMs: 120001,
+        callerRing: ProtectionRing.ring3,
+      );
+      expect(safeOverTimeout.decision, equals(RingDecision.askUser));
+      expect(safeOverTimeout.reason, equals('TIMEOUT_EXCEEDS_AUTO_ALLOW_LIMIT'));
+    });
+
+    test('[D-705] Win32JobExecDriver normalizeRawArgs consistency, /skills rejection, preview scope, and SyscallGate pre-check integration', () async {
+      // 1. normalizeRawArgs consistency for single-token commands without shell metacharacters
+      final normOmitted = Win32JobExecDriver.normalizeRawArgs(
+        const <String, dynamic>{'command': 'hostname'},
+      );
+      final normEmptyArgs = Win32JobExecDriver.normalizeRawArgs(
+        const <String, dynamic>{'command': 'hostname', 'args': <String>[]},
+      );
+      expect(normOmitted['args'], equals(const <String>[]));
+      expect(
+        ApprovalGate.canonicalJsonEncode(normOmitted),
+        equals(ApprovalGate.canonicalJsonEncode(normEmptyArgs)),
+      );
+
+      // Ring 2 shell-metacharacter single string keeps args unset
+      final normShellMeta = Win32JobExecDriver.normalizeRawArgs(
+        const <String, dynamic>{'command': 'echo ok && git diff'},
+      );
+      expect(normShellMeta.containsKey('args'), isFalse);
+
+      // 2. Win32JobExecDriver + SyscallGate Ring 3 pre-check & execution
+      final auditLogger = AuditLogger(
+        workspaceHostRoot: repoDir.path,
+        sessionId: 'sess_d705_gate',
+      );
+      final processTable = KernelProcessTable();
+      const parentCap = CapHandle('cap_parent');
+      const childCap = CapHandle('cap_child');
+      final parentTable = CapabilityTable.stage2LeadAgent(
+        workspaceHandle: parentCap,
+      );
+      final childTable = parentTable
+          .deriveForProfile(
+            ProcessProfileId.workspaceWorker,
+            allowUserApproval: true,
+            childHandle: childCap,
+          )
+          .value!;
+      final childPcb = ProcessControlBlock(
+        pid: 2,
+        parentPid: 1,
+        name: 'worker-2',
+        profile: ProcessProfileId.workspaceWorker,
+        ring: ProtectionRing.ring3,
+        state: ProcessState.running,
+        cspace: childTable,
+        quota: ResourceQuota.stage1Default,
+        namespace: namespaceWithSkills,
+        memory: VirtualContextMemory(
+          sessionId: 'sess_d705_gate',
+          systemInstruction: PinnedSystemInstruction(
+            instruction: 'Worker test',
+            tools: Win32JobExecDriver.toolSchemas(policy: samplePolicy),
+          ),
+        ),
+      );
+      processTable.registerProcess(childPcb);
+
+      final approvalSpy = PolicyApprovalHandler.alwaysAllow();
+      final execDriver = Win32JobExecDriver(
+        namespace: namespaceWithSkills,
+        classifier: SysExecClassifier(
+          namespace: namespaceWithSkills,
+          policy: samplePolicy,
+        ),
+      );
+      final baseDef = execDriver.buildSyscallDefinition();
+      var execCalls = 0;
+
+      final gate = SyscallGate(
+        processTable: processTable,
+        approvalGate: ApprovalGate(handler: approvalSpy),
+        ioCapper: IoPayloadCapper(workspaceHostRoot: repoDir.path),
+        auditLogger: auditLogger,
+        hooks: <SyscallHook>[AntiGitHabitGuardHook()],
+      );
+      gate.registerSyscall(
+        SyscallDefinition(
+          name: baseDef.name,
+          requiredRight: baseDef.requiredRight,
+          kind: baseDef.kind,
+          applyIoCap: baseDef.applyIoCap,
+          cappedTextFields: baseDef.cappedTextFields,
+          validateArgs: baseDef.validateArgs,
+          normalizeArgs: baseDef.normalizeArgs,
+          checkPreconditions: baseDef.checkPreconditions,
+          evaluatePolicy: baseDef.evaluatePolicy,
+          approvalPreviewBuilder: baseDef.approvalPreviewBuilder,
+          approvalSignatureBuilder: baseDef.approvalSignatureBuilder,
+          handler: (_) async {
+            execCalls++;
+            return const SyscallResult<Map<String, dynamic>>.success(
+              <String, dynamic>{
+                'exitCode': 0,
+                'stdout': 'ok',
+                'stderr': '',
+                'timedOut': false,
+                'durationMs': 1,
+                'truncatedStdout': false,
+                'truncatedStderr': false,
+              },
+            );
+          },
+        ),
+      );
+
+      const childCtx = SyscallContext(
+        pid: 2,
+        capHandle: childCap,
+        sessionId: 'sess_d705_gate',
+      );
+
+      // Ring 3 hard guards must be denied at sys_request_approval with 0 ApprovalHandler calls
+      for (final targetArgs in const <Map<String, dynamic>>[
+        <String, dynamic>{
+          'command': 'powershell.exe.',
+          'args': <String>['-c', 'whoami'],
+        },
+        <String, dynamic>{
+          'command': 'curl.com',
+          'args': <String>['https://example.com'],
+        },
+        <String, dynamic>{
+          'command': 'dart',
+          'args': <String>['compile', 'exe', 'lib/main.dart', '-o', r'C:\outside\a.exe'],
+        },
+      ]) {
+        final precheck = await gate.invoke(
+          childCtx,
+          SyscallRequest(
+            name: 'sys_request_approval',
+            args: <String, dynamic>{
+              'syscall': 'sys_exec',
+              'args': targetArgs,
+            },
+          ),
+        );
+        expect(precheck.ok, isFalse, reason: '$targetArgs');
+        expect(precheck.error!.code, equals(SyscallErrorCode.eperm));
+        expect(precheck.error!.reason, equals('DENIED_BY_POLICY'));
+      }
+
+      // workingDir: '/skills/my_skill' blocked at Stage 2 checkPreconditions with EACCES: OUT_OF_WORKSPACE_SCOPE
+      final skillsPrecheck = await gate.invoke(
+        childCtx,
+        SyscallRequest(
+          name: 'sys_request_approval',
+          args: const <String, dynamic>{
+            'syscall': 'sys_exec',
+            'args': <String, dynamic>{
+              'command': 'where',
+              'args': <String>['dart'],
+              'workingDir': '/skills/my_skill',
+            },
+          },
+        ),
+      );
+      expect(skillsPrecheck.ok, isFalse);
+      expect(skillsPrecheck.error!.code, equals(SyscallErrorCode.eacces));
+      expect(skillsPrecheck.error!.reason, equals('OUT_OF_WORKSPACE_SCOPE'));
+      expect(approvalSpy.recordedRequests, isEmpty);
+      expect(execCalls, equals(0));
+
+      // Direct execute() defense-in-depth rejects Ring 3 shell wrapper and /skills workingDir
+      final directShellDeny = await execDriver.execute(
+        command: 'powershell.exe.',
+        args: const <String>['-c', 'whoami'],
+        callerPcb: childPcb,
+        namespaceOverride: namespaceWithSkills,
+      );
+      expect(directShellDeny.ok, isFalse);
+      expect(directShellDeny.error!.code, equals(SyscallErrorCode.eperm));
+      expect(directShellDeny.error!.reason, equals('DENIED_BY_POLICY'));
+
+      final directSkillsDeny = await execDriver.execute(
+        command: 'where',
+        args: const <String>['dart'],
+        workingDir: '/skills/my_skill',
+        callerPcb: childPcb,
+        namespaceOverride: namespaceWithSkills,
+      );
+      expect(directSkillsDeny.ok, isFalse);
+      expect(directSkillsDeny.error!.code, equals(SyscallErrorCode.eacces));
+      expect(directSkillsDeny.error!.reason, equals('OUT_OF_WORKSPACE_SCOPE'));
+
+      // sys_request_approval(command: 'hostname') issues grant consumed by sys_exec(command: 'hostname', args: [])
+      // and preview uses Process allow_always scope for pid != 1
+      final grantRes = await gate.invoke(
+        childCtx,
+        SyscallRequest(
+          name: 'sys_request_approval',
+          args: const <String, dynamic>{
+            'syscall': 'sys_exec',
+            'args': <String, dynamic>{'command': 'hostname'},
+          },
+        ),
+      );
+      expect(grantRes.ok, isTrue, reason: '${grantRes.error}');
+      expect(grantRes.value!['approved'], isTrue);
+      expect(approvalSpy.recordedRequests, hasLength(1));
+      final childPreviewText = ((approvalSpy.recordedRequests.single.content.first['content']
+          as Map<String, dynamic>)['text']) as String;
+      expect(childPreviewText, contains('Process allow_always scope (pid=2 only):'));
+      expect(childPreviewText, isNot(contains('Session allow_always scope:')));
+
+      final execWithGrant = await gate.invoke(
+        childCtx,
+        SyscallRequest(
+          name: 'sys_exec',
+          args: const <String, dynamic>{
+            'command': 'hostname',
+            'args': <String>[],
+          },
+        ),
+      );
+      expect(execWithGrant.ok, isTrue, reason: '${execWithGrant.error}');
+      expect(approvalSpy.recordedRequests, hasLength(1));
+      expect(execCalls, equals(1));
+    });
+  });
 }

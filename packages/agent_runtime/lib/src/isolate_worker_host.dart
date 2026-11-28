@@ -28,10 +28,16 @@ class IsolateWorkerHost {
     this.jjDriver,
     this.backend = const IsolateChildWorkerBackend(),
     List<String> additionalExecRuleSummaries = const <String>[],
-  }) : additionalExecRuleSummaries =
-           List<String>.unmodifiable(additionalExecRuleSummaries) {
+    Set<ProcessProfileId> subprocessApprovalProfiles =
+        const <ProcessProfileId>{},
+  })  : additionalExecRuleSummaries =
+            List<String>.unmodifiable(additionalExecRuleSummaries),
+        subprocessApprovalProfiles =
+            Set<ProcessProfileId>.unmodifiable(subprocessApprovalProfiles) {
     _hostPort = ReceivePort();
     _hostPortSub = _hostPort.listen(_onIsolateMessage);
+    syscallGate.approvalGate.onApprovalWaitStart = _onApprovalWaitStart;
+    syscallGate.approvalGate.onApprovalWaitEnd = _onApprovalWaitEnd;
   }
 
   final KernelProcessTable processTable;
@@ -42,6 +48,7 @@ class IsolateWorkerHost {
   final JjDriver? jjDriver;
   final ChildWorkerBackend backend;
   final List<String> additionalExecRuleSummaries;
+  final Set<ProcessProfileId> subprocessApprovalProfiles;
 
   late final ReceivePort _hostPort;
   late final StreamSubscription<dynamic> _hostPortSub;
@@ -113,11 +120,11 @@ class IsolateWorkerHost {
     }
     final resolvedModel = modelRes.value!;
 
-    // 4. Derive attenuated child CSpace ([D-213]).
+    // 4. Derive attenuated child CSpace ([D-213], [D-707]).
     final childHandle = CapHandle('cap_${spec.profile.wireValue}');
-    final cspaceRes = parent.cspace.deriveForProfile(
-      spec.profile,
-      requestedRights: spec.requestedRights,
+    final cspaceRes = _deriveChildCspaceForSpec(
+      parent: parent,
+      spec: spec,
       childHandle: childHandle,
     );
     if (!cspaceRes.ok) {
@@ -219,6 +226,32 @@ class IsolateWorkerHost {
       'supervision': policy.toJson(),
       'donatedQuota': donation.toJson(),
     });
+  }
+
+  SyscallResult<CapabilityTable> _deriveChildCspaceForSpec({
+    required ProcessControlBlock parent,
+    required SpawnSpec spec,
+    required CapHandle childHandle,
+  }) {
+    final bool effectiveAllowApproval;
+    if (spec.allowUserApproval != null) {
+      effectiveAllowApproval = spec.allowUserApproval!;
+    } else if (spec.requestedRights != null) {
+      effectiveAllowApproval =
+          spec.requestedRights!.contains(CapRight.requestApproval);
+    } else {
+      effectiveAllowApproval =
+          spec.profile.supportsUserApprovalOptIn &&
+          subprocessApprovalProfiles.contains(spec.profile) &&
+          parent.cspace.hasAnyRight(CapRight.requestApproval);
+    }
+
+    return parent.cspace.deriveForProfile(
+      spec.profile,
+      requestedRights: spec.requestedRights,
+      allowUserApproval: effectiveAllowApproval,
+      childHandle: childHandle,
+    );
   }
 
   ProcessControlBlock _buildTempSettlementPcb({
@@ -393,7 +426,10 @@ class IsolateWorkerHost {
           )
         : JjTxContext();
 
-    // Construct child PCB with CSpace-filtered tool schemas ([D-213] §4.2).
+    final canRequestApproval =
+        childCspace.hasAnyRight(CapRight.requestApproval);
+
+    // Construct child PCB with CSpace-filtered tool schemas ([D-213] §4.2, [D-711]).
     final childPcb = ProcessControlBlock(
       pid: childPid,
       parentPid: parent.pid,
@@ -411,6 +447,7 @@ class IsolateWorkerHost {
             profile: spec.profile,
             allowedSubpaths: childNamespace.allowedWorkspaceSubpaths,
             additionalExecRuleSummaries: additionalExecRuleSummaries,
+            canRequestApproval: canRequestApproval,
           ),
           tools: const <SyscallToolSchema>[],
         ),
@@ -441,6 +478,7 @@ class IsolateWorkerHost {
             profile: spec.profile,
             allowedSubpaths: childNamespace.allowedWorkspaceSubpaths,
             additionalExecRuleSummaries: additionalExecRuleSummaries,
+            canRequestApproval: canRequestApproval,
           ),
           tools: filteredTools,
         ),
@@ -491,18 +529,7 @@ class IsolateWorkerHost {
     task.currentChild = managed;
     _spawnedChildrenCount += 1;
 
-    managed.startWallTimer(() {
-      unawaited(
-        _killAndCompleteChild(
-          managed,
-          reason: 'WALL_TIME_QUOTA_EXCEEDED',
-          errorCode: SyscallErrorCode.edquot.codeName,
-          exitCode: 77,
-          summary:
-              'Child process exceeded maxWallTimeMs (${donation.childQuota.maxWallTimeMs}ms) and was terminated.',
-        ),
-      );
-    });
+    managed.startWallTimer(() => _onChildWallTimeout(managed));
     managed.startHeartbeatTimer(() => _onChildHeartbeatTimeout(managed));
 
     try {
@@ -745,6 +772,46 @@ class IsolateWorkerHost {
     );
   }
 
+  void _onChildWallTimeout(_ManagedChild child) {
+    if (child.isCompleted || child.isCompleting || child.isTimerPaused) {
+      return;
+    }
+    unawaited(
+      _killAndCompleteChild(
+        child,
+        reason: 'WALL_TIME_QUOTA_EXCEEDED',
+        errorCode: SyscallErrorCode.edquot.codeName,
+        exitCode: 77,
+        summary:
+            'Child process exceeded maxWallTimeMs (${child.pcb.quota.maxWallTimeMs}ms) and was terminated.',
+      ),
+    );
+  }
+
+  void _onApprovalWaitStart(Pid pid) {
+    final child = _children[pid];
+    if (child == null || child.isCompleted || child.isCompleting) {
+      return;
+    }
+    child.updatePauseState(
+      approvalPaused: true,
+      onWallTimeout: () => _onChildWallTimeout(child),
+      onHeartbeatTimeout: () => _onChildHeartbeatTimeout(child),
+    );
+  }
+
+  void _onApprovalWaitEnd(Pid pid) {
+    final child = _children[pid];
+    if (child == null || child.isCompleted || child.isCompleting) {
+      return;
+    }
+    child.updatePauseState(
+      approvalPaused: false,
+      onWallTimeout: () => _onChildWallTimeout(child),
+      onHeartbeatTimeout: () => _onChildHeartbeatTimeout(child),
+    );
+  }
+
   void _onChildHeartbeatTimeout(_ManagedChild child) {
     if (child.isCompleted || child.isHeartbeatPaused) {
       return;
@@ -905,8 +972,11 @@ class IsolateWorkerHost {
         if (constraintMessage != null && constraintMessage.trim().isNotEmpty) {
           child.pendingStopConstraints.add(constraintMessage.trim());
         }
-        child.pauseWallTimer();
-        child.pauseHeartbeatTimer();
+        child.updatePauseState(
+          sigstopPaused: true,
+          onWallTimeout: () => _onChildWallTimeout(child),
+          onHeartbeatTimeout: () => _onChildHeartbeatTimeout(child),
+        );
         child.pcb.suspendController.requestStop(reason: reason);
         child.pcb.state = ProcessState.stopped;
         parent?.mailbox.enqueueControl(
@@ -933,21 +1003,15 @@ class IsolateWorkerHost {
           constraintMessage: constraintMessage,
         );
         if (child.pcb.state == ProcessState.stopped) {
-          child.pcb.state = ProcessState.running;
+          child.pcb.state = child.isApprovalPaused
+              ? ProcessState.waitingApproval
+              : ProcessState.running;
         }
-        child.resumeWallTimer(() {
-          unawaited(
-            _killAndCompleteChild(
-              child,
-              reason: 'WALL_TIME_QUOTA_EXCEEDED',
-              errorCode: SyscallErrorCode.edquot.codeName,
-              exitCode: 77,
-              summary:
-                  'Child process exceeded maxWallTimeMs (${child.pcb.quota.maxWallTimeMs}ms) and was terminated.',
-            ),
-          );
-        });
-        child.resumeHeartbeatTimer(() => _onChildHeartbeatTimeout(child));
+        child.updatePauseState(
+          sigstopPaused: false,
+          onWallTimeout: () => _onChildWallTimeout(child),
+          onHeartbeatTimeout: () => _onChildHeartbeatTimeout(child),
+        );
         parent?.mailbox.enqueueControl(
           ControlSignalMessage(
             kind: ControlSignalKind.sigcont,
@@ -1163,6 +1227,18 @@ class IsolateWorkerHost {
       return;
     }
     _disposed = true;
+    if (identical(
+      syscallGate.approvalGate.onApprovalWaitStart,
+      _onApprovalWaitStart,
+    )) {
+      syscallGate.approvalGate.onApprovalWaitStart = null;
+    }
+    if (identical(
+      syscallGate.approvalGate.onApprovalWaitEnd,
+      _onApprovalWaitEnd,
+    )) {
+      syscallGate.approvalGate.onApprovalWaitEnd = null;
+    }
     for (final task in _tasksById.values) {
       task.killedBySignal = true;
     }
@@ -1331,8 +1407,11 @@ class IsolateWorkerHost {
     // are committed and strictly before the next sys_llm_chat invocation.
     if (name == 'sys_llm_chat') {
       if (child.pcb.suspendController.isSuspended) {
-        child.pauseWallTimer();
-        child.pauseHeartbeatTimer();
+        child.updatePauseState(
+          sigstopPaused: true,
+          onWallTimeout: () => _onChildWallTimeout(child),
+          onHeartbeatTimeout: () => _onChildHeartbeatTimeout(child),
+        );
         await child.pcb.suspendController.waitIfSuspended(
           pcb: child.pcb,
           cancelToken: child.cancelSource.token,
@@ -1347,19 +1426,11 @@ class IsolateWorkerHost {
             ),
           );
         }
-        child.resumeWallTimer(() {
-          unawaited(
-            _killAndCompleteChild(
-              child,
-              reason: 'WALL_TIME_QUOTA_EXCEEDED',
-              errorCode: SyscallErrorCode.edquot.codeName,
-              exitCode: 77,
-              summary:
-                  'Child process exceeded maxWallTimeMs (${child.pcb.quota.maxWallTimeMs}ms) and was terminated.',
-            ),
-          );
-        });
-        child.resumeHeartbeatTimer(() => _onChildHeartbeatTimeout(child));
+        child.updatePauseState(
+          sigstopPaused: false,
+          onWallTimeout: () => _onChildWallTimeout(child),
+          onHeartbeatTimeout: () => _onChildHeartbeatTimeout(child),
+        );
       }
 
       final injectedConstraint =
@@ -1614,6 +1685,7 @@ class IsolateWorkerHost {
     child.idleStopwatch.stop();
     child.stopwatch.stop();
     child.activeSyscall = null;
+    syscallGate.approvalGate.clearForPid(child.pid);
 
     WorkspaceCleanupResult? cleanupRes;
     if (jjDriver != null && child.pcb.hasIsolatedJjWorkspace) {
@@ -1658,6 +1730,7 @@ class IsolateWorkerHost {
     child.stopwatch.stop();
     child.activeSyscall = null;
     child.pcb.state = ProcessState.terminated;
+    syscallGate.approvalGate.clearForPid(child.pid);
 
     final parent = processTable.getProcess(child.parentPid);
     if (parent != null) {
@@ -1927,9 +2000,9 @@ class IsolateWorkerHost {
     }
 
     final nextHandle = CapHandle('cap_${task.spec.profile.wireValue}');
-    final nextCspaceRes = parent.cspace.deriveForProfile(
-      task.spec.profile,
-      requestedRights: task.spec.requestedRights,
+    final nextCspaceRes = _deriveChildCspaceForSpec(
+      parent: parent,
+      spec: task.spec,
       childHandle: nextHandle,
     );
     if (!nextCspaceRes.ok) {
@@ -2147,7 +2220,11 @@ class _ManagedChild {
   Timer? heartbeatTimer;
   int remainingHeartbeatMs;
   bool isHeartbeatPaused = false;
+  bool isSigstopPaused = false;
+  bool isApprovalPaused = false;
   DateTime lastHeartbeatAtUtc;
+
+  bool get isTimerPaused => isSigstopPaused || isApprovalPaused;
   int currentStep = 0;
   int totalSyscalls = 0;
   String? activeSyscall;
@@ -2161,6 +2238,65 @@ class _ManagedChild {
   bool isCompleted = false;
   final List<String> pendingStopConstraints = <String>[];
 
+  void updatePauseState({
+    bool? sigstopPaused,
+    bool? approvalPaused,
+    required void Function() onWallTimeout,
+    required void Function() onHeartbeatTimeout,
+  }) {
+    final wasPaused = isTimerPaused;
+    if (sigstopPaused != null) {
+      isSigstopPaused = sigstopPaused;
+    }
+    if (approvalPaused != null) {
+      isApprovalPaused = approvalPaused;
+    }
+    final nowPaused = isTimerPaused;
+
+    if (!wasPaused && nowPaused) {
+      if (isCompleted || isCompleting) {
+        return;
+      }
+      // Pause wall-clock timer once on entering paused region.
+      wallTimer?.cancel();
+      wallTimer = null;
+      wallStopwatch.stop();
+      if (remainingWallTimeMs != null) {
+        final rem = remainingWallTimeMs! - wallStopwatch.elapsedMilliseconds;
+        remainingWallTimeMs = rem < 1 ? 1 : rem;
+        wallStopwatch.reset();
+      }
+      pausedAtUtc = DateTime.now().toUtc();
+
+      // Pause heartbeat timer once on entering paused region.
+      heartbeatTimer?.cancel();
+      heartbeatTimer = null;
+      idleStopwatch.stop();
+      final remHb = heartbeatTimeoutMs - idleStopwatch.elapsedMilliseconds;
+      remainingHeartbeatMs = remHb < 1 ? 1 : remHb;
+      isHeartbeatPaused = true;
+    } else if (wasPaused && !nowPaused) {
+      if (isCompleted || isCompleting) {
+        return;
+      }
+      final pausedAt = pausedAtUtc;
+      if (pausedAt != null) {
+        final pausedDuration = DateTime.now().toUtc().difference(pausedAt);
+        if (pcb.quotaUsage.startedAtUtc != null) {
+          pcb.quotaUsage.startedAtUtc =
+              pcb.quotaUsage.startedAtUtc!.add(pausedDuration);
+        }
+        pausedAtUtc = null;
+      }
+      startWallTimer(onWallTimeout);
+      isHeartbeatPaused = false;
+      idleStopwatch.start();
+      final ms = remainingHeartbeatMs < 1 ? 1 : remainingHeartbeatMs;
+      heartbeatTimer?.cancel();
+      heartbeatTimer = Timer(Duration(milliseconds: ms), onHeartbeatTimeout);
+    }
+  }
+
   void startWallTimer(void Function() onTimeout) {
     if (remainingWallTimeMs == null || isCompleted) {
       return;
@@ -2171,31 +2307,6 @@ class _ManagedChild {
       ..start();
     final ms = remainingWallTimeMs! < 1 ? 1 : remainingWallTimeMs!;
     wallTimer = Timer(Duration(milliseconds: ms), onTimeout);
-  }
-
-  void pauseWallTimer() {
-    if (remainingWallTimeMs == null || pausedAtUtc != null) {
-      return;
-    }
-    wallTimer?.cancel();
-    wallTimer = null;
-    wallStopwatch.stop();
-    final remaining = remainingWallTimeMs! - wallStopwatch.elapsedMilliseconds;
-    remainingWallTimeMs = remaining < 1 ? 1 : remaining;
-    pausedAtUtc = DateTime.now().toUtc();
-  }
-
-  void resumeWallTimer(void Function() onTimeout) {
-    final pausedAt = pausedAtUtc;
-    if (pausedAt != null) {
-      final pausedDuration = DateTime.now().toUtc().difference(pausedAt);
-      if (pcb.quotaUsage.startedAtUtc != null) {
-        pcb.quotaUsage.startedAtUtc =
-            pcb.quotaUsage.startedAtUtc!.add(pausedDuration);
-      }
-      pausedAtUtc = null;
-    }
-    startWallTimer(onTimeout);
   }
 
   void startHeartbeatTimer(void Function() onTimeout) {
@@ -2233,29 +2344,6 @@ class _ManagedChild {
     );
   }
 
-  void pauseHeartbeatTimer() {
-    if (isHeartbeatPaused || isCompleted) {
-      return;
-    }
-    heartbeatTimer?.cancel();
-    heartbeatTimer = null;
-    idleStopwatch.stop();
-    final rem = heartbeatTimeoutMs - idleStopwatch.elapsedMilliseconds;
-    remainingHeartbeatMs = rem < 1 ? 1 : rem;
-    isHeartbeatPaused = true;
-  }
-
-  void resumeHeartbeatTimer(void Function() onTimeout) {
-    if (!isHeartbeatPaused || isCompleted) {
-      return;
-    }
-    isHeartbeatPaused = false;
-    idleStopwatch.start();
-    final ms = remainingHeartbeatMs < 1 ? 1 : remainingHeartbeatMs;
-    heartbeatTimer?.cancel();
-    heartbeatTimer = Timer(Duration(milliseconds: ms), onTimeout);
-  }
-
   ChildHeartbeatSnapshot buildHeartbeatSnapshot() {
     return ChildHeartbeatSnapshot(
       currentStep: currentStep,
@@ -2265,7 +2353,10 @@ class _ManagedChild {
       idleMs: idleStopwatch.elapsedMilliseconds,
       heartbeatTimeoutMs: heartbeatTimeoutMs,
       lastHeartbeatAt: lastHeartbeatAtUtc.toIso8601String(),
-      isPaused: !isCompleted && (isHeartbeatPaused || pcb.state == ProcessState.stopped),
+      isPaused: !isCompleted &&
+          (isTimerPaused ||
+              pcb.state == ProcessState.stopped ||
+              pcb.state == ProcessState.waitingApproval),
       activeSyscall: activeSyscall,
       lastSyscall: lastSyscall,
       consecutiveErrors: consecutiveErrors,

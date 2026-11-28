@@ -304,6 +304,12 @@ class KernelBootstrap {
       effectiveExecPolicy = execPolicyLoadResult.config;
     }
     final execRuleSummaries = effectiveExecPolicy.toPromptRuleSummaries();
+    final subprocessApprovalProfiles =
+        effectiveExecPolicy.subprocessApprovalProfiles;
+    final subprocessApprovalProfileNames = subprocessApprovalProfiles
+        .map((profile) => profile.wireValue)
+        .toList(growable: false)
+      ..sort();
 
     final ioCapper = IoPayloadCapper(
       config: config.ioCapConfig,
@@ -423,6 +429,7 @@ class KernelBootstrap {
           AgentPrompts.buildLeadInstruction(
             stage: isStage3Team ? 3 : (isStage2Multiprocess ? 2 : 1),
             additionalExecRuleSummaries: execRuleSummaries,
+            subprocessApprovalProfileNames: subprocessApprovalProfileNames,
           ),
       tools: leadToolSchemas,
     );
@@ -628,6 +635,7 @@ class KernelBootstrap {
         jjDriver: jjDriver,
         backend: config.childWorkerBackend ?? const IsolateChildWorkerBackend(),
         additionalExecRuleSummaries: execRuleSummaries,
+        subprocessApprovalProfiles: subprocessApprovalProfiles,
       );
     }
 

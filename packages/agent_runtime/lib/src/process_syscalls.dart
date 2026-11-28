@@ -33,6 +33,7 @@ const Map<String, CapRight> defaultSyscallRequiredRights = <String, CapRight>{
   'sys_web_fetch': CapRight.netRead,
   'sys_skill_list': CapRight.read,
   'sys_skill_read': CapRight.read,
+  'sys_request_approval': CapRight.requestApproval,
 };
 
 /// Exact 5-tool allowlist permitted for the sterile Ring 3 `WebResearcher` profile ([D-218]).
@@ -443,13 +444,18 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
           'heartbeatTimeoutMs': <String, dynamic>{
             'type': 'integer',
             'description':
-                'No-progress heartbeat stall timeout in ms (default 300000, max 600000; paused during SIGSTOP).',
+                'No-progress heartbeat stall timeout in ms (default 300000, max 600000; paused during SIGSTOP and waitingApproval).',
           },
           'requestedRights': <String, dynamic>{
             'type': 'array',
             'items': <String, dynamic>{'type': 'string'},
             'description':
                 'Optional further subset of CapRight names to attenuate within the profile.',
+          },
+          'allowUserApproval': <String, dynamic>{
+            'type': 'boolean',
+            'description':
+                'Optional opt-in for CapRight.requestApproval on workspace_worker or conflict_resolver (defaults to .agent_os/exec_policy.json or false; forbidden for explorer and web_researcher).',
           },
           'supervision': <String, dynamic>{
             'type': 'object',
@@ -581,6 +587,32 @@ List<SyscallToolSchema> buildProcessToolSchemas() {
           },
         },
         'required': <String>['signal'],
+      },
+    ),
+    SyscallToolSchema(
+      name: 'sys_request_approval',
+      description:
+          'Pre-validate a target syscall and arguments (Stage 1..3.5 & policy/hard-guards) and request user approval to obtain a one-time approval ticket bound to (pid, syscall, normalizedArgs).',
+      parametersJsonSchema: const <String, dynamic>{
+        'type': 'object',
+        'properties': <String, dynamic>{
+          'syscall': <String, dynamic>{
+            'type': 'string',
+            'description':
+                'Target syscall name to pre-validate and request approval for (e.g., "sys_exec").',
+          },
+          'args': <String, dynamic>{
+            'type': 'object',
+            'description':
+                'Target syscall arguments object to pre-validate and bind to the one-time approval ticket.',
+          },
+          'reason': <String, dynamic>{
+            'type': 'string',
+            'description':
+                'Optional concise explanation shown to the user justifying why approval is needed.',
+          },
+        },
+        'required': <String>['syscall'],
       },
     ),
   ];
@@ -755,6 +787,26 @@ SyscallError? _validateSpawnArgs(Map<String, dynamic> args) {
       }
     }
   }
+  final allowUserApproval = args['allowUserApproval'];
+  if (allowUserApproval != null && allowUserApproval is! bool) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'INVALID_ARGS',
+      message: 'Argument "allowUserApproval" must be a boolean.',
+      recoverable: true,
+    );
+  }
+  if (allowUserApproval == false &&
+      requestedRights is List &&
+      requestedRights.cast<String>().contains(CapRight.requestApproval.name)) {
+    return const SyscallError(
+      code: SyscallErrorCode.einval,
+      reason: 'CONFLICTING_APPROVAL_ARGS',
+      message:
+          'Cannot specify allowUserApproval: false together with requestedRights containing "requestApproval".',
+      recoverable: true,
+    );
+  }
   final supervision = args['supervision'];
   if (supervision != null) {
     if (supervision is! Map) {
@@ -852,6 +904,7 @@ SyscallResult<SpawnSpec> _parseSpawnSpec(Map<String, dynamic> args) {
       heartbeatTimeoutMs: (args['heartbeatTimeoutMs'] as int?) ??
           SpawnSpec.defaultHeartbeatTimeoutMs,
       requestedRights: requestedRights,
+      allowUserApproval: args['allowUserApproval'] as bool?,
       baseChangeId: (args['baseChangeId'] as String?)?.trim(),
       logicalTaskId: (args['logicalTaskId'] as String?)?.trim(),
       supervision: supervision,

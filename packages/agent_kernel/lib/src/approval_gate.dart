@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 import 'cancellation.dart';
 import 'pcb.dart';
@@ -46,7 +47,7 @@ typedef ApprovalPreviewBuilder = Future<ApprovalPreview?> Function(
   SyscallHookContext context,
 );
 
-/// Approval request delivered to an [ApprovalHandler] when Stage 4 yields `ASK_USER` ([D-020]).
+/// Approval request delivered to an [ApprovalHandler] when Stage 4 yields `ASK_USER` ([D-020], [D-706]).
 class ApprovalRequest {
   ApprovalRequest({
     required this.requestId,
@@ -63,9 +64,18 @@ class ApprovalRequest {
       ApprovalOption.rejectOnce,
     ],
     this.approvalSignature,
+    this.processName,
+    this.profile,
+    this.ring,
+    this.agentReason,
+    this.requestedVia,
+    Map<String, dynamic>? metadata,
   })  : argsSummary = Map<String, dynamic>.unmodifiable(argsSummary),
         content = List<Map<String, dynamic>>.unmodifiable(content),
-        options = List<ApprovalOption>.unmodifiable(options);
+        options = List<ApprovalOption>.unmodifiable(options),
+        metadata = metadata == null
+            ? null
+            : Map<String, dynamic>.unmodifiable(metadata);
 
   final String requestId;
   final String sessionId;
@@ -77,8 +87,35 @@ class ApprovalRequest {
   final List<Map<String, dynamic>> content;
   final List<ApprovalOption> options;
 
-  /// Optional stable signature used to remember `allow_always` within the session.
+  /// Optional stable signature used to remember `allow_always` within the process scope.
   final String? approvalSignature;
+
+  /// Optional process metadata for subprocess correlation and UI display ([D-706], [D-708]).
+  final String? processName;
+  final String? profile;
+  final ProtectionRing? ring;
+  final String? agentReason;
+  final String? requestedVia;
+  final Map<String, dynamic>? metadata;
+}
+
+/// One-time approval ticket bound to `(pid, syscallName, canonicalArgsJson)` ([D-704], [D-706]).
+class ApprovalGrant {
+  const ApprovalGrant({
+    required this.grantId,
+    required this.pid,
+    required this.syscallName,
+    required this.canonicalArgsJson,
+    required this.decisionOption,
+    this.preview,
+  });
+
+  final String grantId;
+  final Pid pid;
+  final String syscallName;
+  final String canonicalArgsJson;
+  final ApprovalOption decisionOption;
+  final ApprovalPreview? preview;
 }
 
 /// Result returned by an [ApprovalHandler] ([D-020]).
@@ -170,23 +207,164 @@ class PolicyApprovalHandler implements ApprovalHandler {
   }
 }
 
-/// Session-scoped approval gate caching `allow_always` signatures and enforcing cancellation ([D-020]).
+class _QueuedApprovalEntry {
+  _QueuedApprovalEntry({
+    required this.request,
+    required this.cancelToken,
+    required this.completer,
+  });
+
+  final ApprovalRequest request;
+  final CancellationToken? cancelToken;
+  final Completer<ApprovalDecision> completer;
+  bool settled = false;
+}
+
+/// Approval gate serializing concurrent requests in FIFO order, scoping `allow_always` per PID,
+/// and managing one-time [ApprovalGrant] tickets ([D-020], [D-706]).
 class ApprovalGate {
-  ApprovalGate({required this.handler});
+  ApprovalGate({
+    required this.handler,
+    this.onApprovalWaitStart,
+    this.onApprovalWaitEnd,
+    this.onGrantConsumed,
+  });
 
   final ApprovalHandler handler;
-  final Set<String> _allowAlwaysSignatures = <String>{};
 
-  /// Unmodifiable view of signatures remembered via `allow_always`.
-  UnmodifiableSetView<String> get allowAlwaysSignatures =>
-      UnmodifiableSetView<String>(_allowAlwaysSignatures);
+  /// Optional lifecycle callbacks invoked around approval wait and ticket consumption ([D-706]).
+  void Function(Pid pid)? onApprovalWaitStart;
+  void Function(Pid pid)? onApprovalWaitEnd;
+  void Function(ApprovalGrant grant)? onGrantConsumed;
 
-  /// Clears remembered session approvals.
-  void clearRemembered() {
-    _allowAlwaysSignatures.clear();
+  final Map<Pid, Set<String>> _allowAlwaysByPid = <Pid, Set<String>>{};
+  final Map<Pid, Map<String, ApprovalGrant>> _grantsByPid =
+      <Pid, Map<String, ApprovalGrant>>{};
+  final Queue<_QueuedApprovalEntry> _waitQueue = Queue<_QueuedApprovalEntry>();
+  bool _isDraining = false;
+  int _grantCounter = 0;
+
+  /// Grace period for cooperative handler cleanup on cancellation before advancing FIFO queue ([D-706], RV-001).
+  static const Duration _cancelCleanupGrace = Duration(milliseconds: 50);
+
+  /// Deterministically encodes [value] as JSON with lexicographically sorted Map keys
+  /// and `null`-valued Map entries omitted ([D-706]).
+  static String canonicalJsonEncode(Object? value) {
+    return jsonEncode(_canonicalizeValue(value));
   }
 
-  /// Evaluates [request], honoring session `allow_always` cache and cooperative cancellation.
+  static Object? _canonicalizeValue(Object? value) {
+    if (value is Map) {
+      final entries = <MapEntry<String, Object?>>[];
+      for (final entry in value.entries) {
+        if (entry.value == null) {
+          continue;
+        }
+        entries.add(
+          MapEntry<String, Object?>(
+            entry.key.toString(),
+            _canonicalizeValue(entry.value),
+          ),
+        );
+      }
+      entries.sort((a, b) => a.key.compareTo(b.key));
+      final out = <String, Object?>{};
+      for (final entry in entries) {
+        out[entry.key] = entry.value;
+      }
+      return out;
+    }
+    if (value is List) {
+      return value.map<Object?>(_canonicalizeValue).toList(growable: false);
+    }
+    return value;
+  }
+
+  static String _grantLookupKey(String syscallName, String canonicalArgsJson) =>
+      '$syscallName\u0000$canonicalArgsJson';
+
+  /// Unmodifiable view of signatures remembered via `allow_always` for the lead process (`pid == 1`).
+  UnmodifiableSetView<String> get allowAlwaysSignatures =>
+      UnmodifiableSetView<String>(_allowAlwaysByPid[1] ?? const <String>{});
+
+  /// Returns an unmodifiable view of `allow_always` signatures remembered for [pid] ([D-706]).
+  Set<String> allowAlwaysSignaturesForPid(Pid pid) =>
+      UnmodifiableSetView<String>(_allowAlwaysByPid[pid] ?? const <String>{});
+
+  /// Returns true if [pid] has already remembered [signature] via `allow_always` ([D-706]).
+  bool hasAllowAlways({
+    required Pid pid,
+    required String? signature,
+  }) {
+    if (signature == null || signature.isEmpty) {
+      return false;
+    }
+    return _allowAlwaysByPid[pid]?.contains(signature) ?? false;
+  }
+
+  /// Issues (or replaces) a one-time [ApprovalGrant] bound to `(pid, syscallName, normalizedArgs)` ([D-706]).
+  ApprovalGrant issueGrant({
+    required Pid pid,
+    required String syscallName,
+    required Map<String, dynamic> normalizedArgs,
+    required ApprovalOption decisionOption,
+    ApprovalPreview? preview,
+  }) {
+    final canonical = canonicalJsonEncode(normalizedArgs);
+    final lookupKey = _grantLookupKey(syscallName, canonical);
+    final grant = ApprovalGrant(
+      grantId: 'grt_${++_grantCounter}',
+      pid: pid,
+      syscallName: syscallName,
+      canonicalArgsJson: canonical,
+      decisionOption: decisionOption,
+      preview: preview,
+    );
+    _grantsByPid.putIfAbsent(pid, () => <String, ApprovalGrant>{})[lookupKey] =
+        grant;
+    return grant;
+  }
+
+  /// Atomically consumes and returns a matching one-time [ApprovalGrant], or `null` if none exists ([D-706]).
+  ApprovalGrant? consumeGrant({
+    required Pid pid,
+    required String syscallName,
+    required Map<String, dynamic> normalizedArgs,
+  }) {
+    final pidGrants = _grantsByPid[pid];
+    if (pidGrants == null || pidGrants.isEmpty) {
+      return null;
+    }
+    final canonical = canonicalJsonEncode(normalizedArgs);
+    final lookupKey = _grantLookupKey(syscallName, canonical);
+    final grant = pidGrants.remove(lookupKey);
+    if (pidGrants.isEmpty) {
+      _grantsByPid.remove(pid);
+    }
+    if (grant != null) {
+      try {
+        onGrantConsumed?.call(grant);
+      } catch (_) {
+        // Non-critical observer error must not disrupt ticket consumption.
+      }
+    }
+    return grant;
+  }
+
+  /// Releases all remembered `allow_always` signatures and unconsumed tickets for [pid] ([D-706]).
+  void clearForPid(Pid pid) {
+    _allowAlwaysByPid.remove(pid);
+    _grantsByPid.remove(pid);
+  }
+
+  /// Clears remembered session approvals and unconsumed tickets for all PIDs.
+  void clearRemembered() {
+    _allowAlwaysByPid.clear();
+    _grantsByPid.clear();
+  }
+
+  /// Evaluates [request], honoring PID-scoped `allow_always`, FIFO serialization,
+  /// and immediate per-request cancellation ([D-020], [D-706]).
   Future<ApprovalDecision> evaluate(
     ApprovalRequest request, {
     CancellationToken? cancelToken,
@@ -195,33 +373,153 @@ class ApprovalGate {
       return const ApprovalDecision.cancelled();
     }
 
-    final sig = request.approvalSignature;
-    if (sig != null && _allowAlwaysSignatures.contains(sig)) {
+    if (hasAllowAlways(pid: request.pid, signature: request.approvalSignature)) {
       return const ApprovalDecision.allowAlways();
     }
 
-    final Future<ApprovalDecision> responseFuture = handler.requestApproval(
-      request,
+    final entry = _QueuedApprovalEntry(
+      request: request,
       cancelToken: cancelToken,
+      completer: Completer<ApprovalDecision>(),
     );
+    _waitQueue.addLast(entry);
 
-    final ApprovalDecision decision;
     if (cancelToken != null) {
-      decision = await Future.any<ApprovalDecision>(<Future<ApprovalDecision>>[
-        responseFuture,
-        cancelToken.onCancel.then((_) => const ApprovalDecision.cancelled()),
-      ]);
-    } else {
-      decision = await responseFuture;
+      unawaited(
+        cancelToken.onCancel.then((_) {
+          if (!entry.settled) {
+            entry.settled = true;
+            entry.completer.complete(const ApprovalDecision.cancelled());
+          }
+        }),
+      );
     }
 
-    if (!decision.cancelled &&
-        decision.option == ApprovalOption.allowAlways &&
-        sig != null &&
-        sig.isNotEmpty) {
-      _allowAlwaysSignatures.add(sig);
+    if (!_isDraining) {
+      unawaited(_drainQueue());
     }
 
-    return decision;
+    return entry.completer.future;
+  }
+
+  Future<void> _drainQueue() async {
+    if (_isDraining) {
+      return;
+    }
+    _isDraining = true;
+    try {
+      while (_waitQueue.isNotEmpty) {
+        final entry = _waitQueue.removeFirst();
+        if (entry.settled || (entry.cancelToken?.isCancelled ?? false)) {
+          if (!entry.settled) {
+            entry.settled = true;
+            entry.completer.complete(const ApprovalDecision.cancelled());
+          }
+          continue;
+        }
+
+        final sig = entry.request.approvalSignature;
+        if (hasAllowAlways(pid: entry.request.pid, signature: sig)) {
+          if (!entry.settled) {
+            entry.settled = true;
+            entry.completer.complete(const ApprovalDecision.allowAlways());
+          }
+          continue;
+        }
+
+        final Future<ApprovalDecision> responseFuture;
+        try {
+          responseFuture = handler.requestApproval(
+            entry.request,
+            cancelToken: entry.cancelToken,
+          );
+        } catch (err, st) {
+          if (!entry.settled) {
+            entry.settled = true;
+            entry.completer.completeError(err, st);
+          }
+          continue;
+        }
+
+        ApprovalDecision decision;
+        if (entry.cancelToken == null) {
+          try {
+            decision = await responseFuture;
+          } catch (err, st) {
+            if (!entry.settled) {
+              entry.settled = true;
+              entry.completer.completeError(err, st);
+            }
+            continue;
+          }
+        } else {
+          var responseCompleted = false;
+          ApprovalDecision? completedDecision;
+          Object? responseError;
+          StackTrace? responseStack;
+          final trackedResponse = responseFuture.then<ApprovalDecision?>(
+            (value) {
+              responseCompleted = true;
+              completedDecision = value;
+              return value;
+            },
+            onError: (Object err, StackTrace st) {
+              responseCompleted = true;
+              responseError = err;
+              responseStack = st;
+              return null;
+            },
+          );
+
+          await Future.any<Object?>(<Future<Object?>>[
+            trackedResponse,
+            entry.cancelToken!.onCancel,
+          ]);
+
+          if (!responseCompleted) {
+            // Wait up to 50ms for cooperative handler cleanup (e.g. permission_cancelled wire flush)
+            // before dispatching the next queued request ([D-706], RV-001).
+            await trackedResponse.timeout(
+              _cancelCleanupGrace,
+              onTimeout: () => const ApprovalDecision.cancelled(),
+            );
+          }
+
+          if (responseError != null) {
+            if (!entry.settled) {
+              entry.settled = true;
+              entry.completer.completeError(responseError!, responseStack);
+            }
+            continue;
+          }
+
+          if ((entry.cancelToken!.isCancelled) || !responseCompleted) {
+            decision = const ApprovalDecision.cancelled();
+          } else {
+            decision =
+                completedDecision ?? const ApprovalDecision.cancelled();
+          }
+        }
+
+        if (!decision.cancelled &&
+            decision.option == ApprovalOption.allowAlways &&
+            sig != null &&
+            sig.isNotEmpty) {
+          _allowAlwaysByPid
+              .putIfAbsent(entry.request.pid, () => <String>{})
+              .add(sig);
+        }
+
+        if (!entry.settled) {
+          entry.settled = true;
+          entry.completer.complete(decision);
+        }
+      }
+    } finally {
+      _isDraining = false;
+      if (_waitQueue.isNotEmpty) {
+        unawaited(_drainQueue());
+      }
+    }
   }
 }
